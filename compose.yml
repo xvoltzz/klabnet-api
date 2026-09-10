@@ -1,0 +1,11 @@
+services:
+  klabnet-api:
+    build: .
+    container_name: klabnet-api
+    restart: unless-stopped
+    ports:
+      - "8765:8765"
+    volumes:
+      - ./data:/data
+    environment:
+      DB_PATH: /data/prefs.db

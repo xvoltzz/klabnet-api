@@ -1,0 +1,18 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Push All",
+      "type": "shell",
+      "command": "git push origin main && git push github main && git push prod main",
+      "group": { "kind": "build", "isDefault": true },
+      "problemMatcher": []
+    },
+    {
+      "label": "Deploy: Prod",
+      "type": "shell",
+      "command": "git push prod main",
+      "problemMatcher": []
+    }
+  ]
+}
