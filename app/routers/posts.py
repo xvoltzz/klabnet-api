@@ -12,13 +12,43 @@ def _unauthenticated() -> JSONResponse:
     return JSONResponse(status_code=401, content={"error": "not authenticated"})
 
 
-def _row_to_post(r) -> dict:
+def _reactions_and_reply_counts(db, post_ids: list[int], username: str) -> tuple[dict, dict]:
+    """One query each for reaction aggregates and reply counts across a page
+    of posts, instead of N+1 per-post lookups."""
+    if not post_ids:
+        return {}, {}
+    placeholders = ",".join("?" for _ in post_ids)
+    reactions: dict[int, dict[str, dict]] = {}
+    for row in db.execute(
+        f"""SELECT post_id, emoji, COUNT(*) AS cnt,
+                   SUM(CASE WHEN username = ? THEN 1 ELSE 0 END) AS mine
+            FROM post_reactions WHERE post_id IN ({placeholders})
+            GROUP BY post_id, emoji""",
+        (username, *post_ids),
+    ).fetchall():
+        reactions.setdefault(row["post_id"], {})[row["emoji"]] = {
+            "count": row["cnt"],
+            "mine": bool(row["mine"]),
+        }
+    reply_counts: dict[int, int] = {}
+    for row in db.execute(
+        f"""SELECT post_id, COUNT(*) AS cnt FROM post_replies
+            WHERE post_id IN ({placeholders}) GROUP BY post_id""",
+        post_ids,
+    ).fetchall():
+        reply_counts[row["post_id"]] = row["cnt"]
+    return reactions, reply_counts
+
+
+def _row_to_post(r, reactions: dict, reply_counts: dict) -> dict:
     return {
         "id": r["id"],
         "username": r["username"],
         "text": r["text"],
         "image_mxc": r["image_mxc"],
         "created": r["created"],
+        "reactions": reactions.get(r["id"], {}),
+        "reply_count": reply_counts.get(r["id"], 0),
     }
 
 
@@ -26,6 +56,7 @@ def _row_to_post(r) -> dict:
 def get_posts(request: Request, limit: int = 50, before_id: int | None = None):
     """Feed, newest-first. `before_id` pages further back for "load older"."""
     limit = max(1, min(limit, 100))
+    username = get_username(request)
     with get_db() as db:
         if before_id is not None:
             rows = db.execute(
@@ -37,7 +68,8 @@ def get_posts(request: Request, limit: int = 50, before_id: int | None = None):
                 "SELECT id, username, text, image_mxc, created FROM posts ORDER BY id DESC LIMIT ?",
                 (limit,),
             ).fetchall()
-    return {"posts": [_row_to_post(r) for r in rows]}
+        reactions, reply_counts = _reactions_and_reply_counts(db, [r["id"] for r in rows], username)
+    return {"posts": [_row_to_post(r, reactions, reply_counts) for r in rows]}
 
 
 @router.post("/api/posts")
@@ -63,7 +95,7 @@ async def create_post(request: Request):
             "SELECT id, username, text, image_mxc, created FROM posts WHERE id=?",
             (cur.lastrowid,),
         ).fetchone()
-    return _row_to_post(row)
+    return _row_to_post(row, {}, {})
 
 
 @router.delete("/api/posts/{post_id}")
@@ -77,6 +109,101 @@ def delete_post(post_id: int, request: Request):
             return JSONResponse(status_code=404, content={"error": "not found"})
         if row["username"] != username and not is_admin(get_groups(request)):
             return JSONResponse(status_code=403, content={"error": "not your post"})
+        # No FK cascade in this DB (see db.py) — clean up manually.
+        db.execute("DELETE FROM post_reactions WHERE post_id=?", (post_id,))
+        db.execute("DELETE FROM post_replies WHERE post_id=?", (post_id,))
         db.execute("DELETE FROM posts WHERE id=?", (post_id,))
+        db.commit()
+    return {"ok": True}
+
+
+@router.put("/api/posts/{post_id}/reactions")
+async def toggle_reaction(post_id: int, request: Request):
+    """Adds the caller's reaction, or removes it if they'd already reacted
+    with that same emoji — one call for a click that toggles a pill,
+    mirroring the PUT-as-toggle shape /api/notes already uses."""
+    username = get_username(request)
+    if username == "anonymous":
+        return _unauthenticated()
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "invalid JSON"})
+    emoji = str(body.get("emoji", "")).strip()
+    if not emoji:
+        return JSONResponse(status_code=400, content={"error": "emoji required"})
+    with get_db() as db:
+        if db.execute("SELECT 1 FROM posts WHERE id=?", (post_id,)).fetchone() is None:
+            return JSONResponse(status_code=404, content={"error": "not found"})
+        existing = db.execute(
+            "SELECT 1 FROM post_reactions WHERE post_id=? AND username=? AND emoji=?",
+            (post_id, username, emoji),
+        ).fetchone()
+        if existing:
+            db.execute(
+                "DELETE FROM post_reactions WHERE post_id=? AND username=? AND emoji=?",
+                (post_id, username, emoji),
+            )
+        else:
+            db.execute(
+                "INSERT INTO post_reactions(post_id, username, emoji) VALUES (?, ?, ?)",
+                (post_id, username, emoji),
+            )
+        db.commit()
+        reactions, _ = _reactions_and_reply_counts(db, [post_id], username)
+    return {"reactions": reactions.get(post_id, {})}
+
+
+@router.get("/api/posts/{post_id}/replies")
+def get_replies(post_id: int, request: Request):
+    with get_db() as db:
+        rows = db.execute(
+            "SELECT id, post_id, username, text, created FROM post_replies WHERE post_id=? ORDER BY id ASC",
+            (post_id,),
+        ).fetchall()
+    return {"replies": [dict(r) for r in rows]}
+
+
+@router.post("/api/posts/{post_id}/replies")
+async def create_reply(post_id: int, request: Request):
+    username = get_username(request)
+    if username == "anonymous":
+        return _unauthenticated()
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "invalid JSON"})
+    text = str(body.get("text", "")).strip()[:POST_MAX_CHARS]
+    if not text:
+        return JSONResponse(status_code=400, content={"error": "reply text required"})
+    with get_db() as db:
+        if db.execute("SELECT 1 FROM posts WHERE id=?", (post_id,)).fetchone() is None:
+            return JSONResponse(status_code=404, content={"error": "not found"})
+        cur = db.execute(
+            "INSERT INTO post_replies(post_id, username, text) VALUES (?, ?, ?)",
+            (post_id, username, text),
+        )
+        db.commit()
+        row = db.execute(
+            "SELECT id, post_id, username, text, created FROM post_replies WHERE id=?",
+            (cur.lastrowid,),
+        ).fetchone()
+    return dict(row)
+
+
+@router.delete("/api/posts/{post_id}/replies/{reply_id}")
+def delete_reply(post_id: int, reply_id: int, request: Request):
+    username = get_username(request)
+    if username == "anonymous":
+        return _unauthenticated()
+    with get_db() as db:
+        row = db.execute(
+            "SELECT username FROM post_replies WHERE id=? AND post_id=?", (reply_id, post_id)
+        ).fetchone()
+        if row is None:
+            return JSONResponse(status_code=404, content={"error": "not found"})
+        if row["username"] != username and not is_admin(get_groups(request)):
+            return JSONResponse(status_code=403, content={"error": "not your reply"})
+        db.execute("DELETE FROM post_replies WHERE id=?", (reply_id,))
         db.commit()
     return {"ok": True}

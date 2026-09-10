@@ -70,6 +70,26 @@ CREATE TABLE IF NOT EXISTS posts (
     image_mxc TEXT NOT NULL DEFAULT '',
     created   TEXT NOT NULL DEFAULT (datetime('now'))
 );
+-- One row per (post, user, emoji) — a user can react to the same post with
+-- several different emoji, but only once each (re-toggling removes it).
+-- No FK/cascade: this app doesn't otherwise rely on SQLite foreign keys, so
+-- DELETE /api/posts/{id} explicitly cleans up matching rows here instead.
+CREATE TABLE IF NOT EXISTS post_reactions (
+    post_id  INTEGER NOT NULL,
+    username TEXT NOT NULL,
+    emoji    TEXT NOT NULL,
+    created  TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (post_id, username, emoji)
+);
+-- Flat replies (one level, no reply-to-reply nesting — keeps the feed's
+-- reply UI to a simple list under each post rather than real threading).
+CREATE TABLE IF NOT EXISTS post_replies (
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    post_id  INTEGER NOT NULL,
+    username TEXT NOT NULL,
+    text     TEXT NOT NULL,
+    created  TEXT NOT NULL DEFAULT (datetime('now'))
+);
 """
 
 
