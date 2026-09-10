@@ -36,6 +36,8 @@ _load_local_env(os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env")
 DB_PATH      = os.environ.get("DB_PATH", "/data/prefs.db")
 ADMIN_GROUP  = os.environ.get("ADMIN_GROUP", "klabnet-admin")
 PRESENCE_TTL = int(os.environ.get("PRESENCE_TTL", "30"))  # seconds
+NOTE_TTL_HOURS  = int(os.environ.get("NOTE_TTL_HOURS", "24"))
+NOTE_MAX_CHARS  = int(os.environ.get("NOTE_MAX_CHARS", "60"))  # same cap Instagram Notes uses
 
 CORS_ORIGINS = [
     origin.strip()

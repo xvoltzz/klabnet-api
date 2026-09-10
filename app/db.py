@@ -50,6 +50,15 @@ CREATE TABLE IF NOT EXISTS presence (
     party_host TEXT NOT NULL DEFAULT '',
     updated    TEXT NOT NULL DEFAULT (datetime('now'))
 );
+-- Instagram-Notes-style ephemeral status text — one per user, expires on
+-- its own after NOTE_TTL_HOURS (filtered at query time in GET /api/notes,
+-- same pattern PRESENCE_TTL already uses for presence — no cleanup job,
+-- an expired row just stops being returned).
+CREATE TABLE IF NOT EXISTS notes (
+    username TEXT PRIMARY KEY,
+    text     TEXT NOT NULL,
+    created  TEXT NOT NULL DEFAULT (datetime('now'))
+);
 """
 
 

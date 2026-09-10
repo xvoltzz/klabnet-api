@@ -26,6 +26,7 @@ anything else. Admin-only writes (`POST`/`PUT`/`DELETE` on `/api/apps` and
 | `/api/me` | GET | any | echoes back derived identity |
 | `/api/prefs` | GET, PUT | any | per-user JSON blob (theme, tile order, favorites, playlists, ...) |
 | `/api/presence` | GET, POST, DELETE | any | who's active right now + what they're listening to |
+| `/api/notes` | GET, PUT, DELETE | any | Instagram-Notes-style ephemeral status text, one per user, expires after `NOTE_TTL_HOURS` |
 | `/api/apps` | GET, POST, PUT, DELETE | GET: any · writes: admin | admin-managed app tiles |
 | `/api/sections` | GET, POST, PUT, DELETE | GET: any · writes: admin | tile groupings |
 
@@ -112,4 +113,6 @@ populated before the first push — it's not something the hook bootstraps.
 | `DB_PATH` | `/data/prefs.db` | set to `./data/prefs.db` for local dev |
 | `ADMIN_GROUP` | `klabnet-admin` | Authentik group required for admin writes |
 | `PRESENCE_TTL` | `30` | seconds a presence row stays "active" |
+| `NOTE_TTL_HOURS` | `24` | hours a note stays visible before expiring |
+| `NOTE_MAX_CHARS` | `60` | max note length |
 | `CORS_ORIGINS` | `https://user.klab.gg,https://staging.klab.gg` | comma-separated; only matters for a browser hitting this API cross-origin, which the current frontend doesn't do (it calls relative `/api/...` paths, proxied same-origin through Caddy) |
