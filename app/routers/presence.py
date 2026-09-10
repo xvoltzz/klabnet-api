@@ -25,23 +25,25 @@ async def post_presence(request: Request):
     except Exception:
         return JSONResponse(status_code=400, content={"error": "invalid JSON"})
 
-    song    = str(body.get("song",   "")).strip()[:200]
-    artist  = str(body.get("artist", "")).strip()[:200]
-    song_id = str(body.get("songId", "")).strip()[:100]
-    playing = bool(body.get("playing", False))
+    song       = str(body.get("song",   "")).strip()[:200]
+    artist     = str(body.get("artist", "")).strip()[:200]
+    song_id    = str(body.get("songId", "")).strip()[:100]
+    playing    = bool(body.get("playing", False))
+    party_host = str(body.get("partyHost", "")).strip()[:100]
 
     touch_user(username)
     with get_db() as db:
         db.execute(
-            """INSERT INTO presence(username, song, artist, song_id, playing, updated)
-               VALUES (?, ?, ?, ?, ?, datetime('now'))
+            """INSERT INTO presence(username, song, artist, song_id, playing, party_host, updated)
+               VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
                ON CONFLICT(username) DO UPDATE SET
-                   song    = excluded.song,
-                   artist  = excluded.artist,
-                   song_id = excluded.song_id,
-                   playing = excluded.playing,
-                   updated = excluded.updated""",
-            (username, song, artist, song_id, 1 if playing else 0),
+                   song       = excluded.song,
+                   artist     = excluded.artist,
+                   song_id    = excluded.song_id,
+                   playing    = excluded.playing,
+                   party_host = excluded.party_host,
+                   updated    = excluded.updated""",
+            (username, song, artist, song_id, 1 if playing else 0, party_host),
         )
         db.commit()
     return {"ok": True}
@@ -57,7 +59,7 @@ def get_presence(request: Request):
     cutoff = (datetime.utcnow() - timedelta(seconds=PRESENCE_TTL)).strftime("%Y-%m-%d %H:%M:%S")
     with get_db() as db:
         rows = db.execute(
-            """SELECT username, song, artist, song_id, playing, updated
+            """SELECT username, song, artist, song_id, playing, party_host, updated
                FROM   presence
                WHERE  updated >= ?
                ORDER  BY updated DESC""",
@@ -66,12 +68,13 @@ def get_presence(request: Request):
 
     listeners = [
         {
-            "username": r["username"],
-            "song":     r["song"],
-            "artist":   r["artist"],
-            "songId":   r["song_id"],
-            "playing":  bool(r["playing"]),
-            "updated":  r["updated"],
+            "username":  r["username"],
+            "song":      r["song"],
+            "artist":    r["artist"],
+            "songId":    r["song_id"],
+            "playing":   bool(r["playing"]),
+            "partyHost": r["party_host"] or None,
+            "updated":   r["updated"],
         }
         for r in rows
     ]

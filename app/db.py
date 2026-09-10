@@ -42,12 +42,13 @@ CREATE TABLE IF NOT EXISTS sections (
     created    TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE TABLE IF NOT EXISTS presence (
-    username TEXT PRIMARY KEY,
-    song     TEXT NOT NULL DEFAULT '',
-    artist   TEXT NOT NULL DEFAULT '',
-    song_id  TEXT NOT NULL DEFAULT '',
-    playing  INTEGER NOT NULL DEFAULT 0,
-    updated  TEXT NOT NULL DEFAULT (datetime('now'))
+    username   TEXT PRIMARY KEY,
+    song       TEXT NOT NULL DEFAULT '',
+    artist     TEXT NOT NULL DEFAULT '',
+    song_id    TEXT NOT NULL DEFAULT '',
+    playing    INTEGER NOT NULL DEFAULT 0,
+    party_host TEXT NOT NULL DEFAULT '',
+    updated    TEXT NOT NULL DEFAULT (datetime('now'))
 );
 """
 
@@ -64,6 +65,13 @@ def init_db() -> None:
         # requests, avoided for the cost of one pragma.
         conn.execute("PRAGMA journal_mode=WAL")
         conn.executescript(SCHEMA)
+        # party_host is new — CREATE TABLE IF NOT EXISTS is a no-op against
+        # an already-existing presence table (the real deployed one
+        # predates this column), so it needs an explicit one-time migration
+        # rather than just being added to the schema above.
+        cols = [row[1] for row in conn.execute("PRAGMA table_info(presence)").fetchall()]
+        if "party_host" not in cols:
+            conn.execute("ALTER TABLE presence ADD COLUMN party_host TEXT NOT NULL DEFAULT ''")
         conn.commit()
     finally:
         conn.close()
