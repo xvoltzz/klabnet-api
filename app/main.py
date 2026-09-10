@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from .config import APP_VERSION, CORS_ORIGINS
 from .db import init_db
-from .routers import apps, health, identity, notes, prefs, presence, sections
+from .routers import apps, health, identity, notes, posts, prefs, presence, sections
 
 
 @asynccontextmanager
@@ -26,5 +26,5 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-for router in (health.router, identity.router, prefs.router, presence.router, notes.router, apps.router, sections.router):
+for router in (health.router, identity.router, prefs.router, presence.router, notes.router, posts.router, apps.router, sections.router):
     app.include_router(router)

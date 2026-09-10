@@ -59,6 +59,17 @@ CREATE TABLE IF NOT EXISTS notes (
     text     TEXT NOT NULL,
     created  TEXT NOT NULL DEFAULT (datetime('now'))
 );
+-- Feed posts. image_mxc (when set) is an mxc:// URI pointing at Matrix's
+-- content repo, not image bytes — the browser uploads straight to Matrix
+-- (same flow the profile-avatar picker already uses) and only hands this
+-- service the resulting URI, so this table never touches file storage.
+CREATE TABLE IF NOT EXISTS posts (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    username  TEXT NOT NULL,
+    text      TEXT NOT NULL DEFAULT '',
+    image_mxc TEXT NOT NULL DEFAULT '',
+    created   TEXT NOT NULL DEFAULT (datetime('now'))
+);
 """
 
 

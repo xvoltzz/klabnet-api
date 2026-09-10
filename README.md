@@ -27,6 +27,8 @@ anything else. Admin-only writes (`POST`/`PUT`/`DELETE` on `/api/apps` and
 | `/api/prefs` | GET, PUT | any | per-user JSON blob (theme, tile order, favorites, playlists, ...) |
 | `/api/presence` | GET, POST, DELETE | any | who's active right now + what they're listening to |
 | `/api/notes` | GET, PUT, DELETE | any | Instagram-Notes-style ephemeral status text, one per user, expires after `NOTE_TTL_HOURS` |
+| `/api/posts` | GET, POST | any | feed posts (text + optional `image_mxc` — an `mxc://` URI the browser uploads to Matrix's content repo directly, never routed through this service) |
+| `/api/posts/{id}` | DELETE | own post or admin | delete a post |
 | `/api/apps` | GET, POST, PUT, DELETE | GET: any · writes: admin | admin-managed app tiles |
 | `/api/sections` | GET, POST, PUT, DELETE | GET: any · writes: admin | tile groupings |
 
@@ -115,4 +117,5 @@ populated before the first push — it's not something the hook bootstraps.
 | `PRESENCE_TTL` | `30` | seconds a presence row stays "active" |
 | `NOTE_TTL_HOURS` | `24` | hours a note stays visible before expiring |
 | `NOTE_MAX_CHARS` | `60` | max note length |
+| `POST_MAX_CHARS` | `500` | max feed post text length |
 | `CORS_ORIGINS` | `https://user.klab.gg,https://staging.klab.gg` | comma-separated; only matters for a browser hitting this API cross-origin, which the current frontend doesn't do (it calls relative `/api/...` paths, proxied same-origin through Caddy) |
