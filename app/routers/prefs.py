@@ -30,6 +30,8 @@ async def put_prefs(request: Request):
     username = get_username(request)
     try:
         body = await request.json()
+        if not isinstance(body, dict):
+            raise ValueError("body must be a JSON object")
     except Exception:
         return JSONResponse(status_code=400, content={"error": "invalid JSON"})
     clean = {k: v for k, v in body.items() if k in ALLOWED_PREF_KEYS}

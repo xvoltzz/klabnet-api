@@ -39,6 +39,7 @@ PRESENCE_TTL = int(os.environ.get("PRESENCE_TTL", "30"))  # seconds
 NOTE_TTL_HOURS  = int(os.environ.get("NOTE_TTL_HOURS", "24"))
 NOTE_MAX_CHARS  = int(os.environ.get("NOTE_MAX_CHARS", "60"))  # same cap Instagram Notes uses
 POST_MAX_CHARS  = int(os.environ.get("POST_MAX_CHARS", "500"))
+EMOJI_MAX_CHARS = int(os.environ.get("EMOJI_MAX_CHARS", "32"))  # generous enough for ZWJ/skin-tone sequences
 
 CORS_ORIGINS = [
     origin.strip()

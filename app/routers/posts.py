@@ -1,8 +1,10 @@
+import sqlite3
+
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
 from ..auth import get_groups, get_username, is_admin
-from ..config import POST_MAX_CHARS
+from ..config import EMOJI_MAX_CHARS, POST_MAX_CHARS
 from ..db import get_db
 
 router = APIRouter()
@@ -79,6 +81,8 @@ async def create_post(request: Request):
         return _unauthenticated()
     try:
         body = await request.json()
+        if not isinstance(body, dict):
+            raise ValueError("body must be a JSON object")
     except Exception:
         return JSONResponse(status_code=400, content={"error": "invalid JSON"})
     text = str(body.get("text", "")).strip()[:POST_MAX_CHARS]
@@ -120,16 +124,20 @@ def delete_post(post_id: int, request: Request):
 @router.put("/api/posts/{post_id}/reactions")
 async def toggle_reaction(post_id: int, request: Request):
     """Adds the caller's reaction, or removes it if they'd already reacted
-    with that same emoji — one call for a click that toggles a pill,
-    mirroring the PUT-as-toggle shape /api/notes already uses."""
+    with that same emoji — one call for a click that toggles a pill. Unlike
+    /api/notes's PUT (a plain upsert-or-clear), this one actually flips
+    state based on what's already there, so a racing duplicate insert is
+    treated as a no-op rather than an error."""
     username = get_username(request)
     if username == "anonymous":
         return _unauthenticated()
     try:
         body = await request.json()
+        if not isinstance(body, dict):
+            raise ValueError("body must be a JSON object")
     except Exception:
         return JSONResponse(status_code=400, content={"error": "invalid JSON"})
-    emoji = str(body.get("emoji", "")).strip()
+    emoji = str(body.get("emoji", "")).strip()[:EMOJI_MAX_CHARS]
     if not emoji:
         return JSONResponse(status_code=400, content={"error": "emoji required"})
     with get_db() as db:
@@ -145,10 +153,15 @@ async def toggle_reaction(post_id: int, request: Request):
                 (post_id, username, emoji),
             )
         else:
-            db.execute(
-                "INSERT INTO post_reactions(post_id, username, emoji) VALUES (?, ?, ?)",
-                (post_id, username, emoji),
-            )
+            try:
+                db.execute(
+                    "INSERT INTO post_reactions(post_id, username, emoji) VALUES (?, ?, ?)",
+                    (post_id, username, emoji),
+                )
+            except sqlite3.IntegrityError:
+                # Lost a race with another request for the same toggle — the
+                # reaction already exists either way, so this is a no-op.
+                pass
         db.commit()
         reactions, _ = _reactions_and_reply_counts(db, [post_id], username)
     return {"reactions": reactions.get(post_id, {})}
@@ -157,6 +170,8 @@ async def toggle_reaction(post_id: int, request: Request):
 @router.get("/api/posts/{post_id}/replies")
 def get_replies(post_id: int, request: Request):
     with get_db() as db:
+        if db.execute("SELECT 1 FROM posts WHERE id=?", (post_id,)).fetchone() is None:
+            return JSONResponse(status_code=404, content={"error": "not found"})
         rows = db.execute(
             "SELECT id, post_id, username, text, created FROM post_replies WHERE post_id=? ORDER BY id ASC",
             (post_id,),
@@ -171,6 +186,8 @@ async def create_reply(post_id: int, request: Request):
         return _unauthenticated()
     try:
         body = await request.json()
+        if not isinstance(body, dict):
+            raise ValueError("body must be a JSON object")
     except Exception:
         return JSONResponse(status_code=400, content={"error": "invalid JSON"})
     text = str(body.get("text", "")).strip()[:POST_MAX_CHARS]

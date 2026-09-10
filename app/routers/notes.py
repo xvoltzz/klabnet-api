@@ -37,6 +37,8 @@ async def set_note(request: Request):
         return _unauthenticated()
     try:
         body = await request.json()
+        if not isinstance(body, dict):
+            raise ValueError("body must be a JSON object")
     except Exception:
         return JSONResponse(status_code=400, content={"error": "invalid JSON"})
     text = str(body.get("text", "")).strip()[:NOTE_MAX_CHARS]

@@ -38,6 +38,8 @@ async def create_app(request: Request):
     username = get_username(request)
     try:
         body = await request.json()
+        if not isinstance(body, dict):
+            raise ValueError("body must be a JSON object")
     except Exception:
         return JSONResponse(status_code=400, content={"error": "invalid JSON"})
     name       = str(body.get("name", "")).strip()
@@ -68,6 +70,8 @@ async def update_app(app_id: str, request: Request):
     require_admin(request)
     try:
         body = await request.json()
+        if not isinstance(body, dict):
+            raise ValueError("body must be a JSON object")
     except Exception:
         return JSONResponse(status_code=400, content={"error": "invalid JSON"})
     updates = {k: v for k, v in body.items() if k in ALLOWED_APP_FIELDS}
