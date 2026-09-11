@@ -90,6 +90,17 @@ CREATE TABLE IF NOT EXISTS post_replies (
     text     TEXT NOT NULL,
     created  TEXT NOT NULL DEFAULT (datetime('now'))
 );
+-- Public-facing profile data (chat name color, bio, banner image) — unlike
+-- `prefs`, this is meant to be readable by anyone, not just its owner, so it
+-- gets its own table rather than living in that private per-user blob. Row
+-- only exists once a user has saved a profile at least once.
+CREATE TABLE IF NOT EXISTS profiles (
+    username   TEXT PRIMARY KEY,
+    chat_color TEXT NOT NULL DEFAULT '',
+    bio        TEXT NOT NULL DEFAULT '',
+    banner_mxc TEXT NOT NULL DEFAULT '',
+    updated    TEXT NOT NULL DEFAULT (datetime('now'))
+);
 """
 
 
