@@ -13,7 +13,7 @@ router = APIRouter()
 ALLOWED_PREF_KEYS = {
     "tile_order", "hidden_tiles", "section_order", "notes", "login_song",
     "favorites", "play_history", "playlists", "settings", "theme", "perf",
-    "volume", "tile_groups",
+    "volume", "tile_groups", "bg_dark", "bg_light",
 }
 
 
