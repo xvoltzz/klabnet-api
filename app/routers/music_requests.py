@@ -8,6 +8,9 @@ limited to ~1 req/sec, both easier to get right in one place than from N
 browser tabs, and it sidesteps any CORS question entirely.
 """
 
+import asyncio
+import time
+
 import httpx
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
@@ -22,6 +25,23 @@ MB_BASE = "https://musicbrainz.org/ws/2"
 MB_HEADERS = {"User-Agent": MUSICBRAINZ_USER_AGENT, "Accept": "application/json"}
 COVER_ART_BASE = "https://coverartarchive.org"
 
+# MusicBrainz enforces ~1 request/sec per client and 503s anything faster —
+# hit in practice with completely reasonable usage (the frontend's own
+# 400ms search debounce alone can burst past this, before even counting two
+# people using the feature at once, since it's all the same server IP).
+# A single process-wide gate is enough here (one klabnet-api instance, no
+# multi-worker deploy) — queues every call through a lock and sleeps out
+# whatever's left of the window since the last one, so the server
+# self-throttles regardless of how fast requests actually arrive. In
+# practice a single 503 still shows up occasionally even fully spaced at
+# 1.05s (their real limiter isn't purely a fixed per-request gap — a burst
+# of manual testing was enough to trip it at that spacing), so this retries
+# with real backoff rather than once at the same interval.
+_MB_MIN_INTERVAL = 1.1
+_MB_RETRY_BACKOFFS = (1.5, 3.0)  # extra attempts beyond the first, seconds apart
+_mb_lock = asyncio.Lock()
+_mb_last_call = 0.0
+
 
 def _unauthenticated() -> JSONResponse:
     return JSONResponse(status_code=401, content={"error": "not authenticated"})
@@ -34,6 +54,28 @@ def _artist_credit(credits: list) -> str:
     return "".join(f"{c.get('name', '')}{c.get('joinphrase', '')}" for c in credits or [])
 
 
+async def _mb_get(url: str, params: dict) -> httpx.Response:
+    """GET against MusicBrainz, self-throttled to _MB_MIN_INTERVAL apart,
+    retrying with real backoff on a 503 (their own rate-limit response) —
+    belt-and-suspenders in case something outside this process also hit
+    their API in the same window, or their limiter is stricter than a
+    fixed per-request gap in practice."""
+    global _mb_last_call
+    async with _mb_lock:
+        wait = _MB_MIN_INTERVAL - (time.monotonic() - _mb_last_call)
+        if wait > 0:
+            await asyncio.sleep(wait)
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            res = await client.get(url, params=params, headers=MB_HEADERS)
+            for backoff in _MB_RETRY_BACKOFFS:
+                if res.status_code != 503:
+                    break
+                await asyncio.sleep(backoff)
+                res = await client.get(url, params=params, headers=MB_HEADERS)
+            _mb_last_call = time.monotonic()
+    return res
+
+
 @router.get("/api/music-requests/search")
 async def search_musicbrainz(q: str, type: str = "album"):
     """Proxies a MusicBrainz search so the request form can show real
@@ -43,14 +85,9 @@ async def search_musicbrainz(q: str, type: str = "album"):
         return {"results": []}
     entity = "recording" if type == "song" else "release-group"
     try:
-        async with httpx.AsyncClient(timeout=8.0) as client:
-            res = await client.get(
-                f"{MB_BASE}/{entity}",
-                params={"query": q, "fmt": "json", "limit": 8},
-                headers=MB_HEADERS,
-            )
-            res.raise_for_status()
-            data = res.json()
+        res = await _mb_get(f"{MB_BASE}/{entity}", {"query": q, "fmt": "json", "limit": 8})
+        res.raise_for_status()
+        data = res.json()
     except httpx.HTTPError:
         return JSONResponse(status_code=502, content={"error": "musicbrainz lookup failed"})
 
