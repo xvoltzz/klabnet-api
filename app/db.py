@@ -101,6 +101,22 @@ CREATE TABLE IF NOT EXISTS profiles (
     banner_mxc TEXT NOT NULL DEFAULT '',
     updated    TEXT NOT NULL DEFAULT (datetime('now'))
 );
+-- Music library requests ("add this album/song") — req_type distinguishes
+-- an album (mbid is a release-group) from a song (mbid is a recording);
+-- cover_art_url is a Cover Art Archive URL predicted client/server-side at
+-- search time (see routers/music_requests.py), not verified to exist here —
+-- the frontend falls back to a placeholder icon on image load failure.
+CREATE TABLE IF NOT EXISTS music_requests (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    username      TEXT NOT NULL,
+    req_type      TEXT NOT NULL DEFAULT 'album',
+    title         TEXT NOT NULL,
+    artist        TEXT NOT NULL DEFAULT '',
+    mbid          TEXT NOT NULL DEFAULT '',
+    cover_art_url TEXT NOT NULL DEFAULT '',
+    status        TEXT NOT NULL DEFAULT 'pending',
+    created       TEXT NOT NULL DEFAULT (datetime('now'))
+);
 """
 
 

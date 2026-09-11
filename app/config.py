@@ -41,6 +41,11 @@ NOTE_MAX_CHARS  = int(os.environ.get("NOTE_MAX_CHARS", "60"))  # same cap Instag
 POST_MAX_CHARS  = int(os.environ.get("POST_MAX_CHARS", "500"))
 EMOJI_MAX_CHARS = int(os.environ.get("EMOJI_MAX_CHARS", "32"))  # generous enough for ZWJ/skin-tone sequences
 BIO_MAX_CHARS   = int(os.environ.get("BIO_MAX_CHARS", "160"))
+REQUEST_FIELD_MAX_CHARS = int(os.environ.get("REQUEST_FIELD_MAX_CHARS", "200"))
+# MusicBrainz requires a real identifying User-Agent on every request
+# ("Application/Version (contact)") — an anonymous/browser-looking one gets
+# rate-limited much harder or outright blocked.
+MUSICBRAINZ_USER_AGENT = os.environ.get("MUSICBRAINZ_USER_AGENT", "klabnet-web/2.0 (+https://klab.gg)")
 
 CORS_ORIGINS = [
     origin.strip()
