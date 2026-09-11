@@ -1,10 +1,11 @@
+import json
 import sqlite3
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
 from ..auth import get_groups, get_username, is_admin
-from ..config import EMOJI_MAX_CHARS, POST_MAX_CHARS
+from ..config import EMOJI_MAX_CHARS, POST_MAX_CHARS, SONG_FIELD_MAX_CHARS, SONG_LYRIC_MAX_CHARS
 from ..db import get_db
 
 router = APIRouter()
@@ -12,6 +13,28 @@ router = APIRouter()
 
 def _unauthenticated() -> JSONResponse:
     return JSONResponse(status_code=401, content={"error": "not authenticated"})
+
+
+def _sanitize_song(raw) -> str:
+    """Client-provided "share to feed" song attachment -> a JSON string to
+    store, or '' if there's nothing usable. Not verified against the actual
+    music library (same trust model as image_mxc) — this only caps field
+    lengths and drops anything without at least a title, the one field the
+    feed card can't render without."""
+    if not isinstance(raw, dict):
+        return ""
+    title = str(raw.get("title", "")).strip()[:SONG_FIELD_MAX_CHARS]
+    if not title:
+        return ""
+    song = {
+        "songId": str(raw.get("songId", "")).strip()[:100],
+        "title": title,
+        "artist": str(raw.get("artist", "")).strip()[:SONG_FIELD_MAX_CHARS],
+        "album": str(raw.get("album", "")).strip()[:SONG_FIELD_MAX_CHARS],
+        "coverArt": str(raw.get("coverArt", "")).strip()[:200],
+        "lyric": str(raw.get("lyric") or "").strip()[:SONG_LYRIC_MAX_CHARS],
+    }
+    return json.dumps(song)
 
 
 def _reactions_and_reply_counts(db, post_ids: list[int], username: str) -> tuple[dict, dict]:
@@ -43,11 +66,18 @@ def _reactions_and_reply_counts(db, post_ids: list[int], username: str) -> tuple
 
 
 def _row_to_post(r, reactions: dict, reply_counts: dict) -> dict:
+    song = None
+    if r["song_json"]:
+        try:
+            song = json.loads(r["song_json"])
+        except (ValueError, TypeError):
+            song = None
     return {
         "id": r["id"],
         "username": r["username"],
         "text": r["text"],
         "image_mxc": r["image_mxc"],
+        "song": song,
         "created": r["created"],
         "reactions": reactions.get(r["id"], {}),
         "reply_count": reply_counts.get(r["id"], 0),
@@ -62,12 +92,12 @@ def get_posts(request: Request, limit: int = 50, before_id: int | None = None):
     with get_db() as db:
         if before_id is not None:
             rows = db.execute(
-                "SELECT id, username, text, image_mxc, created FROM posts WHERE id < ? ORDER BY id DESC LIMIT ?",
+                "SELECT id, username, text, image_mxc, song_json, created FROM posts WHERE id < ? ORDER BY id DESC LIMIT ?",
                 (before_id, limit),
             ).fetchall()
         else:
             rows = db.execute(
-                "SELECT id, username, text, image_mxc, created FROM posts ORDER BY id DESC LIMIT ?",
+                "SELECT id, username, text, image_mxc, song_json, created FROM posts ORDER BY id DESC LIMIT ?",
                 (limit,),
             ).fetchall()
         reactions, reply_counts = _reactions_and_reply_counts(db, [r["id"] for r in rows], username)
@@ -87,16 +117,17 @@ async def create_post(request: Request):
         return JSONResponse(status_code=400, content={"error": "invalid JSON"})
     text = str(body.get("text", "")).strip()[:POST_MAX_CHARS]
     image_mxc = str(body.get("image_mxc", "")).strip()
-    if not text and not image_mxc:
-        return JSONResponse(status_code=400, content={"error": "post must have text or an image"})
+    song_json = _sanitize_song(body.get("song"))
+    if not text and not image_mxc and not song_json:
+        return JSONResponse(status_code=400, content={"error": "post must have text, an image, or a song"})
     with get_db() as db:
         cur = db.execute(
-            "INSERT INTO posts(username, text, image_mxc) VALUES (?, ?, ?)",
-            (username, text, image_mxc),
+            "INSERT INTO posts(username, text, image_mxc, song_json) VALUES (?, ?, ?, ?)",
+            (username, text, image_mxc, song_json),
         )
         db.commit()
         row = db.execute(
-            "SELECT id, username, text, image_mxc, created FROM posts WHERE id=?",
+            "SELECT id, username, text, image_mxc, song_json, created FROM posts WHERE id=?",
             (cur.lastrowid,),
         ).fetchone()
     return _row_to_post(row, {}, {})

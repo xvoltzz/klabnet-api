@@ -63,11 +63,19 @@ CREATE TABLE IF NOT EXISTS notes (
 -- content repo, not image bytes — the browser uploads straight to Matrix
 -- (same flow the profile-avatar picker already uses) and only hands this
 -- service the resulting URI, so this table never touches file storage.
+-- song_json (when set) is a JSON object describing a shared track —
+-- {song_id, title, artist, album, cover_art, lyric} — cover_art is a
+-- Navidrome coverArt id, not a URL (the frontend reconstructs the URL the
+-- same way it does everywhere else); lyric is an optional quoted excerpt
+-- captured from whatever line was on screen in the synced-lyrics view at
+-- share time. Client-provided, not verified against the actual library —
+-- same trust model as image_mxc.
 CREATE TABLE IF NOT EXISTS posts (
     id        INTEGER PRIMARY KEY AUTOINCREMENT,
     username  TEXT NOT NULL,
     text      TEXT NOT NULL DEFAULT '',
     image_mxc TEXT NOT NULL DEFAULT '',
+    song_json TEXT NOT NULL DEFAULT '',
     created   TEXT NOT NULL DEFAULT (datetime('now'))
 );
 -- One row per (post, user, emoji) — a user can react to the same post with
@@ -139,6 +147,10 @@ def init_db() -> None:
         cols = [row[1] for row in conn.execute("PRAGMA table_info(presence)").fetchall()]
         if "party_host" not in cols:
             conn.execute("ALTER TABLE presence ADD COLUMN party_host TEXT NOT NULL DEFAULT ''")
+        # song_json is new — same one-time migration story as party_host above.
+        post_cols = [row[1] for row in conn.execute("PRAGMA table_info(posts)").fetchall()]
+        if "song_json" not in post_cols:
+            conn.execute("ALTER TABLE posts ADD COLUMN song_json TEXT NOT NULL DEFAULT ''")
         conn.commit()
     finally:
         conn.close()

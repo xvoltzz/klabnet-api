@@ -42,6 +42,8 @@ POST_MAX_CHARS  = int(os.environ.get("POST_MAX_CHARS", "500"))
 EMOJI_MAX_CHARS = int(os.environ.get("EMOJI_MAX_CHARS", "32"))  # generous enough for ZWJ/skin-tone sequences
 BIO_MAX_CHARS   = int(os.environ.get("BIO_MAX_CHARS", "160"))
 REQUEST_FIELD_MAX_CHARS = int(os.environ.get("REQUEST_FIELD_MAX_CHARS", "200"))
+SONG_FIELD_MAX_CHARS = int(os.environ.get("SONG_FIELD_MAX_CHARS", "200"))
+SONG_LYRIC_MAX_CHARS = int(os.environ.get("SONG_LYRIC_MAX_CHARS", "300"))
 # MusicBrainz requires a real identifying User-Agent on every request
 # ("Application/Version (contact)") — an anonymous/browser-looking one gets
 # rate-limited much harder or outright blocked.
