@@ -125,6 +125,16 @@ CREATE TABLE IF NOT EXISTS music_requests (
     status        TEXT NOT NULL DEFAULT 'pending',
     created       TEXT NOT NULL DEFAULT (datetime('now'))
 );
+-- Accumulated listening time for the (experimental) leaderboard — see
+-- routers/leaderboard.py and the accumulation logic in routers/presence.py's
+-- POST handler, which adds the elapsed time between two consecutive
+-- "playing" heartbeats each time one arrives. Not a live/authoritative
+-- listening log, just a running total.
+CREATE TABLE IF NOT EXISTS listening_stats (
+    username         TEXT PRIMARY KEY,
+    seconds_listened INTEGER NOT NULL DEFAULT 0,
+    updated          TEXT NOT NULL DEFAULT (datetime('now'))
+);
 """
 
 

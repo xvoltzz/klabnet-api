@@ -44,6 +44,13 @@ BIO_MAX_CHARS   = int(os.environ.get("BIO_MAX_CHARS", "160"))
 REQUEST_FIELD_MAX_CHARS = int(os.environ.get("REQUEST_FIELD_MAX_CHARS", "200"))
 SONG_FIELD_MAX_CHARS = int(os.environ.get("SONG_FIELD_MAX_CHARS", "200"))
 SONG_LYRIC_MAX_CHARS = int(os.environ.get("SONG_LYRIC_MAX_CHARS", "300"))
+# Caps how much listening time one presence heartbeat can credit — the
+# dashboard pings every ~8s while playing, so anything much larger than
+# that means a gap (a sleeping laptop, a dead connection, a very late
+# heartbeat), not real continuous listening. Without this, a stale
+# "playing" row that starts getting heartbeats again after hours would
+# credit the entire gap as listened time.
+LISTENING_HEARTBEAT_CAP_SECONDS = int(os.environ.get("LISTENING_HEARTBEAT_CAP_SECONDS", "30"))
 # MusicBrainz requires a real identifying User-Agent on every request
 # ("Application/Version (contact)") — an anonymous/browser-looking one gets
 # rate-limited much harder or outright blocked.
