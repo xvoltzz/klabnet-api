@@ -135,6 +135,23 @@ CREATE TABLE IF NOT EXISTS listening_stats (
     seconds_listened INTEGER NOT NULL DEFAULT 0,
     updated          TEXT NOT NULL DEFAULT (datetime('now'))
 );
+-- Personal calendars + "book with" requests. One row per event; a plain
+-- personal event has invitee_username == '' and status is always
+-- 'accepted' (nobody to approve it). A booking request has a real invitee
+-- and starts 'pending' until they accept/decline it — see
+-- routers/calendar.py. Deliberately no recurrence, no availability rules,
+-- no external sync: v1 is exactly "propose a time, they accept or not".
+CREATE TABLE IF NOT EXISTS calendar_events (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    requester_username TEXT NOT NULL,
+    invitee_username   TEXT NOT NULL DEFAULT '',
+    title              TEXT NOT NULL,
+    notes              TEXT NOT NULL DEFAULT '',
+    start_time         TEXT NOT NULL,
+    end_time           TEXT NOT NULL,
+    status             TEXT NOT NULL DEFAULT 'accepted',
+    created            TEXT NOT NULL DEFAULT (datetime('now'))
+);
 """
 
 
