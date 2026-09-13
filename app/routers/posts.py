@@ -26,13 +26,18 @@ def _sanitize_song(raw) -> str:
     title = str(raw.get("title", "")).strip()[:SONG_FIELD_MAX_CHARS]
     if not title:
         return ""
+    source = str(raw.get("source", "")).strip().lower()
     song = {
         "songId": str(raw.get("songId", "")).strip()[:100],
         "title": title,
         "artist": str(raw.get("artist", "")).strip()[:SONG_FIELD_MAX_CHARS],
         "album": str(raw.get("album", "")).strip()[:SONG_FIELD_MAX_CHARS],
-        "coverArt": str(raw.get("coverArt", "")).strip()[:200],
+        # A Spotify track's own art is a direct https URL (longer than a
+        # Navidrome cover-art id) rather than something the client resolves
+        # itself, so this needs more room than the id-only case ever did.
+        "coverArt": str(raw.get("coverArt", "")).strip()[:300],
         "lyric": str(raw.get("lyric") or "").strip()[:SONG_LYRIC_MAX_CHARS],
+        "source": source if source == "spotify" else "navidrome",
     }
     return json.dumps(song)
 
