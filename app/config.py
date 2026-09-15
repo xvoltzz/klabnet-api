@@ -44,8 +44,6 @@ BIO_MAX_CHARS   = int(os.environ.get("BIO_MAX_CHARS", "160"))
 REQUEST_FIELD_MAX_CHARS = int(os.environ.get("REQUEST_FIELD_MAX_CHARS", "200"))
 SONG_FIELD_MAX_CHARS = int(os.environ.get("SONG_FIELD_MAX_CHARS", "200"))
 SONG_LYRIC_MAX_CHARS = int(os.environ.get("SONG_LYRIC_MAX_CHARS", "300"))
-CALENDAR_TITLE_MAX_CHARS = int(os.environ.get("CALENDAR_TITLE_MAX_CHARS", "100"))
-CALENDAR_NOTES_MAX_CHARS = int(os.environ.get("CALENDAR_NOTES_MAX_CHARS", "500"))
 # Caps how much listening time one presence heartbeat can credit — the
 # dashboard pings every ~8s while playing, so anything much larger than
 # that means a gap (a sleeping laptop, a dead connection, a very late

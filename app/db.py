@@ -135,23 +135,6 @@ CREATE TABLE IF NOT EXISTS listening_stats (
     seconds_listened INTEGER NOT NULL DEFAULT 0,
     updated          TEXT NOT NULL DEFAULT (datetime('now'))
 );
--- Personal calendars + "book with" requests. One row per event; a plain
--- personal event has invitee_username == '' and status is always
--- 'accepted' (nobody to approve it). A booking request has a real invitee
--- and starts 'pending' until they accept/decline it — see
--- routers/calendar.py. Deliberately no recurrence, no availability rules,
--- no external sync: v1 is exactly "propose a time, they accept or not".
-CREATE TABLE IF NOT EXISTS calendar_events (
-    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
-    requester_username TEXT NOT NULL,
-    invitee_username   TEXT NOT NULL DEFAULT '',
-    title              TEXT NOT NULL,
-    notes              TEXT NOT NULL DEFAULT '',
-    start_time         TEXT NOT NULL,
-    end_time           TEXT NOT NULL,
-    status             TEXT NOT NULL DEFAULT 'accepted',
-    created            TEXT NOT NULL DEFAULT (datetime('now'))
-);
 """
 
 
@@ -178,6 +161,11 @@ def init_db() -> None:
         post_cols = [row[1] for row in conn.execute("PRAGMA table_info(posts)").fetchall()]
         if "song_json" not in post_cols:
             conn.execute("ALTER TABLE posts ADD COLUMN song_json TEXT NOT NULL DEFAULT ''")
+        # The calendar / "book with" feature was removed outright (not just
+        # its routes) — drops the table and whatever events/booking
+        # requests were already in it on the first boot after this
+        # deploys. IF EXISTS makes this a no-op on every boot after that.
+        conn.execute("DROP TABLE IF EXISTS calendar_events")
         conn.commit()
     finally:
         conn.close()
