@@ -7,5 +7,13 @@ services:
       - "8765:8765"
     volumes:
       - ./data:/data
+    # Secrets live in a .env next to this file, which is gitignored and never
+    # baked into the image (the Dockerfile only COPYs app/, so config.py's own
+    # .env fallback can't see one from inside the container — it has to come
+    # in through the environment). required:false so the stack still starts on
+    # a host that hasn't got one yet.
+    env_file:
+      - path: .env
+        required: false
     environment:
       DB_PATH: /data/prefs.db
