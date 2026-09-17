@@ -56,6 +56,19 @@ LISTENING_HEARTBEAT_CAP_SECONDS = int(os.environ.get("LISTENING_HEARTBEAT_CAP_SE
 # rate-limited much harder or outright blocked.
 MUSICBRAINZ_USER_AGENT = os.environ.get("MUSICBRAINZ_USER_AGENT", "klabnet-web/2.0 (+https://klab.gg)")
 
+# ── Gitea (in-app bug reports / feature requests) ──
+# GITEA_TOKEN needs `write:issue` on GITEA_REPO and belongs to whichever
+# account should appear as the issue author — the reporter's own klabnet
+# username goes in the issue body instead, since klabnet and Gitea
+# usernames aren't the same namespace. Listing needs no token (the repo's
+# issue list is world-readable), so leaving the token unset degrades to a
+# read-only "here's what's already reported" panel rather than breaking.
+GITEA_URL   = os.environ.get("GITEA_URL", "https://git.klab.gg")
+GITEA_REPO  = os.environ.get("GITEA_REPO", "xvoltzz/klabnet-web")
+GITEA_TOKEN = os.environ.get("GITEA_TOKEN", "")
+FEEDBACK_TITLE_MAX_CHARS = int(os.environ.get("FEEDBACK_TITLE_MAX_CHARS", "120"))
+FEEDBACK_BODY_MAX_CHARS  = int(os.environ.get("FEEDBACK_BODY_MAX_CHARS", "4000"))
+
 CORS_ORIGINS = [
     origin.strip()
     for origin in os.environ.get("CORS_ORIGINS", "https://user.klab.gg,https://staging.klab.gg").split(",")
