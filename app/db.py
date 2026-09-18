@@ -24,23 +24,6 @@ CREATE TABLE IF NOT EXISTS prefs (
     data     TEXT NOT NULL DEFAULT '{}',
     updated  TEXT NOT NULL DEFAULT (datetime('now'))
 );
-CREATE TABLE IF NOT EXISTS apps (
-    id         TEXT PRIMARY KEY,
-    name       TEXT NOT NULL,
-    url        TEXT NOT NULL,
-    icon       TEXT NOT NULL DEFAULT 'ti-app',
-    groups     TEXT NOT NULL DEFAULT '[]',
-    sort_order INTEGER NOT NULL DEFAULT 0,
-    section_id TEXT NOT NULL DEFAULT 'applications',
-    created    TEXT NOT NULL DEFAULT (datetime('now')),
-    created_by TEXT NOT NULL DEFAULT 'admin'
-);
-CREATE TABLE IF NOT EXISTS sections (
-    id         TEXT PRIMARY KEY,
-    name       TEXT NOT NULL,
-    sort_order INTEGER NOT NULL DEFAULT 0,
-    created    TEXT NOT NULL DEFAULT (datetime('now'))
-);
 CREATE TABLE IF NOT EXISTS presence (
     username   TEXT PRIMARY KEY,
     song       TEXT NOT NULL DEFAULT '',
@@ -125,16 +108,6 @@ CREATE TABLE IF NOT EXISTS music_requests (
     status        TEXT NOT NULL DEFAULT 'pending',
     created       TEXT NOT NULL DEFAULT (datetime('now'))
 );
--- Accumulated listening time for the (experimental) leaderboard — see
--- routers/leaderboard.py and the accumulation logic in routers/presence.py's
--- POST handler, which adds the elapsed time between two consecutive
--- "playing" heartbeats each time one arrives. Not a live/authoritative
--- listening log, just a running total.
-CREATE TABLE IF NOT EXISTS listening_stats (
-    username         TEXT PRIMARY KEY,
-    seconds_listened INTEGER NOT NULL DEFAULT 0,
-    updated          TEXT NOT NULL DEFAULT (datetime('now'))
-);
 """
 
 
@@ -166,6 +139,14 @@ def init_db() -> None:
         # requests were already in it on the first boot after this
         # deploys. IF EXISTS makes this a no-op on every boot after that.
         conn.execute("DROP TABLE IF EXISTS calendar_events")
+        # Same again for the Apps tab (service tiles + their sections) and
+        # the experimental leaderboard, all removed outright rather than
+        # just unrouted. This drops whatever tile/section rows and
+        # accumulated listening totals were in them on the first boot after
+        # this deploys; IF EXISTS makes it a no-op every boot after that.
+        conn.execute("DROP TABLE IF EXISTS apps")
+        conn.execute("DROP TABLE IF EXISTS sections")
+        conn.execute("DROP TABLE IF EXISTS listening_stats")
         conn.commit()
     finally:
         conn.close()

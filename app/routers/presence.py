@@ -4,7 +4,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
 from ..auth import get_username, touch_user
-from ..config import LISTENING_HEARTBEAT_CAP_SECONDS, PRESENCE_TTL
+from ..config import PRESENCE_TTL
 from ..db import get_db
 
 router = APIRouter()
@@ -35,16 +35,6 @@ async def post_presence(request: Request):
 
     touch_user(username)
     with get_db() as db:
-        # Read the PREVIOUS heartbeat before overwriting it — if that one
-        # said "playing", the gap between it and this one is real listening
-        # time (this heartbeat's own `playing` doesn't matter here: even if
-        # they just paused, the elapsed time since the last heartbeat was
-        # still spent listening). Feeds the (experimental) leaderboard's
-        # minutes-listened stat; see config.LISTENING_HEARTBEAT_CAP_SECONDS
-        # for why this is capped rather than trusted outright.
-        prev = db.execute(
-            "SELECT playing, updated FROM presence WHERE username=?", (username,)
-        ).fetchone()
         db.execute(
             """INSERT INTO presence(username, song, artist, song_id, playing, party_host, updated)
                VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
@@ -57,22 +47,6 @@ async def post_presence(request: Request):
                    updated    = excluded.updated""",
             (username, song, artist, song_id, 1 if playing else 0, party_host),
         )
-        if prev and prev["playing"]:
-            try:
-                prev_dt = datetime.strptime(prev["updated"], "%Y-%m-%d %H:%M:%S")
-                elapsed = (datetime.utcnow() - prev_dt).total_seconds()
-            except (ValueError, TypeError):
-                elapsed = 0
-            elapsed = max(0, min(int(elapsed), LISTENING_HEARTBEAT_CAP_SECONDS))
-            if elapsed:
-                db.execute(
-                    """INSERT INTO listening_stats(username, seconds_listened, updated)
-                       VALUES (?, ?, datetime('now'))
-                       ON CONFLICT(username) DO UPDATE SET
-                           seconds_listened = seconds_listened + excluded.seconds_listened,
-                           updated = excluded.updated""",
-                    (username, elapsed),
-                )
         db.commit()
     return {"ok": True}
 
