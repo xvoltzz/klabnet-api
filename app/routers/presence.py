@@ -67,6 +67,15 @@ def get_presence(request: Request):
                ORDER  BY updated DESC""",
             (cutoff,),
         ).fetchall()
+        # Everyone this service has ever seen, most recently active first.
+        # The frontend used to derive its offline roster from Matrix room
+        # membership, which meant it couldn't draw anybody until the SDK
+        # had downloaded, logged in and finished an initial sync — several
+        # seconds of the rail visibly filling in. This is the same list and
+        # it's already here, so it arrives with the very first poll.
+        roster_rows = db.execute(
+            """SELECT username, last_seen FROM users ORDER BY last_seen DESC"""
+        ).fetchall()
 
     listeners = [
         {
@@ -80,7 +89,14 @@ def get_presence(request: Request):
         }
         for r in rows
     ]
-    return {"listeners": listeners}
+    roster = [
+        {"username": r["username"], "lastSeen": r["last_seen"]}
+        for r in roster_rows
+        # Service accounts aren't people; the frontend filtered these out
+        # of the Matrix-derived roster too.
+        if not r["username"].endswith("-bot")
+    ]
+    return {"listeners": listeners, "roster": roster}
 
 
 @router.delete("/api/presence")
