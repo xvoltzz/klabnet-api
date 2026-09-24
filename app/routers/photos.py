@@ -21,7 +21,7 @@ from datetime import datetime, timedelta
 from fastapi import APIRouter, File, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 
-from ..auth import get_username
+from ..auth import get_groups, get_username, is_admin
 from ..config import PHOTO_MAX_UPLOAD_MB, PHOTOS_PER_POST, POST_MAX_CHARS
 from ..db import get_db
 from ..media import media_ready
@@ -288,6 +288,54 @@ async def create_photo_post(request: Request):
                     "UPDATE photos SET post_id=?, position=? WHERE id=?", (post_id, position, photo_id)
                 )
         db.executemany("INSERT INTO post_tags(post_id, username) VALUES (?, ?)", [(post_id, t) for t in tags])
+        db.commit()
+        row = db.execute(f"SELECT {_COLS} FROM posts WHERE id=?", (post_id,)).fetchone()
+        post = _attach(db, [row], username)[0]
+    return post
+
+
+@router.put("/api/posts/photos/{post_id}")
+async def edit_photo_post(post_id: int, request: Request):
+    """Fix a post after the fact: {caption?, shot_at?, tags?}, each optional,
+    each replacing what's there. Owner or admin. An empty shot_at goes back
+    to the photos' own capture date, same as when posting."""
+    username = get_username(request)
+    if username == "anonymous":
+        return _unauthenticated()
+    try:
+        body = await request.json()
+        if not isinstance(body, dict):
+            raise ValueError("body must be a JSON object")
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "invalid JSON"})
+    with get_db() as db:
+        row = db.execute("SELECT username FROM posts WHERE id=? AND kind='photo'", (post_id,)).fetchone()
+        if row is None:
+            return JSONResponse(status_code=404, content={"error": "not found"})
+        if row["username"] != username and not is_admin(get_groups(request)):
+            return JSONResponse(status_code=403, content={"error": "not your post"})
+        owner = row["username"]
+        if "caption" in body:
+            db.execute("UPDATE posts SET text=? WHERE id=?", (str(body.get("caption") or "").strip()[:POST_MAX_CHARS], post_id))
+        if "shot_at" in body:
+            shot_at = _clean_shot_at(body.get("shot_at"))
+            if shot_at is None:
+                return JSONResponse(status_code=400, content={"error": "that shooting date isn't a real date"})
+            if not shot_at:
+                ids = [r["id"] for r in db.execute("SELECT id FROM photos WHERE post_id=?", (post_id,)).fetchall()]
+                shot_at = _earliest_taken(db, ids) if ids else ""
+            db.execute("UPDATE posts SET shot_at=? WHERE id=?", (shot_at, post_id))
+        if "tags" in body:
+            raw = body.get("tags") if isinstance(body.get("tags"), list) else []
+            wanted = list(dict.fromkeys(str(t).strip().lower() for t in raw if str(t).strip()))[:MAX_TAGS]
+            wanted = [t for t in wanted if t != owner]
+            tags = []
+            if wanted:
+                marks = ",".join("?" for _ in wanted)
+                known = {r["username"] for r in db.execute(f"SELECT username FROM users WHERE username IN ({marks})", wanted).fetchall()}
+                tags = [t for t in wanted if t in known]
+            db.execute("DELETE FROM post_tags WHERE post_id=?", (post_id,))
+            db.executemany("INSERT INTO post_tags(post_id, username) VALUES (?, ?)", [(post_id, t) for t in tags])
         db.commit()
         row = db.execute(f"SELECT {_COLS} FROM posts WHERE id=?", (post_id,)).fetchone()
         post = _attach(db, [row], username)[0]
