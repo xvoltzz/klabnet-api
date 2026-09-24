@@ -152,6 +152,7 @@ def delete_post(post_id: int, request: Request):
         # No FK cascade in this DB (see db.py) — clean up manually.
         photo_ids = [r["id"] for r in db.execute("SELECT id FROM photos WHERE post_id=?", (post_id,)).fetchall()]
         db.execute("DELETE FROM photos WHERE post_id=?", (post_id,))
+        db.execute("DELETE FROM post_tags WHERE post_id=?", (post_id,))
         db.execute("DELETE FROM post_reactions WHERE post_id=?", (post_id,))
         db.execute("DELETE FROM post_replies WHERE post_id=?", (post_id,))
         db.execute("DELETE FROM posts WHERE id=?", (post_id,))

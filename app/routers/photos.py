@@ -15,6 +15,8 @@ ids. Uploads never attached to a post are swept after a day.
 
 import json
 import os
+import re
+from datetime import datetime, timedelta
 
 from fastapi import APIRouter, File, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
@@ -115,45 +117,106 @@ def get_photo_file(photo_id: str, size: str):
     )
 
 
-@router.get("/api/posts/photos")
-def list_photo_posts(request: Request, limit: int = 40, before_id: int | None = None):
-    """Photo posts, newest first, each with its photos in order."""
-    limit = max(1, min(limit, 100))
-    username = get_username(request)
-    cols = "id, username, text, image_mxc, song_json, created"
-    with get_db() as db:
-        if before_id is not None:
-            rows = db.execute(
-                f"SELECT {cols} FROM posts WHERE kind='photo' AND id < ? ORDER BY id DESC LIMIT ?",
-                (before_id, limit),
-            ).fetchall()
-        else:
-            rows = db.execute(
-                f"SELECT {cols} FROM posts WHERE kind='photo' ORDER BY id DESC LIMIT ?", (limit,)
-            ).fetchall()
-        ids = [r["id"] for r in rows]
-        reactions, reply_counts = _reactions_and_reply_counts(db, ids, username)
-        photos: dict[int, list] = {}
-        if ids:
-            marks = ",".join("?" for _ in ids)
-            for p in db.execute(
-                f"SELECT * FROM photos WHERE post_id IN ({marks}) ORDER BY post_id, position", ids
-            ).fetchall():
-                photos.setdefault(p["post_id"], []).append(_photo_json(p))
-    posts = []
+# Timeline order: when the photos were taken, falling back to when they were
+# posted. Both are "YYYY-MM-DD HH:MM:SS", so they compare as strings.
+_SORT = "CASE WHEN shot_at != '' THEN shot_at ELSE created END"
+_COLS = f"id, username, text, image_mxc, song_json, created, shot_at, {_SORT} AS sort_at"
+_SHOT_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{2}):(\d{2})(?::(\d{2}))?)?$")
+MAX_TAGS = 20
+
+
+def _clean_shot_at(raw) -> str | None:
+    """'YYYY-MM-DD' or 'YYYY-MM-DD HH:MM[:SS]' -> 'YYYY-MM-DD HH:MM:SS';
+    '' for unknown; None if it isn't a real date. A bare date gets noon, so
+    it lands mid-day rather than sorting before everything that day."""
+    raw = str(raw or "").strip()
+    if not raw:
+        return ""
+    m = _SHOT_RE.match(raw)
+    if not m:
+        return None
+    y, mo, d, h, mi, sec = (int(x) if x else None for x in m.groups())
+    try:
+        when = datetime(y, mo, d, 12 if h is None else h, mi or 0, sec or 0)
+    except ValueError:
+        return None
+    if when.year < 1826 or when > datetime.now() + timedelta(days=2):
+        return None
+    return when.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _earliest_taken(db, photo_ids) -> str:
+    """Default shooting date: the earliest EXIF capture time among the photos."""
+    marks = ",".join("?" for _ in photo_ids)
+    best = ""
+    for r in db.execute(f"SELECT exif_json FROM photos WHERE id IN ({marks})", photo_ids).fetchall():
+        try:
+            taken = _clean_shot_at(json.loads(r["exif_json"]).get("taken", ""))
+        except (ValueError, TypeError, AttributeError):
+            taken = None
+        if taken and (not best or taken < best):
+            best = taken
+    return best
+
+
+def _attach(db, rows, username) -> list:
+    ids = [r["id"] for r in rows]
+    reactions, reply_counts = _reactions_and_reply_counts(db, ids, username)
+    photos: dict[int, list] = {}
+    tags: dict[int, list] = {}
+    if ids:
+        marks = ",".join("?" for _ in ids)
+        for p in db.execute(
+            f"SELECT * FROM photos WHERE post_id IN ({marks}) ORDER BY post_id, position", ids
+        ).fetchall():
+            photos.setdefault(p["post_id"], []).append(_photo_json(p))
+        for t in db.execute(
+            f"SELECT post_id, username FROM post_tags WHERE post_id IN ({marks}) ORDER BY username", ids
+        ).fetchall():
+            tags.setdefault(t["post_id"], []).append(t["username"])
+    out = []
     for r in rows:
         post = _row_to_post(r, reactions, reply_counts)
         post["photos"] = photos.get(r["id"], [])
+        post["tags"] = tags.get(r["id"], [])
+        post["shot_at"] = r["shot_at"]
+        post["sort_at"] = r["sort_at"]
         if post["photos"]:
-            posts.append(post)
+            out.append(post)
+    return out
+
+
+@router.get("/api/posts/photos")
+def list_photo_posts(
+    request: Request, limit: int = 40, before_sort: str | None = None, before_id: int | None = None
+):
+    """Photo posts in timeline order, newest shot first. Page back with the
+    last post's sort_at + id."""
+    limit = max(1, min(limit, 100))
+    username = get_username(request)
+    with get_db() as db:
+        if before_sort is not None and before_id is not None:
+            rows = db.execute(
+                f"""SELECT {_COLS} FROM posts WHERE kind='photo'
+                    AND ({_SORT} < ? OR ({_SORT} = ? AND id < ?))
+                    ORDER BY sort_at DESC, id DESC LIMIT ?""",
+                (before_sort, before_sort, before_id, limit),
+            ).fetchall()
+        else:
+            rows = db.execute(
+                f"SELECT {_COLS} FROM posts WHERE kind='photo' ORDER BY sort_at DESC, id DESC LIMIT ?", (limit,)
+            ).fetchall()
+        posts = _attach(db, rows, username)
     return {"posts": posts}
 
 
 @router.post("/api/posts/photos")
 async def create_photo_post(request: Request):
-    """Body: {caption, photos: [{id, exif?}], song?}. `exif` is the
-    composer's edited version; when present it replaces what was read from
-    the file, so a film scan can say what film it was."""
+    """Body: {caption, photos: [{id, exif?}], song?, shot_at?, tags?}.
+    `exif` is the composer's edited version; when present it replaces what
+    was read from the file, so a film scan can say what film it was.
+    `shot_at` defaults to the earliest capture time in the photos' EXIF.
+    `tags` are usernames of people who were on the shoot."""
     username = get_username(request)
     if username == "anonymous":
         return _unauthenticated()
@@ -173,6 +236,12 @@ async def create_photo_post(request: Request):
         return JSONResponse(status_code=400, content={"error": "the same photo is in there twice"})
     caption = str(body.get("caption", "")).strip()[:POST_MAX_CHARS]
     song_json = _sanitize_song(body.get("song"))
+    shot_at = _clean_shot_at(body.get("shot_at"))
+    if shot_at is None:
+        return JSONResponse(status_code=400, content={"error": "that shooting date isn't a real date"})
+    raw_tags = body.get("tags") if isinstance(body.get("tags"), list) else []
+    wanted = list(dict.fromkeys(str(t).strip().lower() for t in raw_tags if str(t).strip()))[:MAX_TAGS]
+    wanted = [t for t in wanted if t != username]
 
     with get_db() as db:
         marks = ",".join("?" for _ in photo_ids)
@@ -182,9 +251,18 @@ async def create_photo_post(request: Request):
         ).fetchone()[0]
         if owned != len(photo_ids):
             return JSONResponse(status_code=400, content={"error": "some of those photos aren't available"})
+        # Only people this site actually knows can be tagged.
+        tags = []
+        if wanted:
+            tmarks = ",".join("?" for _ in wanted)
+            known = {r["username"] for r in db.execute(
+                f"SELECT username FROM users WHERE username IN ({tmarks})", wanted).fetchall()}
+            tags = [t for t in wanted if t in known]
+        if not shot_at and not body.get("shot_at_cleared"):
+            shot_at = _earliest_taken(db, photo_ids)
         cur = db.execute(
-            "INSERT INTO posts(username, text, song_json, kind) VALUES (?, ?, ?, 'photo')",
-            (username, caption, song_json),
+            "INSERT INTO posts(username, text, song_json, kind, shot_at) VALUES (?, ?, ?, 'photo', ?)",
+            (username, caption, song_json, shot_at),
         )
         post_id = cur.lastrowid
         for position, (photo_id, item) in enumerate(zip(photo_ids, items)):
@@ -197,14 +275,8 @@ async def create_photo_post(request: Request):
                 db.execute(
                     "UPDATE photos SET post_id=?, position=? WHERE id=?", (post_id, position, photo_id)
                 )
+        db.executemany("INSERT INTO post_tags(post_id, username) VALUES (?, ?)", [(post_id, t) for t in tags])
         db.commit()
-        row = db.execute(
-            "SELECT id, username, text, image_mxc, song_json, created FROM posts WHERE id=?", (post_id,)
-        ).fetchone()
-        photos = [
-            _photo_json(p)
-            for p in db.execute("SELECT * FROM photos WHERE post_id=? ORDER BY position", (post_id,)).fetchall()
-        ]
-    post = _row_to_post(row, {}, {})
-    post["photos"] = photos
+        row = db.execute(f"SELECT {_COLS} FROM posts WHERE id=?", (post_id,)).fetchone()
+        post = _attach(db, [row], username)[0]
     return post

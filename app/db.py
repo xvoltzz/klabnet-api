@@ -60,6 +60,7 @@ CREATE TABLE IF NOT EXISTS posts (
     image_mxc TEXT NOT NULL DEFAULT '',
     song_json TEXT NOT NULL DEFAULT '',
     kind      TEXT NOT NULL DEFAULT '',
+    shot_at   TEXT NOT NULL DEFAULT '',
     created   TEXT NOT NULL DEFAULT (datetime('now'))
 );
 -- One row per (post, user, emoji) — a user can react to the same post with
@@ -100,6 +101,14 @@ CREATE TABLE IF NOT EXISTS photos (
     created   TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS photos_by_post ON photos(post_id, position);
+-- People tagged in a post ("we were on this shoot together"). Kept as rows
+-- rather than a JSON column so a profile can later list photos someone
+-- appears in.
+CREATE TABLE IF NOT EXISTS post_tags (
+    post_id  INTEGER NOT NULL,
+    username TEXT NOT NULL,
+    PRIMARY KEY (post_id, username)
+);
 -- Public-facing profile data (chat name color, bio, banner image) — unlike
 -- `prefs`, this is meant to be readable by anyone, not just its owner, so it
 -- gets its own table rather than living in that private per-user blob. Row
@@ -157,6 +166,11 @@ def init_db() -> None:
         # so the feed and the Photos tab each list only their own.
         if "kind" not in post_cols:
             conn.execute("ALTER TABLE posts ADD COLUMN kind TEXT NOT NULL DEFAULT ''")
+        # shot_at: when a photo post was taken ("YYYY-MM-DD HH:MM:SS", local
+        # wall time), so old photos uploaded today sort where they belong.
+        # '' means unknown, and the post sorts by when it was posted.
+        if "shot_at" not in post_cols:
+            conn.execute("ALTER TABLE posts ADD COLUMN shot_at TEXT NOT NULL DEFAULT ''")
         # The calendar / "book with" feature was removed outright (not just
         # its routes) — drops the table and whatever events/booking
         # requests were already in it on the first boot after this
