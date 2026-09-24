@@ -1,10 +1,15 @@
 """Photo processing and storage for the Photos tab.
 
-Every upload becomes three files under MEDIA_DIR/photos/<id[:2]>/<id>/:
+Every upload becomes these files under MEDIA_DIR/photos/<id[:2]>/<id>/:
 
   original.jpg  full resolution, full quality, location removed
-  display.jpg   2560px long edge, what the big view shows
+  display.jpg   2560px long edge, what the big view shows on a large screen
+  medium.jpg    1440px long edge, the big view on a phone or small window
   thumb.jpg     320px long edge, the filmstrip and the instant placeholder
+
+plus an .avif of display, medium and thumb, served to browsers that take
+it (all current ones): the same picture at 40-60% of the JPEG's size,
+which is what decides how fast a photo appears away from home.
 
 Location privacy: a phone photo carries GPS coordinates precise enough to
 find someone's front door. For JPEGs the GPS block is zeroed in place and
@@ -21,7 +26,7 @@ import secrets
 import shutil
 import struct
 
-from PIL import Image, ImageOps
+from PIL import Image, ImageOps, features
 from pillow_heif import register_heif_opener
 
 from .config import MEDIA_DIR
@@ -32,8 +37,11 @@ register_heif_opener()
 Image.MAX_IMAGE_PIXELS = 200_000_000
 
 THUMB_EDGE = 320
+MEDIUM_EDGE = 1440
 DISPLAY_EDGE = 2560
-SIZES = ("thumb", "display", "original")
+SIZES = ("thumb", "medium", "display", "original")
+AVIF_SIZES = ("thumb", "medium", "display")
+HAS_AVIF = features.check("avif")
 EXIF_FIELDS = ("camera", "lens", "aperture", "shutter", "iso", "focal", "film", "taken")
 EXIF_FIELD_MAX_CHARS = 120
 
@@ -56,8 +64,20 @@ def photo_dir(photo_id: str) -> str:
     return os.path.join(MEDIA_DIR, "photos", photo_id[:2], photo_id)
 
 
-def photo_path(photo_id: str, size: str) -> str:
-    return os.path.join(photo_dir(photo_id), f"{size}.jpg")
+def photo_path(photo_id: str, size: str, avif: bool = False) -> str | None:
+    """The file to serve for a size, or None. `avif` asks for the AVIF copy
+    when there is one. Photos from before a size existed fall back to the
+    next size up (medium -> display), so old posts keep working."""
+    d = photo_dir(photo_id)
+    for name in ([size] + (["display"] if size == "medium" else [])):
+        if avif and name in AVIF_SIZES:
+            p = os.path.join(d, f"{name}.avif")
+            if os.path.isfile(p):
+                return p
+        p = os.path.join(d, f"{name}.jpg")
+        if os.path.isfile(p):
+            return p
+    return None
 
 
 def delete_photo_files(photo_ids) -> None:
@@ -232,6 +252,64 @@ def _save_jpeg(img: Image.Image, path: str, quality: int, icc) -> None:
     img.save(path, "JPEG", **kwargs)
 
 
+def _save_avif(img: Image.Image, path: str, icc) -> None:
+    # q60 at speed 8: visually matches the q88 JPEG at 40-60% of its size,
+    # and encodes faster than WebP would.
+    kwargs = {"quality": 60, "speed": 8}
+    if icc:
+        kwargs["icc_profile"] = icc
+    img.save(path, "AVIF", **kwargs)
+
+
+def write_derivatives(oriented: Image.Image, folder: str, icc) -> None:
+    """display / medium / thumb, as JPEG and (when available) AVIF."""
+    img = oriented.copy()
+    # Nothing from the original's metadata rides along: some encoders
+    # (AVIF among them) copy EXIF/XMP from the image unless told otherwise,
+    # and the rotated copy still carries the original's, GPS and all. The
+    # colour profile is passed explicitly instead.
+    img.info = {}
+    for name, edge, q in (("display", DISPLAY_EDGE, 88), ("medium", MEDIUM_EDGE, 86), ("thumb", THUMB_EDGE, 80)):
+        img.thumbnail((edge, edge), Image.LANCZOS)  # each step shrinks the last one
+        _save_jpeg(img, os.path.join(folder, f"{name}.jpg"), q, icc)
+        if HAS_AVIF:
+            _save_avif(img, os.path.join(folder, f"{name}.avif"), icc)
+
+
+def backfill_derivatives(log=print) -> int:
+    """Give photos uploaded before medium/AVIF existed their missing files,
+    from their original. Safe to run repeatedly: a folder that already has
+    them is skipped. Returns how many were filled."""
+    root = os.path.join(MEDIA_DIR, "photos")
+    if not os.path.isdir(root):
+        return 0
+    want = ["medium.jpg"] + ([f"{n}.avif" for n in AVIF_SIZES] if HAS_AVIF else [])
+    done = 0
+    for shard in sorted(os.listdir(root)):
+        for photo_id in sorted(os.listdir(os.path.join(root, shard))):
+            folder = os.path.join(root, shard, photo_id)
+            if not valid_photo_id(photo_id) or not os.path.isfile(os.path.join(folder, "original.jpg")):
+                continue
+            if all(os.path.isfile(os.path.join(folder, w)) for w in want):
+                continue
+            try:
+                img = Image.open(os.path.join(folder, "original.jpg"))
+                img.load()
+                icc = img.info.get("icc_profile")
+                oriented = ImageOps.exif_transpose(img).convert("RGB")
+                tmp = folder + ".partial"
+                os.makedirs(tmp, exist_ok=True)
+                write_derivatives(oriented, tmp, icc)
+                for f in os.listdir(tmp):
+                    if f != "display.jpg" and f != "thumb.jpg":  # the existing JPEGs stay as they were
+                        os.replace(os.path.join(tmp, f), os.path.join(folder, f))
+                shutil.rmtree(tmp, ignore_errors=True)
+                done += 1
+            except Exception as e:  # one bad file mustn't stop the rest
+                log(f"backfill {photo_id}: {e}")
+    return done
+
+
 def process_upload(data: bytes) -> dict:
     """Validate, strip and store one upload. Returns
     {id, width, height, exif}; files are on disk before this returns."""
@@ -278,11 +356,7 @@ def process_upload(data: bytes) -> dict:
                 fh.write(original)
         else:
             _save_jpeg(oriented, os.path.join(tmp, "original.jpg"), 95, icc)
-        display = oriented.copy()
-        display.thumbnail((DISPLAY_EDGE, DISPLAY_EDGE), Image.LANCZOS)
-        _save_jpeg(display, os.path.join(tmp, "display.jpg"), 88, icc)
-        display.thumbnail((THUMB_EDGE, THUMB_EDGE), Image.LANCZOS)
-        _save_jpeg(display, os.path.join(tmp, "thumb.jpg"), 80, icc)
+        write_derivatives(oriented, tmp, icc)
         os.rename(tmp, final)
     except Exception:
         shutil.rmtree(tmp, ignore_errors=True)

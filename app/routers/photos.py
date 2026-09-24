@@ -103,17 +103,20 @@ def discard_upload(photo_id: str, request: Request):
 
 
 @router.get("/api/posts/photos/files/{photo_id}/{size}")
-def get_photo_file(photo_id: str, size: str):
+def get_photo_file(photo_id: str, size: str, request: Request):
     if size not in SIZES or not valid_photo_id(photo_id):
         return JSONResponse(status_code=404, content={"error": "not found"})
-    path = photo_path(photo_id, size)
-    if not os.path.isfile(path):
+    # AVIF to any browser that says it takes it (every current one puts
+    # image/avif in an <img>'s Accept header); JPEG to anything else.
+    avif = "image/avif" in request.headers.get("accept", "")
+    path = photo_path(photo_id, size, avif=avif)
+    if path is None:
         return JSONResponse(status_code=404, content={"error": "not found"})
     # A photo id's files never change, so the browser can keep them forever.
     return FileResponse(
         path,
-        media_type="image/jpeg",
-        headers={"Cache-Control": "private, max-age=31536000, immutable"},
+        media_type="image/avif" if path.endswith(".avif") else "image/jpeg",
+        headers={"Cache-Control": "private, max-age=31536000, immutable", "Vary": "Accept"},
     )
 
 
