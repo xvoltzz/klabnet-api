@@ -34,6 +34,9 @@ def _load_local_env(path: str) -> None:
 _load_local_env(os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env"))
 
 DB_PATH      = os.environ.get("DB_PATH", "/data/prefs.db")
+# Where uploaded photos live. On the server this is the Vault SMB share,
+# bind-mounted in by compose.yml.
+MEDIA_DIR    = os.environ.get("MEDIA_DIR", "/media")
 ADMIN_GROUP  = os.environ.get("ADMIN_GROUP", "klabnet-admin")
 PRESENCE_TTL = int(os.environ.get("PRESENCE_TTL", "30"))  # seconds
 NOTE_TTL_HOURS  = int(os.environ.get("NOTE_TTL_HOURS", "24"))

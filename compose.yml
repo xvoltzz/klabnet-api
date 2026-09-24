@@ -7,6 +7,10 @@ services:
       - "8765:8765"
     volumes:
       - ./data:/data
+      # Full-quality photo storage on the Vault share. Only image files go
+      # here — the SQLite db stays on ./data, since file locking over SMB
+      # isn't reliable enough for it.
+      - /mnt/Vault/KLAB/KLABNET:/media
     # Secrets live in a .env next to this file, which is gitignored and never
     # baked into the image (the Dockerfile only COPYs app/, so config.py's own
     # .env fallback can't see one from inside the container — it has to come
@@ -17,3 +21,4 @@ services:
         required: false
     environment:
       DB_PATH: /data/prefs.db
+      MEDIA_DIR: /media
