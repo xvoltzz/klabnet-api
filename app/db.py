@@ -171,6 +171,18 @@ def init_db() -> None:
         # '' means unknown, and the post sorts by when it was posted.
         if "shot_at" not in post_cols:
             conn.execute("ALTER TABLE posts ADD COLUMN shot_at TEXT NOT NULL DEFAULT ''")
+        # Photo posts made before shot_at existed have none, so they sorted by
+        # when they were posted. Fill each from the earliest capture time in
+        # its photos' EXIF, the same default a new post gets. Only touches
+        # undated photo posts that have one, so it's a no-op once they're filled.
+        conn.execute(
+            """UPDATE posts SET shot_at = (
+                   SELECT MIN(json_extract(exif_json, '$.taken')) FROM photos
+                   WHERE photos.post_id = posts.id AND COALESCE(json_extract(exif_json, '$.taken'), '') != '')
+               WHERE kind = 'photo' AND shot_at = ''
+                 AND EXISTS (SELECT 1 FROM photos WHERE photos.post_id = posts.id
+                             AND COALESCE(json_extract(exif_json, '$.taken'), '') != '')"""
+        )
         # The calendar / "book with" feature was removed outright (not just
         # its routes) — drops the table and whatever events/booking
         # requests were already in it on the first boot after this
