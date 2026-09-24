@@ -123,6 +123,7 @@ _SORT = "CASE WHEN shot_at != '' THEN shot_at ELSE created END"
 _COLS = f"id, username, text, image_mxc, song_json, created, shot_at, {_SORT} AS sort_at"
 _SHOT_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{2}):(\d{2})(?::(\d{2}))?)?$")
 MAX_TAGS = 20
+LIKE = "❤️"
 
 
 def _clean_shot_at(raw) -> str | None:
@@ -164,6 +165,7 @@ def _attach(db, rows, username) -> list:
     reactions, reply_counts = _reactions_and_reply_counts(db, ids, username)
     photos: dict[int, list] = {}
     tags: dict[int, list] = {}
+    likers: dict[int, list] = {}
     if ids:
         marks = ",".join("?" for _ in ids)
         for p in db.execute(
@@ -174,11 +176,18 @@ def _attach(db, rows, username) -> list:
             f"SELECT post_id, username FROM post_tags WHERE post_id IN ({marks}) ORDER BY username", ids
         ).fetchall():
             tags.setdefault(t["post_id"], []).append(t["username"])
+        # The Photos tab's only reaction is a heart, and it shows who gave one.
+        for lk in db.execute(
+            f"SELECT post_id, username FROM post_reactions WHERE post_id IN ({marks}) AND emoji=? ORDER BY created",
+            (*ids, LIKE),
+        ).fetchall():
+            likers.setdefault(lk["post_id"], []).append(lk["username"])
     out = []
     for r in rows:
         post = _row_to_post(r, reactions, reply_counts)
         post["photos"] = photos.get(r["id"], [])
         post["tags"] = tags.get(r["id"], [])
+        post["likers"] = likers.get(r["id"], [])
         post["shot_at"] = r["shot_at"]
         post["sort_at"] = r["sort_at"]
         if post["photos"]:
