@@ -59,6 +59,7 @@ CREATE TABLE IF NOT EXISTS posts (
     text      TEXT NOT NULL DEFAULT '',
     image_mxc TEXT NOT NULL DEFAULT '',
     song_json TEXT NOT NULL DEFAULT '',
+    kind      TEXT NOT NULL DEFAULT '',
     created   TEXT NOT NULL DEFAULT (datetime('now'))
 );
 -- One row per (post, user, emoji) — a user can react to the same post with
@@ -81,6 +82,24 @@ CREATE TABLE IF NOT EXISTS post_replies (
     text     TEXT NOT NULL,
     created  TEXT NOT NULL DEFAULT (datetime('now'))
 );
+-- Photos tab. A photo post is a `posts` row with kind='photo'; its images
+-- are rows here, ordered by position. post_id stays NULL between upload
+-- and posting (the composer uploads as soon as a file is picked), and
+-- unattached rows older than a day are swept on the next upload. The files
+-- themselves live on the media share, not in this database (see
+-- photos_store.py). exif_json holds display strings (camera, lens,
+-- aperture, ...), never location.
+CREATE TABLE IF NOT EXISTS photos (
+    id        TEXT PRIMARY KEY,
+    username  TEXT NOT NULL,
+    post_id   INTEGER,
+    position  INTEGER NOT NULL DEFAULT 0,
+    width     INTEGER NOT NULL,
+    height    INTEGER NOT NULL,
+    exif_json TEXT NOT NULL DEFAULT '{}',
+    created   TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS photos_by_post ON photos(post_id, position);
 -- Public-facing profile data (chat name color, bio, banner image) — unlike
 -- `prefs`, this is meant to be readable by anyone, not just its owner, so it
 -- gets its own table rather than living in that private per-user blob. Row
@@ -134,6 +153,10 @@ def init_db() -> None:
         post_cols = [row[1] for row in conn.execute("PRAGMA table_info(posts)").fetchall()]
         if "song_json" not in post_cols:
             conn.execute("ALTER TABLE posts ADD COLUMN song_json TEXT NOT NULL DEFAULT ''")
+        # kind is new too: '' for feed posts, 'photo' for Photos-tab posts,
+        # so the feed and the Photos tab each list only their own.
+        if "kind" not in post_cols:
+            conn.execute("ALTER TABLE posts ADD COLUMN kind TEXT NOT NULL DEFAULT ''")
         # The calendar / "book with" feature was removed outright (not just
         # its routes) — drops the table and whatever events/booking
         # requests were already in it on the first boot after this

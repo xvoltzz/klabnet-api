@@ -7,6 +7,7 @@ from fastapi.responses import JSONResponse
 from ..auth import get_groups, get_username, is_admin
 from ..config import EMOJI_MAX_CHARS, POST_MAX_CHARS, SONG_FIELD_MAX_CHARS, SONG_LYRIC_MAX_CHARS
 from ..db import get_db
+from ..photos_store import delete_photo_files
 
 router = APIRouter()
 
@@ -34,6 +35,10 @@ def _sanitize_song(raw) -> str:
         "coverArt": str(raw.get("coverArt", "")).strip()[:200],
         "lyric": str(raw.get("lyric") or "").strip()[:SONG_LYRIC_MAX_CHARS],
     }
+    # Photo posts play a clip starting here (seconds into the track).
+    start = raw.get("start")
+    if isinstance(start, (int, float)) and 0 < start < 3600:
+        song["start"] = round(float(start), 1)
     return json.dumps(song)
 
 
@@ -92,12 +97,12 @@ def get_posts(request: Request, limit: int = 50, before_id: int | None = None):
     with get_db() as db:
         if before_id is not None:
             rows = db.execute(
-                "SELECT id, username, text, image_mxc, song_json, created FROM posts WHERE id < ? ORDER BY id DESC LIMIT ?",
+                "SELECT id, username, text, image_mxc, song_json, created FROM posts WHERE kind='' AND id < ? ORDER BY id DESC LIMIT ?",
                 (before_id, limit),
             ).fetchall()
         else:
             rows = db.execute(
-                "SELECT id, username, text, image_mxc, song_json, created FROM posts ORDER BY id DESC LIMIT ?",
+                "SELECT id, username, text, image_mxc, song_json, created FROM posts WHERE kind='' ORDER BY id DESC LIMIT ?",
                 (limit,),
             ).fetchall()
         reactions, reply_counts = _reactions_and_reply_counts(db, [r["id"] for r in rows], username)
@@ -145,10 +150,13 @@ def delete_post(post_id: int, request: Request):
         if row["username"] != username and not is_admin(get_groups(request)):
             return JSONResponse(status_code=403, content={"error": "not your post"})
         # No FK cascade in this DB (see db.py) — clean up manually.
+        photo_ids = [r["id"] for r in db.execute("SELECT id FROM photos WHERE post_id=?", (post_id,)).fetchall()]
+        db.execute("DELETE FROM photos WHERE post_id=?", (post_id,))
         db.execute("DELETE FROM post_reactions WHERE post_id=?", (post_id,))
         db.execute("DELETE FROM post_replies WHERE post_id=?", (post_id,))
         db.execute("DELETE FROM posts WHERE id=?", (post_id,))
         db.commit()
+    delete_photo_files(photo_ids)
     return {"ok": True}
 
 

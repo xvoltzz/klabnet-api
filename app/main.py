@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from .config import APP_VERSION, CORS_ORIGINS
 from .db import init_db
-from .routers import feedback, health, identity, music_requests, notes, posts, prefs, presence, profiles
+from .routers import feedback, health, identity, music_requests, notes, photos, posts, prefs, presence, profiles
 
 
 @asynccontextmanager
@@ -26,5 +26,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-for router in (health.router, identity.router, prefs.router, presence.router, notes.router, posts.router, profiles.router, music_requests.router, feedback.router):
+# photos before posts: its /api/posts/photos/... paths must win over /api/posts/{post_id}.
+for router in (health.router, identity.router, prefs.router, presence.router, notes.router, photos.router, posts.router, profiles.router, music_requests.router, feedback.router):
     app.include_router(router)

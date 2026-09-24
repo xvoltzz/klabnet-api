@@ -37,6 +37,8 @@ DB_PATH      = os.environ.get("DB_PATH", "/data/prefs.db")
 # Where uploaded photos live. On the server this is the Vault SMB share,
 # bind-mounted in by compose.yml.
 MEDIA_DIR    = os.environ.get("MEDIA_DIR", "/media")
+PHOTO_MAX_UPLOAD_MB = int(os.environ.get("PHOTO_MAX_UPLOAD_MB", "60"))
+PHOTOS_PER_POST     = int(os.environ.get("PHOTOS_PER_POST", "10"))
 ADMIN_GROUP  = os.environ.get("ADMIN_GROUP", "klabnet-admin")
 PRESENCE_TTL = int(os.environ.get("PRESENCE_TTL", "30"))  # seconds
 NOTE_TTL_HOURS  = int(os.environ.get("NOTE_TTL_HOURS", "24"))
