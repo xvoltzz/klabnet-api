@@ -246,16 +246,29 @@ def strip_jpeg_location(data: bytes) -> bytes:
 # ── The whole upload ──
 
 def _save_jpeg(img: Image.Image, path: str, quality: int, icc) -> None:
-    kwargs = {"quality": quality, "optimize": True, "progressive": True}
+    kwargs = {"quality": quality, "optimize": True, "progressive": True, "subsampling": 0}
     if icc:
         kwargs["icc_profile"] = icc
     img.save(path, "JPEG", **kwargs)
 
 
-def _save_avif(img: Image.Image, path: str, icc) -> None:
-    # q60 at speed 8: visually matches the q88 JPEG at 40-60% of its size,
-    # and encodes faster than WebP would.
-    kwargs = {"quality": 60, "speed": 8}
+# Bumped whenever the copies below change; each photo folder holds a
+# `.q<N>` marker, and folders without the current one are rebuilt from
+# their original at startup. The frontend puts it in file URLs (?v=N) so
+# browsers holding the old copies (served as immutable) fetch the new ones.
+DERIV_VERSION = 2
+DERIV_MARKER = f".q{DERIV_VERSION}"
+
+# Per size: (long edge, JPEG quality, AVIF quality). v1 used AVIF q60,
+# which on real photos turned skies' fine grain into flat blocks: visible
+# banding, at 8-25KB for a 2560px image. q90 with full-resolution colour
+# (4:4:4) is indistinguishable from the original on those same skies at
+# ~300KB, still under half a comparable JPEG.
+DERIVATIVES = (("display", DISPLAY_EDGE, 92, 90), ("medium", MEDIUM_EDGE, 90, 90), ("thumb", THUMB_EDGE, 82, 75))
+
+
+def _save_avif(img: Image.Image, path: str, quality: int, icc) -> None:
+    kwargs = {"quality": quality, "speed": 6, "subsampling": "4:4:4"}
     if icc:
         kwargs["icc_profile"] = icc
     img.save(path, "AVIF", **kwargs)
@@ -269,28 +282,29 @@ def write_derivatives(oriented: Image.Image, folder: str, icc) -> None:
     # and the rotated copy still carries the original's, GPS and all. The
     # colour profile is passed explicitly instead.
     img.info = {}
-    for name, edge, q in (("display", DISPLAY_EDGE, 88), ("medium", MEDIUM_EDGE, 86), ("thumb", THUMB_EDGE, 80)):
+    for name, edge, jq, aq in DERIVATIVES:
         img.thumbnail((edge, edge), Image.LANCZOS)  # each step shrinks the last one
-        _save_jpeg(img, os.path.join(folder, f"{name}.jpg"), q, icc)
+        _save_jpeg(img, os.path.join(folder, f"{name}.jpg"), jq, icc)
         if HAS_AVIF:
-            _save_avif(img, os.path.join(folder, f"{name}.avif"), icc)
+            _save_avif(img, os.path.join(folder, f"{name}.avif"), aq, icc)
+    open(os.path.join(folder, DERIV_MARKER), "w").close()
 
 
 def backfill_derivatives(log=print) -> int:
-    """Give photos uploaded before medium/AVIF existed their missing files,
-    from their original. Safe to run repeatedly: a folder that already has
-    them is skipped. Returns how many were filled."""
+    """Rebuild the smaller copies of any photo made by an older version of
+    write_derivatives() (no current `.q<N>` marker), from its original.
+    Safe to run repeatedly: up-to-date folders are skipped. Returns how
+    many were rebuilt."""
     root = os.path.join(MEDIA_DIR, "photos")
     if not os.path.isdir(root):
         return 0
-    want = ["medium.jpg"] + ([f"{n}.avif" for n in AVIF_SIZES] if HAS_AVIF else [])
     done = 0
     for shard in sorted(os.listdir(root)):
         for photo_id in sorted(os.listdir(os.path.join(root, shard))):
             folder = os.path.join(root, shard, photo_id)
             if not valid_photo_id(photo_id) or not os.path.isfile(os.path.join(folder, "original.jpg")):
                 continue
-            if all(os.path.isfile(os.path.join(folder, w)) for w in want):
+            if os.path.isfile(os.path.join(folder, DERIV_MARKER)):
                 continue
             try:
                 img = Image.open(os.path.join(folder, "original.jpg"))
@@ -300,10 +314,13 @@ def backfill_derivatives(log=print) -> int:
                 tmp = folder + ".partial"
                 os.makedirs(tmp, exist_ok=True)
                 write_derivatives(oriented, tmp, icc)
-                for f in os.listdir(tmp):
-                    if f != "display.jpg" and f != "thumb.jpg":  # the existing JPEGs stay as they were
-                        os.replace(os.path.join(tmp, f), os.path.join(folder, f))
+                # Swap each file in place (the marker last), then drop old markers.
+                for f in sorted(os.listdir(tmp), key=lambda n: n.startswith(".")):
+                    os.replace(os.path.join(tmp, f), os.path.join(folder, f))
                 shutil.rmtree(tmp, ignore_errors=True)
+                for f in os.listdir(folder):
+                    if f.startswith(".q") and f != DERIV_MARKER:
+                        os.remove(os.path.join(folder, f))
                 done += 1
             except Exception as e:  # one bad file mustn't stop the rest
                 log(f"backfill {photo_id}: {e}")
