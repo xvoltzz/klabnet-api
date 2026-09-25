@@ -69,6 +69,9 @@ GITEA_TOKEN = os.environ.get("GITEA_TOKEN", "")
 FEEDBACK_TITLE_MAX_CHARS = int(os.environ.get("FEEDBACK_TITLE_MAX_CHARS", "120"))
 FEEDBACK_BODY_MAX_CHARS  = int(os.environ.get("FEEDBACK_BODY_MAX_CHARS", "4000"))
 
+# ── GIF stash (the picker in chat and the feed) ──
+GIF_MAX_MB = int(os.environ.get("GIF_MAX_MB", "12"))
+
 CORS_ORIGINS = [
     origin.strip()
     for origin in os.environ.get("CORS_ORIGINS", "https://user.klab.gg,https://staging.klab.gg").split(",")

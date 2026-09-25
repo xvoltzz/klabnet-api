@@ -125,6 +125,20 @@ CREATE TABLE IF NOT EXISTS profiles (
 -- cover_art_url is a Cover Art Archive URL predicted client/server-side at
 -- search time (see routers/music_requests.py), not verified to exist here —
 -- the frontend falls back to a placeholder icon on image load failure.
+-- The GIF stash: klabnet's own GIFs, added by pasting a link or uploading.
+-- id is a hash of the file, so the same GIF added twice is one row.
+CREATE TABLE IF NOT EXISTS gifs (
+    id        TEXT PRIMARY KEY,
+    username  TEXT NOT NULL,
+    name      TEXT NOT NULL DEFAULT '',
+    width     INTEGER NOT NULL DEFAULT 0,
+    height    INTEGER NOT NULL DEFAULT 0,
+    bytes     INTEGER NOT NULL DEFAULT 0,
+    uses      INTEGER NOT NULL DEFAULT 0,
+    created   TEXT NOT NULL DEFAULT (datetime('now')),
+    last_used TEXT
+);
+
 CREATE TABLE IF NOT EXISTS music_requests (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     username      TEXT NOT NULL,
