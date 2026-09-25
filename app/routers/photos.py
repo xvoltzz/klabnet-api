@@ -200,14 +200,26 @@ def _attach(db, rows, username) -> list:
 
 @router.get("/api/posts/photos")
 def list_photo_posts(
-    request: Request, limit: int = 40, before_sort: str | None = None, before_id: int | None = None
+    request: Request, limit: int = 40, before_sort: str | None = None, before_id: int | None = None,
+    order: str = "shot",
 ):
-    """Photo posts in timeline order, newest shot first. Page back with the
-    last post's sort_at + id."""
+    """Photo posts, newest first. order=shot (default) is the timeline, by
+    when the photos were taken; order=posted is "What's New", by upload.
+    Page back with the last post's sort_at + id. In posted order sort_at is
+    the upload time, so clients can treat both orders the same way."""
     limit = max(1, min(limit, 100))
     username = get_username(request)
+    posted = order == "posted"
     with get_db() as db:
-        if before_sort is not None and before_id is not None:
+        if posted:
+            cols = "id, username, text, image_mxc, song_json, created, shot_at, created AS sort_at"
+            if before_id is not None:
+                rows = db.execute(
+                    f"SELECT {cols} FROM posts WHERE kind='photo' AND id < ? ORDER BY id DESC LIMIT ?", (before_id, limit)
+                ).fetchall()
+            else:
+                rows = db.execute(f"SELECT {cols} FROM posts WHERE kind='photo' ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        elif before_sort is not None and before_id is not None:
             rows = db.execute(
                 f"""SELECT {_COLS} FROM posts WHERE kind='photo'
                     AND ({_SORT} < ? OR ({_SORT} = ? AND id < ?))
