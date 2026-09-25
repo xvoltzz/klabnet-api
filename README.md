@@ -120,5 +120,6 @@ populated before the first push — it's not something the hook bootstraps.
 | `PRESENCE_TTL` | `30` | seconds a presence row stays "active" |
 | `NOTE_TTL_HOURS` | `24` | hours a note stays visible before expiring |
 | `NOTE_MAX_CHARS` | `60` | max note length |
-| `POST_MAX_CHARS` | `500` | max feed post text length |
+| `POST_MAX_CHARS` | `500` | max reply / photo caption length |
+| `FEED_POST_MAX_CHARS` | `10000` | max feed post length (posts are markdown) |
 | `CORS_ORIGINS` | `https://user.klab.gg,https://staging.klab.gg` | comma-separated; only matters for a browser hitting this API cross-origin, which the current frontend doesn't do (it calls relative `/api/...` paths, proxied same-origin through Caddy) |

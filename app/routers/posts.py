@@ -5,7 +5,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
 from ..auth import get_groups, get_username, is_admin
-from ..config import EMOJI_MAX_CHARS, POST_MAX_CHARS, SONG_FIELD_MAX_CHARS, SONG_LYRIC_MAX_CHARS
+from ..config import EMOJI_MAX_CHARS, FEED_POST_MAX_CHARS, POST_MAX_CHARS, SONG_FIELD_MAX_CHARS, SONG_LYRIC_MAX_CHARS
 from ..db import get_db
 from ..photos_store import delete_photo_files
 
@@ -120,7 +120,11 @@ async def create_post(request: Request):
             raise ValueError("body must be a JSON object")
     except Exception:
         return JSONResponse(status_code=400, content={"error": "invalid JSON"})
-    text = str(body.get("text", "")).strip()[:POST_MAX_CHARS]
+    text = str(body.get("text", "")).strip()
+    # Refused rather than cut: a clipped markdown post can end mid-table or
+    # mid-code-block, and the writer would never know what got dropped.
+    if len(text) > FEED_POST_MAX_CHARS:
+        return JSONResponse(status_code=400, content={"error": f"post is too long (max {FEED_POST_MAX_CHARS:,} characters)"})
     image_mxc = str(body.get("image_mxc", "")).strip()
     song_json = _sanitize_song(body.get("song"))
     if not text and not image_mxc and not song_json:

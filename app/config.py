@@ -44,6 +44,8 @@ PRESENCE_TTL = int(os.environ.get("PRESENCE_TTL", "30"))  # seconds
 NOTE_TTL_HOURS  = int(os.environ.get("NOTE_TTL_HOURS", "24"))
 NOTE_MAX_CHARS  = int(os.environ.get("NOTE_MAX_CHARS", "60"))  # same cap Instagram Notes uses
 POST_MAX_CHARS  = int(os.environ.get("POST_MAX_CHARS", "500"))
+# Feed posts are markdown and can run long; replies and photo captions keep POST_MAX_CHARS.
+FEED_POST_MAX_CHARS = int(os.environ.get("FEED_POST_MAX_CHARS", "10000"))
 EMOJI_MAX_CHARS = int(os.environ.get("EMOJI_MAX_CHARS", "32"))  # generous enough for ZWJ/skin-tone sequences
 BIO_MAX_CHARS   = int(os.environ.get("BIO_MAX_CHARS", "160"))
 REQUEST_FIELD_MAX_CHARS = int(os.environ.get("REQUEST_FIELD_MAX_CHARS", "200"))
