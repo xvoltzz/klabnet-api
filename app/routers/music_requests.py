@@ -9,17 +9,20 @@ browser tabs, and it sidesteps any CORS question entirely.
 """
 
 import asyncio
+import os
 import re
 import time
 import unicodedata
+from urllib.parse import urljoin, urlparse
 
 import httpx
 from fastapi import APIRouter, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 
 from ..auth import get_groups, get_username, is_admin
-from ..config import MUSICBRAINZ_USER_AGENT, REQUEST_FIELD_MAX_CHARS
-from ..db import get_db
+from ..config import MEDIA_DIR, MUSICBRAINZ_USER_AGENT, REQUEST_FIELD_MAX_CHARS
+from ..db import art_id, get_db
+from ..media import media_ready
 
 router = APIRouter()
 
@@ -327,7 +330,7 @@ async def hires_artwork(request: Request, artist: str = "", album: str = "", mbi
         ).fetchone()
     # source "none": looked, nothing confident. (null: couldn't look.)
     if row and (row["large"] or row["age"] < _ART_MISS_RETRY_DAYS):
-        return {"large": row["large"] or None, "full": row["full"] or None, "source": row["source"] or "none"}
+        return _art_answer(key, row["large"], row["full"], row["source"] or "none")
 
     found = None
     try:
@@ -343,10 +346,130 @@ async def hires_artwork(request: Request, artist: str = "", album: str = "", mbi
 
     with get_db() as db:
         db.execute(
-            """INSERT INTO art_cache(key, large, full, source, checked) VALUES (?, ?, ?, ?, datetime('now'))
+            """INSERT INTO art_cache(key, large, full, source, checked, id) VALUES (?, ?, ?, ?, datetime('now'), ?)
                ON CONFLICT(key) DO UPDATE SET large=excluded.large, full=excluded.full,
-                   source=excluded.source, checked=excluded.checked""",
-            (key, (found or {}).get("large", ""), (found or {}).get("full", ""), (found or {}).get("source", "")),
+                   source=excluded.source, checked=excluded.checked, id=excluded.id""",
+            (key, (found or {}).get("large", ""), (found or {}).get("full", ""), (found or {}).get("source", ""), art_id(key)),
         )
         db.commit()
-    return found or {"large": None, "full": None, "source": "none"}
+    if not found:
+        return {"large": None, "full": None, "source": "none"}
+    return _art_answer(key, found["large"], found["full"], found["source"])
+
+
+# ── Keeping the art ──
+# The images are kept on the media share, fetched from the catalogue the
+# first time anyone asks for one, so browsers only ever load them from
+# here: nobody's browser talks to Apple or Deezer, and art already kept
+# stays up if a catalogue drops it. Without the share, the catalogue's
+# own links are handed out instead.
+
+_ART_HOSTS = ("mzstatic.com", "dzcdn.net", "coverartarchive.org", "archive.org")
+_ART_MAX_BYTES = 25 * 1024 * 1024
+_ART_FILE_RE = re.compile(r"^([0-9a-f]{20})-([lf])$")
+_ART_RETRY_SECS = 3600
+_art_fetching: dict = {}
+_art_failed: dict = {}  # file name -> when fetching it last failed
+
+
+def _art_answer(key: str, large: str, full: str, source: str) -> dict:
+    if not large:
+        return {"large": None, "full": None, "source": source}
+    if not media_ready():
+        return {"large": large, "full": full or large, "source": source}
+    base = f"/api/music-requests/artwork/files/{art_id(key)}"
+    return {"large": base + "-l", "full": base + "-f", "source": source}
+
+
+def _art_dir() -> str:
+    d = os.path.join(MEDIA_DIR, "art")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _art_type(head: bytes):
+    if head[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if head[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
+def _art_host_ok(url: str) -> bool:
+    u = urlparse(url)
+    host = (u.hostname or "").lower()
+    return u.scheme == "https" and any(host == h or host.endswith("." + h) for h in _ART_HOSTS)
+
+
+async def _art_download(url: str, path: str) -> bool:
+    """Fetch one image from a catalogue into path. Only ever goes to the
+    catalogues' own image hosts, every redirect included."""
+    async with httpx.AsyncClient(timeout=20.0, follow_redirects=False, headers={"User-Agent": MUSICBRAINZ_USER_AGENT}) as client:
+        for _ in range(5):
+            if not _art_host_ok(url):
+                return False
+            async with client.stream("GET", url) as res:
+                if res.status_code in (301, 302, 303, 307, 308):
+                    url = urljoin(url, res.headers.get("location", ""))
+                    continue
+                if res.status_code != 200:
+                    return False
+                data = bytearray()
+                async for chunk in res.aiter_bytes():
+                    data += chunk
+                    if len(data) > _ART_MAX_BYTES:
+                        return False
+            if not _art_type(bytes(data[:12])):
+                return False
+            tmp = f"{path}.{os.getpid()}.tmp"
+            with open(tmp, "wb") as f:
+                f.write(data)
+            os.replace(tmp, path)
+            return True
+    return False
+
+
+async def _art_fetch(name: str, url: str, path: str) -> bool:
+    """Download one file, once however many people ask at the same time,
+    and not again for a while if the catalogue wouldn't give it."""
+    if time.time() - _art_failed.get(name, 0) < _ART_RETRY_SECS:
+        return False
+    task = _art_fetching.get(name)
+    if task is None:
+        task = _art_fetching[name] = asyncio.ensure_future(_art_download(url, path))
+        task.add_done_callback(lambda _t: _art_fetching.pop(name, None))
+    try:
+        ok = await asyncio.shield(task)
+    except (httpx.HTTPError, OSError):
+        ok = False
+    if not ok:
+        _art_failed[name] = time.time()
+    return ok
+
+
+@router.get("/api/music-requests/artwork/files/{name}")
+async def hires_artwork_file(name: str):
+    m = _ART_FILE_RE.match(name)
+    if not m or not media_ready():
+        return JSONResponse(status_code=404, content={"error": "not found"})
+    aid, size = m.groups()
+    d = _art_dir()
+    path = os.path.join(d, name)
+    if not os.path.isfile(path):
+        with get_db() as db:
+            row = db.execute("SELECT large, full FROM art_cache WHERE id=? AND large != ''", (aid,)).fetchone()
+        if row is None:
+            return JSONResponse(status_code=404, content={"error": "not found"})
+        ok = await _art_fetch(name, row["large"] if size == "l" else (row["full"] or row["large"]), path)
+        if not ok and size == "f":
+            # No full-size copy to be had: the large one will do.
+            path = os.path.join(d, aid + "-l")
+            ok = os.path.isfile(path) or await _art_fetch(aid + "-l", row["large"], path)
+        if not ok:
+            return JSONResponse(status_code=502, content={"error": "couldn't get the artwork"})
+    with open(path, "rb") as f:
+        media_type = _art_type(f.read(12)) or "application/octet-stream"
+    # A file only ever holds one album's art.
+    return FileResponse(path, media_type=media_type, headers={"Cache-Control": "private, max-age=31536000, immutable"})

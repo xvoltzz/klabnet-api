@@ -3,6 +3,7 @@ on every request, and a context-managed connection helper so a handler that
 raises can't leak a connection.
 """
 
+import hashlib
 import sqlite3
 from contextlib import contextmanager
 
@@ -155,14 +156,22 @@ CREATE TABLE IF NOT EXISTS music_requests (
 -- only (Navidrome's own art and files are never touched). One row per
 -- album, including albums nothing was found for (large = '') so they
 -- aren't looked up again every time; those are retried after a while.
+-- The images themselves are kept on the media share (art/<id>-l, -f) the
+-- first time anyone asks for them; id names them.
 CREATE TABLE IF NOT EXISTS art_cache (
     key     TEXT PRIMARY KEY,
     large   TEXT NOT NULL DEFAULT '',
     full    TEXT NOT NULL DEFAULT '',
     source  TEXT NOT NULL DEFAULT '',
-    checked TEXT NOT NULL DEFAULT (datetime('now'))
+    checked TEXT NOT NULL DEFAULT (datetime('now')),
+    id      TEXT NOT NULL DEFAULT ''
 );
 """
+
+
+def art_id(key: str) -> str:
+    """The name an album's artwork files go by on the media share."""
+    return hashlib.sha1(key.encode()).hexdigest()[:20]
 
 
 def init_db() -> None:
@@ -201,6 +210,15 @@ def init_db() -> None:
         # '' means unknown, and the post sorts by when it was posted.
         if "shot_at" not in post_cols:
             conn.execute("ALTER TABLE posts ADD COLUMN shot_at TEXT NOT NULL DEFAULT ''")
+        # art_cache.id (which file on the media share an album's art is)
+        # came after the table did; same migration, and rows from before
+        # get theirs from their key.
+        art_cols = [row[1] for row in conn.execute("PRAGMA table_info(art_cache)").fetchall()]
+        if "id" not in art_cols:
+            conn.execute("ALTER TABLE art_cache ADD COLUMN id TEXT NOT NULL DEFAULT ''")
+        for (key,) in conn.execute("SELECT key FROM art_cache WHERE id=''").fetchall():
+            conn.execute("UPDATE art_cache SET id=? WHERE key=?", (art_id(key), key))
+        conn.execute("CREATE INDEX IF NOT EXISTS art_cache_id ON art_cache(id)")
         # Photo posts made before shot_at existed have none, so they sorted by
         # when they were posted. Fill each from the earliest capture time in
         # its photos' EXIF, the same default a new post gets. Only touches
