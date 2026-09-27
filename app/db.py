@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS presence (
     song_id    TEXT NOT NULL DEFAULT '',
     playing    INTEGER NOT NULL DEFAULT 0,
     party_host TEXT NOT NULL DEFAULT '',
+    platform   TEXT NOT NULL DEFAULT '',
     updated    TEXT NOT NULL DEFAULT (datetime('now'))
 );
 -- Instagram-Notes-style ephemeral status text — one per user, expires on
@@ -172,6 +173,10 @@ def init_db() -> None:
         cols = [row[1] for row in conn.execute("PRAGMA table_info(presence)").fetchall()]
         if "party_host" not in cols:
             conn.execute("ALTER TABLE presence ADD COLUMN party_host TEXT NOT NULL DEFAULT ''")
+        # platform (what someone's on: "app:windows", "web:macos:firefox")
+        # came later still; same migration.
+        if "platform" not in cols:
+            conn.execute("ALTER TABLE presence ADD COLUMN platform TEXT NOT NULL DEFAULT ''")
         # song_json is new — same one-time migration story as party_host above.
         post_cols = [row[1] for row in conn.execute("PRAGMA table_info(posts)").fetchall()]
         if "song_json" not in post_cols:

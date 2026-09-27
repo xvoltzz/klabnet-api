@@ -1,3 +1,4 @@
+import re
 from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Request
@@ -32,20 +33,24 @@ async def post_presence(request: Request):
     song_id    = str(body.get("songId", "")).strip()[:100]
     playing    = bool(body.get("playing", False))
     party_host = str(body.get("partyHost", "")).strip()[:100]
+    # What they're on, for the icon on their card: "app:windows",
+    # "pwa:ios", "web:macos:firefox". Just letters and colons.
+    platform   = re.sub(r"[^a-z:]", "", str(body.get("platform", "")).lower())[:40]
 
     touch_user(username)
     with get_db() as db:
         db.execute(
-            """INSERT INTO presence(username, song, artist, song_id, playing, party_host, updated)
-               VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
+            """INSERT INTO presence(username, song, artist, song_id, playing, party_host, platform, updated)
+               VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
                ON CONFLICT(username) DO UPDATE SET
                    song       = excluded.song,
                    artist     = excluded.artist,
                    song_id    = excluded.song_id,
                    playing    = excluded.playing,
                    party_host = excluded.party_host,
+                   platform   = excluded.platform,
                    updated    = excluded.updated""",
-            (username, song, artist, song_id, 1 if playing else 0, party_host),
+            (username, song, artist, song_id, 1 if playing else 0, party_host, platform),
         )
         db.commit()
     return {"ok": True}
@@ -61,7 +66,7 @@ def get_presence(request: Request):
     cutoff = (datetime.utcnow() - timedelta(seconds=PRESENCE_TTL)).strftime("%Y-%m-%d %H:%M:%S")
     with get_db() as db:
         rows = db.execute(
-            """SELECT username, song, artist, song_id, playing, party_host, updated
+            """SELECT username, song, artist, song_id, playing, party_host, platform, updated
                FROM   presence
                WHERE  updated >= ?
                ORDER  BY updated DESC""",
@@ -85,6 +90,7 @@ def get_presence(request: Request):
             "songId":    r["song_id"],
             "playing":   bool(r["playing"]),
             "partyHost": r["party_host"] or None,
+            "platform":  r["platform"] or None,
             "updated":   r["updated"],
         }
         for r in rows
