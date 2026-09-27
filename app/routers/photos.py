@@ -231,6 +231,13 @@ def list_photo_posts(
                 f"SELECT {_COLS} FROM posts WHERE kind='photo' ORDER BY sort_at DESC, id DESC LIMIT ?", (limit,)
             ).fetchall()
         posts = _attach(db, rows, username)
+        # The first page also says how many photos there are in all (not
+        # posts: a post can hold several), for the count over the viewer.
+        if before_sort is None and before_id is None:
+            total = db.execute(
+                "SELECT COUNT(*) FROM photos p JOIN posts ps ON ps.id = p.post_id WHERE ps.kind='photo'"
+            ).fetchone()[0]
+            return {"posts": posts, "total": total}
     return {"posts": posts}
 
 
