@@ -9,7 +9,9 @@ browser tabs, and it sidesteps any CORS question entirely.
 """
 
 import asyncio
+import re
 import time
+import unicodedata
 
 import httpx
 from fastapi import APIRouter, Request
@@ -216,3 +218,135 @@ def delete_request(request_id: int, request: Request):
         db.execute("DELETE FROM music_requests WHERE id=?", (request_id,))
         db.commit()
     return {"ok": True}
+
+
+# ── High-resolution artwork ──────────────────────────────────────────────
+# klabnet's Cover Flow shows album art big (up to ~800px on a large screen,
+# more in the full-size viewer) and many libraries' embedded art is small.
+# This finds the same cover at high resolution for display: the iTunes
+# catalogue first (up to 3000x3000), then Deezer's (its search finds plenty
+# iTunes' misses), the Cover Art Archive when the album has a MusicBrainz
+# ID. Only a confident match counts (the same artist and
+# the same album name once edition noise is stripped): wrong art is worse
+# than small art. Results, misses included, are cached per album.
+
+ITUNES_SEARCH = "https://itunes.apple.com/search"
+DEEZER_SEARCH = "https://api.deezer.com/search/album"
+_ART_MISS_RETRY_DAYS = 14
+_EDITION_NOISE = re.compile(
+    r"\s*[\(\[][^\)\]]*(deluxe|remaster|master|mix|reissue|edition|expanded|anniversary|bonus|version|explicit|clean|mono|stereo|special)[^\)\]]*[\)\]]"
+    r"|\s+-\s+(single|ep)$",
+    re.I,
+)
+
+
+_FOLD = str.maketrans({"ø": "o", "Ø": "O", "æ": "ae", "Æ": "AE", "œ": "oe", "Œ": "OE", "ß": "ss", "đ": "d", "Đ": "D", "ł": "l", "Ł": "L", "$": "s"})
+
+
+def _norm(s: str) -> str:
+    # Letters accents don't decompose (NØIR, Æ...), then the accents.
+    s = unicodedata.normalize("NFKD", (s or "").translate(_FOLD)).encode("ascii", "ignore").decode().lower()
+    s = _EDITION_NOISE.sub("", s)
+    s = s.replace("&", " and ")
+    s = re.sub(r"[^a-z0-9]+", " ", s)
+    return " ".join(s.split())
+
+
+def _first_artist(s: str) -> str:
+    """"Massive Attack, Nicolette" / "A feat. B" / "A & B": the lead act."""
+    return _norm(re.split(r",|\bfeat\.?|\bft\.?|\bwith\b", s or "", maxsplit=1, flags=re.I)[0])
+
+
+def _same_artist(ours: str, theirs: str) -> bool:
+    a, b = _norm(ours), _norm(theirs)
+    if not a or not b:
+        return False
+    return a == b or _first_artist(ours) == _first_artist(theirs) or a in b or b in a
+
+
+async def _itunes_art(artist: str, album: str):
+    want = _norm(album)
+    # Artist and album first; then the album alone, for artists credited
+    # differently there ("The Voidz" is "Julian Casablancas+The Voidz").
+    async with httpx.AsyncClient(timeout=8.0) as client:
+        for term, limit in ((f"{artist} {album}", 15), (album, 40)):
+            res = await client.get(ITUNES_SEARCH, params={"term": term, "entity": "album", "media": "music", "limit": limit})
+            if res.status_code != 200:
+                return None
+            for r in res.json().get("results", []):
+                art = r.get("artworkUrl100") or ""
+                if not art or "100x100" not in art:
+                    continue
+                if _norm(r.get("collectionName", "")) == want and _same_artist(artist, r.get("artistName", "")):
+                    return {
+                        "large": art.replace("100x100bb", "1200x1200bb"),
+                        "full": art.replace("100x100bb", "3000x3000bb"),
+                        "source": "itunes",
+                    }
+    return None
+
+
+async def _deezer_art(artist: str, album: str):
+    want = _norm(album)
+    async with httpx.AsyncClient(timeout=8.0) as client:
+        for q in (f'artist:"{artist}" album:"{album}"', f"{artist} {album}"):
+            res = await client.get(DEEZER_SEARCH, params={"q": q, "limit": 15})
+            if res.status_code != 200:
+                return None
+            for r in res.json().get("data", []) or []:
+                xl = r.get("cover_xl") or ""
+                if not xl or "1000x1000" not in xl:
+                    continue
+                if _norm(r.get("title", "")) == want and _same_artist(artist, (r.get("artist") or {}).get("name", "")):
+                    return {"large": xl, "full": xl.replace("1000x1000", "1400x1400"), "source": "deezer"}
+    return None
+
+
+async def _caa_art(mbid: str):
+    url = f"{COVER_ART_BASE}/release/{mbid}/front-1200"
+    async with httpx.AsyncClient(timeout=8.0, follow_redirects=False) as client:
+        res = await client.head(url, headers=MB_HEADERS)
+    if res.status_code in (200, 301, 302, 307, 308):
+        return {"large": url, "full": f"{COVER_ART_BASE}/release/{mbid}/front", "source": "coverartarchive"}
+    return None
+
+
+@router.get("/api/music-requests/artwork")
+async def hires_artwork(request: Request, artist: str = "", album: str = "", mbid: str = ""):
+    if get_username(request) == "anonymous":
+        return _unauthenticated()
+    artist, album = artist.strip()[:200], album.strip()[:200]
+    mbid = mbid.strip() if re.fullmatch(r"[0-9a-fA-F-]{36}", mbid.strip() or "") else ""
+    if not (album and artist) and not mbid:
+        return JSONResponse(status_code=400, content={"error": "artist and album, or mbid"})
+    key = f"{_first_artist(artist)}|{_norm(album)}|{mbid.lower()}"
+
+    with get_db() as db:
+        row = db.execute(
+            "SELECT large, full, source, julianday('now') - julianday(checked) AS age FROM art_cache WHERE key=?", (key,)
+        ).fetchone()
+    # source "none": looked, nothing confident. (null: couldn't look.)
+    if row and (row["large"] or row["age"] < _ART_MISS_RETRY_DAYS):
+        return {"large": row["large"] or None, "full": row["full"] or None, "source": row["source"] or "none"}
+
+    found = None
+    try:
+        if artist and album:
+            found = await _itunes_art(artist, album)
+        if not found and artist and album:
+            found = await _deezer_art(artist, album)
+        if not found and mbid:
+            found = await _caa_art(mbid)
+    except (httpx.HTTPError, ValueError):
+        # The catalogue being unreachable isn't "no art": don't cache it.
+        return {"large": None, "full": None, "source": None}
+
+    with get_db() as db:
+        db.execute(
+            """INSERT INTO art_cache(key, large, full, source, checked) VALUES (?, ?, ?, ?, datetime('now'))
+               ON CONFLICT(key) DO UPDATE SET large=excluded.large, full=excluded.full,
+                   source=excluded.source, checked=excluded.checked""",
+            (key, (found or {}).get("large", ""), (found or {}).get("full", ""), (found or {}).get("source", "")),
+        )
+        db.commit()
+    return found or {"large": None, "full": None, "source": "none"}

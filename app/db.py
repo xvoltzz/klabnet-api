@@ -151,6 +151,17 @@ CREATE TABLE IF NOT EXISTS music_requests (
     status        TEXT NOT NULL DEFAULT 'pending',
     created       TEXT NOT NULL DEFAULT (datetime('now'))
 );
+-- High-resolution album artwork found in an outside catalogue, for display
+-- only (Navidrome's own art and files are never touched). One row per
+-- album, including albums nothing was found for (large = '') so they
+-- aren't looked up again every time; those are retried after a while.
+CREATE TABLE IF NOT EXISTS art_cache (
+    key     TEXT PRIMARY KEY,
+    large   TEXT NOT NULL DEFAULT '',
+    full    TEXT NOT NULL DEFAULT '',
+    source  TEXT NOT NULL DEFAULT '',
+    checked TEXT NOT NULL DEFAULT (datetime('now'))
+);
 """
 
 
