@@ -1,4 +1,5 @@
 import json
+import re
 import sqlite3
 
 from fastapi import APIRouter, Request
@@ -16,23 +17,42 @@ def _unauthenticated() -> JSONResponse:
     return JSONResponse(status_code=401, content={"error": "not authenticated"})
 
 
+# Subsonic ids end up in stream/cover URLs on every viewer's client, so only
+# plain id-shaped strings get stored — anything else could smuggle extra
+# query params or paths into those URLs.
+_SUBSONIC_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
+
+
+def _clean_id(value) -> str | None:
+    """'' for a missing id, the id if it's well-formed, None if it's junk."""
+    s = str(value if value is not None else "").strip()
+    if not s:
+        return ""
+    return s if _SUBSONIC_ID_RE.fullmatch(s) else None
+
+
 def _sanitize_song(raw) -> str:
     """Client-provided "share to feed" song attachment -> a JSON string to
     store, or '' if there's nothing usable. Not verified against the actual
     music library (same trust model as image_mxc) — this only caps field
     lengths and drops anything without at least a title, the one field the
-    feed card can't render without."""
+    feed card can't render without. A malformed songId drops the whole
+    song; a malformed coverArt just drops that field. albumId/artistId
+    aren't stored at all."""
     if not isinstance(raw, dict):
         return ""
     title = str(raw.get("title", "")).strip()[:SONG_FIELD_MAX_CHARS]
     if not title:
         return ""
+    song_id = _clean_id(raw.get("songId"))
+    if song_id is None:
+        return ""
     song = {
-        "songId": str(raw.get("songId", "")).strip()[:100],
+        "songId": song_id,
         "title": title,
         "artist": str(raw.get("artist", "")).strip()[:SONG_FIELD_MAX_CHARS],
         "album": str(raw.get("album", "")).strip()[:SONG_FIELD_MAX_CHARS],
-        "coverArt": str(raw.get("coverArt", "")).strip()[:200],
+        "coverArt": _clean_id(raw.get("coverArt")) or "",
         "lyric": str(raw.get("lyric") or "").strip()[:SONG_LYRIC_MAX_CHARS],
     }
     # Photo posts play a clip starting here (seconds into the track).
