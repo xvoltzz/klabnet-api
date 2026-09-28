@@ -1,3 +1,4 @@
+import asyncio
 import json
 
 from fastapi import APIRouter, Request
@@ -50,3 +51,47 @@ async def put_prefs(request: Request):
         )
         db.commit()
     return {"ok": True, "username": username}
+
+
+@router.patch("/api/prefs")
+async def patch_prefs(request: Request):
+    """Just the fields that changed, merged into what's stored, in one
+    transaction; answers with the merged whole. One request, so it can be
+    sent as a tab closes (a GET-then-PUT gets cut off half-way), and two
+    devices saving at once no longer overwrite each other's fields."""
+    username = get_username(request)
+    if username == "anonymous":
+        return JSONResponse(status_code=401, content={"error": "not authenticated"})
+    raw = await request.body()
+    if len(raw) > 2_000_000:
+        return JSONResponse(status_code=413, content={"error": "prefs too large"})
+    try:
+        body = json.loads(raw)
+        if not isinstance(body, dict):
+            raise ValueError("body must be a JSON object")
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "invalid JSON"})
+    changes = {k: v for k, v in body.items() if k in ALLOWED_PREF_KEYS}
+    return await asyncio.to_thread(_merge_prefs, username, changes)
+
+
+def _merge_prefs(username: str, changes: dict):
+    with get_db() as db:
+        db.execute("BEGIN IMMEDIATE")
+        row = db.execute("SELECT data FROM prefs WHERE username=?", (username,)).fetchone()
+        try:
+            merged = json.loads(row["data"]) if row else {}
+        except ValueError:
+            merged = {}
+        merged.update(changes)
+        data = json.dumps(merged)
+        if len(data) > 2_000_000:
+            db.rollback()
+            return JSONResponse(status_code=413, content={"error": "prefs too large"})
+        db.execute(
+            """INSERT INTO prefs(username,data,updated) VALUES(?,?,datetime('now'))
+               ON CONFLICT(username) DO UPDATE SET data=excluded.data,updated=excluded.updated""",
+            (username, data),
+        )
+        db.commit()
+    return merged
