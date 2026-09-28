@@ -1,10 +1,11 @@
+import asyncio
 import re
 from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
-from ..auth import get_username, touch_user
+from ..auth import get_username
 from ..config import PRESENCE_TTL
 from ..db import get_db
 
@@ -37,8 +38,19 @@ async def post_presence(request: Request):
     # "pwa:ios", "web:macos:firefox". Just letters and colons.
     platform   = re.sub(r"[^a-z:]", "", str(body.get("platform", "")).lower())[:40]
 
-    touch_user(username)
+    # The busiest write there is (every ~8s from every open tab): off the
+    # event loop, one connection and one commit.
+    await asyncio.to_thread(_save_presence, username, song, artist, song_id, playing, party_host, platform)
+    return {"ok": True}
+
+
+def _save_presence(username, song, artist, song_id, playing, party_host, platform):
     with get_db() as db:
+        db.execute(
+            """INSERT INTO users(username) VALUES(?)
+               ON CONFLICT(username) DO UPDATE SET last_seen=datetime('now')""",
+            (username,),
+        )
         db.execute(
             """INSERT INTO presence(username, song, artist, song_id, playing, party_host, platform, updated)
                VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
@@ -53,7 +65,6 @@ async def post_presence(request: Request):
             (username, song, artist, song_id, 1 if playing else 0, party_host, platform),
         )
         db.commit()
-    return {"ok": True}
 
 
 @router.get("/api/presence")

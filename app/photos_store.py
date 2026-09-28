@@ -45,7 +45,7 @@ HAS_AVIF = features.check("avif")
 EXIF_FIELDS = ("camera", "lens", "aperture", "shutter", "iso", "focal", "film", "taken")
 EXIF_FIELD_MAX_CHARS = 120
 
-_ID_RE = re.compile(r"^[A-Za-z0-9_-]{16}$")
+_ID_RE = re.compile(r"[A-Za-z0-9_-]{16}")
 
 
 class PhotoError(Exception):
@@ -57,7 +57,7 @@ def new_photo_id() -> str:
 
 
 def valid_photo_id(photo_id: str) -> bool:
-    return bool(_ID_RE.match(photo_id))
+    return bool(_ID_RE.fullmatch(photo_id))  # fullmatch: "$" lets a trailing newline through
 
 
 def photo_dir(photo_id: str) -> str:
@@ -332,6 +332,10 @@ def process_upload(data: bytes) -> dict:
     {id, width, height, exif}; files are on disk before this returns."""
     try:
         img = Image.open(io.BytesIO(data))
+        # Pillow only refuses outright at twice MAX_IMAGE_PIXELS (it just
+        # warns in between), and a 60MB PNG can decode to several GB.
+        if img.width * img.height > Image.MAX_IMAGE_PIXELS:
+            raise Image.DecompressionBombError("too many pixels")
         img.load()
     except Image.DecompressionBombError:
         raise PhotoError("that image is too large")
@@ -362,6 +366,10 @@ def process_upload(data: bytes) -> dict:
             oriented = flat
         else:
             oriented = oriented.convert("RGB")
+    # Nothing rides along into the files written from this (XMP from a HEIC
+    # or WebP can carry the location, and Pillow writes it back out); the
+    # colour profile is passed explicitly.
+    oriented.info = {}
 
     photo_id = new_photo_id()
     final = photo_dir(photo_id)

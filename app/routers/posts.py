@@ -12,6 +12,9 @@ from ..photos_store import delete_photo_files
 
 router = APIRouter()
 
+# A Matrix media id, and nothing else: every viewer's browser loads it.
+_MXC_RE = re.compile(r"mxc://[A-Za-z0-9.:-]{1,255}/[A-Za-z0-9_-]{1,255}")
+
 
 def _unauthenticated() -> JSONResponse:
     return JSONResponse(status_code=401, content={"error": "not authenticated"})
@@ -146,6 +149,8 @@ async def create_post(request: Request):
     if len(text) > FEED_POST_MAX_CHARS:
         return JSONResponse(status_code=400, content={"error": f"post is too long (max {FEED_POST_MAX_CHARS:,} characters)"})
     image_mxc = str(body.get("image_mxc", "")).strip()
+    if image_mxc and not _MXC_RE.fullmatch(image_mxc):
+        return JSONResponse(status_code=400, content={"error": "that image isn't a Matrix upload"})
     song_json = _sanitize_song(body.get("song"))
     if not text and not image_mxc and not song_json:
         return JSONResponse(status_code=400, content={"error": "post must have text, an image, or a song"})
@@ -211,6 +216,12 @@ async def toggle_reaction(post_id: int, request: Request):
             "SELECT 1 FROM post_reactions WHERE post_id=? AND username=? AND emoji=?",
             (post_id, username, emoji),
         ).fetchone()
+        # Any string counts as an emoji: a script could pile thousands of
+        # "reactions" on a post, and every feed load returns them all.
+        if not existing and db.execute(
+            "SELECT COUNT(*) FROM post_reactions WHERE post_id=? AND username=?", (post_id, username)
+        ).fetchone()[0] >= 12:
+            return JSONResponse(status_code=400, content={"error": "that's a lot of reactions"})
         if existing:
             db.execute(
                 "DELETE FROM post_reactions WHERE post_id=? AND username=? AND emoji=?",

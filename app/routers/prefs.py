@@ -28,8 +28,15 @@ def get_prefs(request: Request):
 @router.put("/api/prefs")
 async def put_prefs(request: Request):
     username = get_username(request)
+    # Everyone without a username would share one "anonymous" row.
+    if username == "anonymous":
+        return JSONResponse(status_code=401, content={"error": "not authenticated"})
+    raw = await request.body()
+    # Served back on every page load: a few hundred KB is a lot of playlists.
+    if len(raw) > 2_000_000:
+        return JSONResponse(status_code=413, content={"error": "prefs too large"})
     try:
-        body = await request.json()
+        body = json.loads(raw)
         if not isinstance(body, dict):
             raise ValueError("body must be a JSON object")
     except Exception:

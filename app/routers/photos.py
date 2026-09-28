@@ -14,6 +14,7 @@ ids. Uploads never attached to a post are swept after a day.
 """
 
 import json
+import threading
 import os
 import re
 from datetime import datetime, timedelta
@@ -39,6 +40,9 @@ from .posts import _reactions_and_reply_counts, _row_to_post, _sanitize_song, _u
 router = APIRouter()
 
 _MAX_BYTES = PHOTO_MAX_UPLOAD_MB * 1024 * 1024
+# Decoding a big photo takes a lot of memory for a moment: two at a time,
+# whoever's uploading (the composer sends two at once).
+_upload_slots = threading.BoundedSemaphore(2)
 
 
 def _sweep_abandoned_uploads(db) -> None:
@@ -46,10 +50,12 @@ def _sweep_abandoned_uploads(db) -> None:
         "SELECT id FROM photos WHERE post_id IS NULL AND created < datetime('now', '-1 day')"
     ).fetchall()
     if rows:
-        ids = [r["id"] for r in rows]
-        delete_photo_files(ids)
-        db.executemany("DELETE FROM photos WHERE id=?", [(i,) for i in ids])
+        # Rows first, and only ones still not in a post (one could have been
+        # posted since the SELECT); then the files of what actually went.
+        gone = [r["id"] for r in rows
+                if db.execute("DELETE FROM photos WHERE id=? AND post_id IS NULL", (r["id"],)).rowcount]
         db.commit()
+        delete_photo_files(gone)
 
 
 def _photo_json(r) -> dict:
@@ -71,15 +77,22 @@ def upload_photo(request: Request, file: UploadFile = File(...)):
     if len(data) > _MAX_BYTES:
         return JSONResponse(status_code=413, content={"error": f"photos can be up to {PHOTO_MAX_UPLOAD_MB}MB"})
     try:
-        photo = process_upload(data)
+        with _upload_slots:
+            photo = process_upload(data)
     except PhotoError as e:
         return JSONResponse(status_code=400, content={"error": str(e)})
     with get_db() as db:
-        db.execute(
-            "INSERT INTO photos(id, username, width, height, exif_json) VALUES (?, ?, ?, ?, ?)",
-            (photo["id"], username, photo["width"], photo["height"], json.dumps(photo["exif"])),
-        )
-        db.commit()
+        try:
+            db.execute(
+                "INSERT INTO photos(id, username, width, height, exif_json) VALUES (?, ?, ?, ?, ?)",
+                (photo["id"], username, photo["width"], photo["height"], json.dumps(photo["exif"])),
+            )
+            db.commit()
+        except Exception:
+            # The files are already on the share, and nothing would ever
+            # find them again without their row.
+            delete_photo_files([photo["id"]])
+            raise
         _sweep_abandoned_uploads(db)
     return {"id": photo["id"], "w": photo["width"], "h": photo["height"], "exif": photo["exif"]}
 
@@ -275,6 +288,10 @@ async def create_photo_post(request: Request):
     wanted = [t for t in wanted if t != username]
 
     with get_db() as db:
+        # One transaction from the check to the last photo claimed: a double
+        # click on Post made two posts, the second taking the photos and the
+        # first left empty (and answering with an error).
+        db.execute("BEGIN IMMEDIATE")
         marks = ",".join("?" for _ in photo_ids)
         owned = db.execute(
             f"SELECT COUNT(*) FROM photos WHERE id IN ({marks}) AND username=? AND post_id IS NULL",
@@ -298,14 +315,18 @@ async def create_photo_post(request: Request):
         post_id = cur.lastrowid
         for position, (photo_id, item) in enumerate(zip(photo_ids, items)):
             if isinstance(item.get("exif"), dict):
-                db.execute(
-                    "UPDATE photos SET post_id=?, position=?, exif_json=? WHERE id=?",
-                    (post_id, position, json.dumps(sanitize_exif(item["exif"])), photo_id),
+                cur = db.execute(
+                    "UPDATE photos SET post_id=?, position=?, exif_json=? WHERE id=? AND username=? AND post_id IS NULL",
+                    (post_id, position, json.dumps(sanitize_exif(item["exif"])), photo_id, username),
                 )
             else:
-                db.execute(
-                    "UPDATE photos SET post_id=?, position=? WHERE id=?", (post_id, position, photo_id)
+                cur = db.execute(
+                    "UPDATE photos SET post_id=?, position=? WHERE id=? AND username=? AND post_id IS NULL",
+                    (post_id, position, photo_id, username),
                 )
+            if cur.rowcount != 1:
+                db.rollback()
+                return JSONResponse(status_code=400, content={"error": "some of those photos aren't available"})
         db.executemany("INSERT INTO post_tags(post_id, username) VALUES (?, ?)", [(post_id, t) for t in tags])
         db.commit()
         row = db.execute(f"SELECT {_COLS} FROM posts WHERE id=?", (post_id,)).fetchone()

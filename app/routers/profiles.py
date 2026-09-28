@@ -9,6 +9,9 @@ from ..db import get_db
 
 router = APIRouter()
 
+# A Matrix media id, and nothing else: every viewer's browser loads it.
+_MXC_RE = re.compile(r"mxc://[A-Za-z0-9.:-]{1,255}/[A-Za-z0-9_-]{1,255}")
+
 _HEX_COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
 
 
@@ -59,7 +62,10 @@ async def update_my_profile(request: Request):
         if "bio" in body:
             current["bio"] = str(body.get("bio", "")).strip()[:BIO_MAX_CHARS]
         if "banner_mxc" in body:
-            current["banner_mxc"] = str(body.get("banner_mxc", "")).strip()
+            banner = str(body.get("banner_mxc", "")).strip()
+            if banner and not _MXC_RE.fullmatch(banner):
+                return JSONResponse(status_code=400, content={"error": "that banner isn't a Matrix upload"})
+            current["banner_mxc"] = banner
 
         db.execute(
             """INSERT INTO profiles(username, chat_color, bio, banner_mxc, updated)

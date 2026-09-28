@@ -81,19 +81,35 @@ async def _mb_get(url: str, params: dict) -> httpx.Response:
     return res
 
 
+_mb_cache: dict = {}  # (type, query) -> (when, answer): typing back and forth asks the same things
+
+
 @router.get("/api/music-requests/search")
-async def search_musicbrainz(q: str, type: str = "album"):
+async def search_musicbrainz(request: Request, q: str, type: str = "album"):
     """Proxies a MusicBrainz search so the request form can show real
     matches (with cover art) to pick from instead of a blind text field."""
-    q = q.strip()
+    if get_username(request) == "anonymous":
+        return _unauthenticated()
+    q = q.strip()[:200]
     if not q:
         return {"results": []}
     entity = "recording" if type == "song" else "release-group"
+    ck = (entity, q.lower())
+    hit = _mb_cache.get(ck)
+    if hit and time.monotonic() - hit[0] < 300:
+        return hit[1]
+    # Typed past already (every search waits its turn behind the others):
+    # don't spend MusicBrainz's one-a-second on it.
+    if await request.is_disconnected():
+        return {"results": []}
     try:
         res = await _mb_get(f"{MB_BASE}/{entity}", {"query": q, "fmt": "json", "limit": 8})
         res.raise_for_status()
         data = res.json()
-    except httpx.HTTPError:
+        if not isinstance(data, dict):
+            raise ValueError("not an object")
+    except (httpx.HTTPError, ValueError):
+        # ValueError: their HTML maintenance page instead of JSON.
         return JSONResponse(status_code=502, content={"error": "musicbrainz lookup failed"})
 
     results = []
@@ -127,7 +143,11 @@ async def search_musicbrainz(q: str, type: str = "album"):
                 "year": (rec.get("first-release-date") or "")[:4],
                 "cover_art_url": cover_url,
             })
-    return {"results": results}
+    out = {"results": results}
+    if len(_mb_cache) > 500:
+        _mb_cache.clear()
+    _mb_cache[ck] = (time.monotonic(), out)
+    return out
 
 
 @router.get("/api/music-requests")
@@ -157,6 +177,10 @@ async def create_request(request: Request):
     artist = str(body.get("artist", "")).strip()[:REQUEST_FIELD_MAX_CHARS]
     mbid = str(body.get("mbid", "")).strip()[:64]
     cover_art_url = str(body.get("cover_art_url", "")).strip()[:500]
+    # Shown to everyone as an <img>: only the Cover Art Archive (what the
+    # search hands out), not any address someone cares to log visits on.
+    if cover_art_url and not (_art_host_ok(cover_art_url) and "coverartarchive.org" in urlparse(cover_art_url).hostname):
+        cover_art_url = ""
     if not title:
         return JSONResponse(status_code=400, content={"error": "title required"})
 
@@ -234,6 +258,11 @@ def delete_request(request_id: int, request: Request):
 # than small art. Results, misses included, are cached per album.
 
 ITUNES_SEARCH = "https://itunes.apple.com/search"
+
+
+class _Unavailable(Exception):
+    """A catalogue that couldn't answer (throttled, down, an error page):
+    not the same as "no art", which is remembered for weeks."""
 DEEZER_SEARCH = "https://api.deezer.com/search/album"
 _ART_MISS_RETRY_DAYS = 14
 _EDITION_NOISE = re.compile(
@@ -274,9 +303,11 @@ async def _itunes_art(artist: str, album: str):
     async with httpx.AsyncClient(timeout=8.0) as client:
         for term, limit in ((f"{artist} {album}", 15), (album, 40)):
             res = await client.get(ITUNES_SEARCH, params={"term": term, "entity": "album", "media": "music", "limit": limit})
-            if res.status_code != 200:
-                return None
-            for r in res.json().get("results", []):
+            # iTunes answers 403 when it's throttling (about 20 calls a minute).
+            payload = res.json() if res.status_code == 200 else None
+            if not isinstance(payload, dict):
+                raise _Unavailable(res.status_code)
+            for r in payload.get("results", []):
                 art = r.get("artworkUrl100") or ""
                 if not art or "100x100" not in art:
                     continue
@@ -294,9 +325,11 @@ async def _deezer_art(artist: str, album: str):
     async with httpx.AsyncClient(timeout=8.0) as client:
         for q in (f'artist:"{artist}" album:"{album}"', f"{artist} {album}"):
             res = await client.get(DEEZER_SEARCH, params={"q": q, "limit": 15})
-            if res.status_code != 200:
-                return None
-            for r in res.json().get("data", []) or []:
+            # Deezer's quota errors come back as 200 with {"error": {...}}.
+            payload = res.json() if res.status_code == 200 else None
+            if not isinstance(payload, dict) or "error" in payload:
+                raise _Unavailable(res.status_code)
+            for r in payload.get("data", []) or []:
                 xl = r.get("cover_xl") or ""
                 if not xl or "1000x1000" not in xl:
                     continue
@@ -311,7 +344,56 @@ async def _caa_art(mbid: str):
         res = await client.head(url, headers=MB_HEADERS)
     if res.status_code in (200, 301, 302, 307, 308):
         return {"large": url, "full": f"{COVER_ART_BASE}/release/{mbid}/front", "source": "coverartarchive"}
+    if res.status_code == 429 or res.status_code >= 500:
+        raise _Unavailable(res.status_code)
     return None
+
+
+# Lookups go out two at a time, and the same album asked for by several
+# covers (or people) at once is looked up once: Cover Flow asks for a
+# dozen covers at a time, and iTunes throttles at about 20 calls a minute.
+_art_sem = asyncio.Semaphore(2)
+_art_lookups: dict = {}
+
+
+async def _art_lookup(artist: str, album: str, mbid: str):
+    """(found, unavailable): found is the art or None; unavailable says a
+    catalogue couldn't answer, so a None isn't a real "no art"."""
+    found, unavailable = None, False
+    async with _art_sem:
+        for fn, args in ((_itunes_art, (artist, album)), (_deezer_art, (artist, album)), (_caa_art, (mbid,))):
+            if found or not all(args):
+                continue
+            try:
+                found = await fn(*args)
+            except (httpx.HTTPError, ValueError, _Unavailable):
+                unavailable = True
+    return found, unavailable
+
+
+def _art_key(artist: str, album: str, mbid: str) -> str:
+    # By artist and album when there are both, whoever asks: the player
+    # doesn't know an album's MusicBrainz id and Home does, and keying on
+    # it too looked the same album up (and kept its files) twice.
+    return f"{_first_artist(artist)}|{_norm(album)}|" if (artist and album) else f"||{mbid.lower()}"
+
+
+def _art_cached(key: str):
+    with get_db() as db:
+        return db.execute(
+            "SELECT large, full, source, julianday('now') - julianday(checked) AS age FROM art_cache WHERE key=?", (key,)
+        ).fetchone()
+
+
+def _art_remember(key: str, found):
+    with get_db() as db:
+        db.execute(
+            """INSERT INTO art_cache(key, large, full, source, checked, id) VALUES (?, ?, ?, ?, datetime('now'), ?)
+               ON CONFLICT(key) DO UPDATE SET large=excluded.large, full=excluded.full,
+                   source=excluded.source, checked=excluded.checked, id=excluded.id""",
+            (key, (found or {}).get("large", ""), (found or {}).get("full", ""), (found or {}).get("source", ""), art_id(key)),
+        )
+        db.commit()
 
 
 @router.get("/api/music-requests/artwork")
@@ -322,39 +404,25 @@ async def hires_artwork(request: Request, artist: str = "", album: str = "", mbi
     mbid = mbid.strip() if re.fullmatch(r"[0-9a-fA-F-]{36}", mbid.strip() or "") else ""
     if not (album and artist) and not mbid:
         return JSONResponse(status_code=400, content={"error": "artist and album, or mbid"})
-    key = f"{_first_artist(artist)}|{_norm(album)}|{mbid.lower()}"
+    key = _art_key(artist, album, mbid)
 
-    with get_db() as db:
-        row = db.execute(
-            "SELECT large, full, source, julianday('now') - julianday(checked) AS age FROM art_cache WHERE key=?", (key,)
-        ).fetchone()
+    row = await asyncio.to_thread(_art_cached, key)
     # source "none": looked, nothing confident. (null: couldn't look.)
     if row and (row["large"] or row["age"] < _ART_MISS_RETRY_DAYS):
-        return _art_answer(key, row["large"], row["full"], row["source"] or "none")
+        return await asyncio.to_thread(_art_answer, key, row["large"], row["full"], row["source"] or "none")
 
-    found = None
-    try:
-        if artist and album:
-            found = await _itunes_art(artist, album)
-        if not found and artist and album:
-            found = await _deezer_art(artist, album)
-        if not found and mbid:
-            found = await _caa_art(mbid)
-    except (httpx.HTTPError, ValueError):
-        # The catalogue being unreachable isn't "no art": don't cache it.
+    task = _art_lookups.get(key)
+    if task is None:
+        task = _art_lookups[key] = asyncio.ensure_future(_art_lookup(artist, album, mbid))
+        task.add_done_callback(lambda _t: _art_lookups.pop(key, None))
+    found, unavailable = await asyncio.shield(task)
+    if not found and unavailable:
+        # A catalogue being throttled or down isn't "no art": don't remember it.
         return {"large": None, "full": None, "source": None}
-
-    with get_db() as db:
-        db.execute(
-            """INSERT INTO art_cache(key, large, full, source, checked, id) VALUES (?, ?, ?, ?, datetime('now'), ?)
-               ON CONFLICT(key) DO UPDATE SET large=excluded.large, full=excluded.full,
-                   source=excluded.source, checked=excluded.checked, id=excluded.id""",
-            (key, (found or {}).get("large", ""), (found or {}).get("full", ""), (found or {}).get("source", ""), art_id(key)),
-        )
-        db.commit()
+    await asyncio.to_thread(_art_remember, key, found)
     if not found:
         return {"large": None, "full": None, "source": "none"}
-    return _art_answer(key, found["large"], found["full"], found["source"])
+    return await asyncio.to_thread(_art_answer, key, found["large"], found["full"], found["source"])
 
 
 # ── Keeping the art ──
@@ -366,25 +434,61 @@ async def hires_artwork(request: Request, artist: str = "", album: str = "", mbi
 
 _ART_HOSTS = ("mzstatic.com", "dzcdn.net", "coverartarchive.org", "archive.org")
 _ART_MAX_BYTES = 25 * 1024 * 1024
-_ART_FILE_RE = re.compile(r"^([0-9a-f]{20})-([lf])$")
+_ART_FILE_RE = re.compile(r"([0-9a-f]{20})-([lf])")
 _ART_RETRY_SECS = 3600
 _art_fetching: dict = {}
 _art_failed: dict = {}  # file name -> when fetching it last failed
 
 
+# Whether the media share is there, looked at every 30s rather than on
+# every request (it's a stat over SMB, and Cover Flow asks a dozen at once).
+_share = {"ok": False, "at": 0.0}
+
+
+def _share_ready() -> bool:
+    if time.monotonic() - _share["at"] > 30:
+        _share["ok"], _share["at"] = media_ready(), time.monotonic()
+    return _share["ok"]
+
+
 def _art_answer(key: str, large: str, full: str, source: str) -> dict:
     if not large:
         return {"large": None, "full": None, "source": source}
-    if not media_ready():
+    if not _share_ready():
         return {"large": large, "full": full or large, "source": source}
     base = f"/api/music-requests/artwork/files/{art_id(key)}"
     return {"large": base + "-l", "full": base + "-f", "source": source}
 
 
+_art_dir_made = False
+
+
 def _art_dir() -> str:
+    global _art_dir_made
     d = os.path.join(MEDIA_DIR, "art")
-    os.makedirs(d, exist_ok=True)
+    if not _art_dir_made:
+        os.makedirs(d, exist_ok=True)
+        _art_dir_made = True
     return d
+
+
+def _write_atomic(path: str, data: bytes):
+    tmp = f"{path}.{os.getpid()}.{os.urandom(3).hex()}.tmp"
+    try:
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _sniff(path: str):
+    with open(path, "rb") as f:
+        return _art_type(f.read(12))
 
 
 def _art_type(head: bytes):
@@ -423,10 +527,7 @@ async def _art_download(url: str, path: str) -> bool:
                         return False
             if not _art_type(bytes(data[:12])):
                 return False
-            tmp = f"{path}.{os.getpid()}.tmp"
-            with open(tmp, "wb") as f:
-                f.write(data)
-            os.replace(tmp, path)
+            await asyncio.to_thread(_write_atomic, path, bytes(data))
             return True
     return False
 
@@ -451,25 +552,30 @@ async def _art_fetch(name: str, url: str, path: str) -> bool:
 
 @router.get("/api/music-requests/artwork/files/{name}")
 async def hires_artwork_file(name: str):
-    m = _ART_FILE_RE.match(name)
-    if not m or not media_ready():
+    # Everything that touches the share runs off the event loop: a slow or
+    # hung share mustn't stall every other request (presence, chat, feed).
+    m = _ART_FILE_RE.fullmatch(name)
+    if not m or not await asyncio.to_thread(_share_ready):
         return JSONResponse(status_code=404, content={"error": "not found"})
     aid, size = m.groups()
-    d = _art_dir()
+    d = await asyncio.to_thread(_art_dir)
     path = os.path.join(d, name)
-    if not os.path.isfile(path):
-        with get_db() as db:
-            row = db.execute("SELECT large, full FROM art_cache WHERE id=? AND large != ''", (aid,)).fetchone()
+    if not await asyncio.to_thread(os.path.isfile, path):
+        row = await asyncio.to_thread(_art_row, aid)
         if row is None:
             return JSONResponse(status_code=404, content={"error": "not found"})
         ok = await _art_fetch(name, row["large"] if size == "l" else (row["full"] or row["large"]), path)
         if not ok and size == "f":
             # No full-size copy to be had: the large one will do.
             path = os.path.join(d, aid + "-l")
-            ok = os.path.isfile(path) or await _art_fetch(aid + "-l", row["large"], path)
+            ok = await asyncio.to_thread(os.path.isfile, path) or await _art_fetch(aid + "-l", row["large"], path)
         if not ok:
             return JSONResponse(status_code=502, content={"error": "couldn't get the artwork"})
-    with open(path, "rb") as f:
-        media_type = _art_type(f.read(12)) or "application/octet-stream"
+    media_type = await asyncio.to_thread(_sniff, path) or "application/octet-stream"
     # A file only ever holds one album's art.
     return FileResponse(path, media_type=media_type, headers={"Cache-Control": "private, max-age=31536000, immutable"})
+
+
+def _art_row(aid: str):
+    with get_db() as db:
+        return db.execute("SELECT large, full FROM art_cache WHERE id=? AND large != ''", (aid,)).fetchone()

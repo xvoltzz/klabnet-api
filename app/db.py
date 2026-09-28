@@ -85,6 +85,8 @@ CREATE TABLE IF NOT EXISTS post_replies (
     text     TEXT NOT NULL,
     created  TEXT NOT NULL DEFAULT (datetime('now'))
 );
+-- Every feed and photos page counts each post's replies.
+CREATE INDEX IF NOT EXISTS post_replies_by_post ON post_replies(post_id, id);
 -- Photos tab. A photo post is a `posts` row with kind='photo'; its images
 -- are rows here, ordered by position. post_id stays NULL between upload
 -- and posting (the composer uploads as soon as a file is picked), and
@@ -255,6 +257,9 @@ def get_db():
     including when the handler raises. Usage: `with get_db() as db: ...`"""
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
+    # With WAL (init_db), NORMAL only risks the last moments of writes on a
+    # power cut, not corruption, and saves an fsync on every commit.
+    conn.execute("PRAGMA synchronous=NORMAL")
     try:
         yield conn
     finally:

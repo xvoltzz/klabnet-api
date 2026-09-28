@@ -12,7 +12,9 @@ and anything resolving to a private, loopback or link-local address is
 refused.
 """
 
+import asyncio
 import hashlib
+import secrets
 import io
 import ipaddress
 import os
@@ -37,7 +39,7 @@ _MAX_BYTES = GIF_MAX_MB * 1024 * 1024
 _PAGE = 30
 _NAME_MAX = 80
 _TIMEOUT = 10.0
-_ID_RE = re.compile(r"^[0-9a-f]{20}$")
+_ID_RE = re.compile(r"[0-9a-f]{20}")
 _UA = "Mozilla/5.0 (compatible; klabnet-gifs/1.0; +https://klab.gg)"
 
 
@@ -74,16 +76,18 @@ def _clean_name(name: str) -> str:
 
 # ── Fetching a pasted link, safely ──
 
-def _public_host(host: str) -> bool:
+def _public_address(host: str):
+    """The address to connect to, if every address the host has is public;
+    else None. (Blocking: called through a thread.)"""
     try:
         infos = socket.getaddrinfo(host, None)
     except socket.gaierror:
-        return False
+        return None
     for info in infos:
         ip = ipaddress.ip_address(info[4][0].split("%")[0])
         if not ip.is_global:
-            return False
-    return bool(infos)
+            return None
+    return infos[0][4][0].split("%")[0] if infos else None
 
 
 async def _fetch(client: httpx.AsyncClient, url: str, accept: str = "image/gif,text/html;q=0.9,*/*;q=0.5") -> tuple[str, str, bytes]:
@@ -91,11 +95,19 @@ async def _fetch(client: httpx.AsyncClient, url: str, accept: str = "image/gif,t
     checked. Returns (final url, content type, body), body capped."""
     for _ in range(6):
         u = urlparse(url)
-        if u.scheme not in ("http", "https") or not u.hostname or (u.port and u.port not in (80, 443)):
+        if u.scheme not in ("http", "https") or not u.hostname or u.username or (u.port and u.port not in (80, 443)):
             raise GifError("that link doesn't look right")
-        if not _public_host(u.hostname):
+        ip = await asyncio.to_thread(_public_address, u.hostname)
+        if not ip:
             raise GifError("that link doesn't look right")
-        async with client.stream("GET", url, headers={"User-Agent": _UA, "Accept": accept}) as r:
+        # Connect to the address just checked, not to whatever the name
+        # resolves to a moment later (a name that flips between a public and
+        # a private address would pass the check and then reach the LAN).
+        # The name still goes in Host and in TLS (SNI and the certificate).
+        port = f":{u.port}" if u.port else ""
+        pinned = u._replace(netloc=(f"[{ip}]" if ":" in ip else ip) + port).geturl()
+        headers = {"User-Agent": _UA, "Accept": accept, "Host": u.hostname + port}
+        async with client.stream("GET", pinned, headers=headers, extensions={"sni_hostname": u.hostname}) as r:
             if r.status_code in (301, 302, 303, 307, 308) and r.headers.get("location"):
                 url = urljoin(url, r.headers["location"])
                 continue
@@ -178,12 +190,12 @@ def _store(data: bytes, username: str, name: str) -> dict:
                 row = db.execute("SELECT * FROM gifs WHERE id=?", (gif_id,)).fetchone()
             return _shape(row)
         path = _path(gif_id)
-        tmp = path + ".tmp"
+        tmp = f"{path}.{secrets.token_hex(4)}.tmp"  # two adds of the same GIF at once
         with open(tmp, "wb") as f:
             f.write(data)
         os.replace(tmp, path)
         db.execute(
-            "INSERT INTO gifs(id, username, name, width, height, bytes) VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT OR IGNORE INTO gifs(id, username, name, width, height, bytes) VALUES (?, ?, ?, ?, ?, ?)",
             (gif_id, username, name, w, h, len(data)),
         )
         db.commit()
@@ -221,12 +233,16 @@ async def add_gif_link(request: Request):
         body = await request.json()
     except Exception:
         body = {}
+    if not isinstance(body, dict):
+        body = {}
     url = str(body.get("url") or "")[:2000]
     if not url:
         return JSONResponse(status_code=400, content={"error": "paste a link to a GIF"})
     try:
         data, guess = await _gif_from_link(url)
-        return _store(data, username, _clean_name(str(body.get("name") or "") or guess))
+        # Decoding, a write of up to GIF_MAX_MB to the share and the database:
+        # not on the event loop.
+        return await asyncio.to_thread(_store, data, username, _clean_name(str(body.get("name") or "") or guess))
     except GifError as e:
         return JSONResponse(status_code=400, content={"error": str(e)})
     except httpx.HTTPError:
@@ -279,7 +295,7 @@ def delete_gif(gif_id: str, request: Request):
 @router.get("/api/gifs/files/{name}")
 def gif_file(name: str):
     gif_id = name[:-4] if name.endswith(".gif") else name
-    if not _ID_RE.match(gif_id) or not media_ready():
+    if not _ID_RE.fullmatch(gif_id) or not media_ready():
         return JSONResponse(status_code=404, content={"error": "not found"})
     path = _path(gif_id)
     if not os.path.isfile(path):
