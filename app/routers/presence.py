@@ -6,7 +6,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
 from ..auth import get_username
-from ..config import PRESENCE_TTL
+from ..config import AWAY_AFTER, PRESENCE_TTL
 from ..db import get_db
 
 router = APIRouter()
@@ -37,14 +37,37 @@ async def post_presence(request: Request):
     # What they're on, for the icon on their card: "app:windows",
     # "pwa:ios", "web:macos:firefox". Just letters and colons.
     platform   = re.sub(r"[^a-z:]", "", str(body.get("platform", "")).lower())[:40]
+    # Away. activeAgo: seconds since this device last saw its person use
+    # it (keyboard, mouse, touch), or absent if it can't tell. idleKnown:
+    # it sees the whole computer (the desktop app asking the OS, Chrome's
+    # idle detection), not just input inside klabnet, so a big activeAgo
+    # really means they're away rather than working in another window.
+    try:
+        active_ago = body.get("activeAgo")
+        active_ago = None if active_ago is None else max(0, min(int(active_ago), 30 * 86400))
+    except (TypeError, ValueError):
+        active_ago = None
+    idle_known = bool(body.get("idleKnown", False)) and active_ago is not None
+    # lockedFor: the screen's been locked this many seconds. Away at once,
+    # unless they've used another device since it locked.
+    try:
+        locked_for = body.get("lockedFor")
+        locked_for = None if locked_for is None else max(0, min(int(locked_for), 30 * 86400))
+    except (TypeError, ValueError):
+        locked_for = None
 
     # The busiest write there is (every ~8s from every open tab): off the
     # event loop, one connection and one commit.
-    await asyncio.to_thread(_save_presence, username, song, artist, song_id, playing, party_host, platform)
+    await asyncio.to_thread(_save_presence, username, song, artist, song_id, playing, party_host, platform, active_ago, idle_known, locked_for)
     return {"ok": True}
 
 
-def _save_presence(username, song, artist, song_id, playing, party_host, platform):
+def _save_presence(username, song, artist, song_id, playing, party_host, platform, active_ago=None, idle_known=False, locked_for=None):
+    now = datetime.utcnow()
+    fmt = "%Y-%m-%d %H:%M:%S"
+    active_at = "" if active_ago is None else (now - timedelta(seconds=active_ago)).strftime(fmt)
+    known_at = now.strftime(fmt) if idle_known else ''
+    locked_at = "" if locked_for is None else (now - timedelta(seconds=locked_for)).strftime(fmt)
     with get_db() as db:
         db.execute(
             """INSERT INTO users(username) VALUES(?)
@@ -64,6 +87,21 @@ def _save_presence(username, song, artist, song_id, playing, party_host, platfor
                    updated    = excluded.updated""",
             (username, song, artist, song_id, 1 if playing else 0, party_host, platform),
         )
+        # The latest activity any of their devices has seen wins (strings
+        # in this format compare in time order): busy on the phone isn't
+        # away because the PC's been idle.
+        if active_at:
+            db.execute(
+                "UPDATE presence SET active_at = MAX(active_at, ?) WHERE username = ?",
+                (active_at, username),
+            )
+        if known_at:
+            db.execute("UPDATE presence SET idle_known_at = ? WHERE username = ?", (known_at, username))
+        if locked_at:
+            db.execute(
+                "UPDATE presence SET locked_at = ?, lock_seen_at = ? WHERE username = ?",
+                (locked_at, now.strftime(fmt), username),
+            )
         db.commit()
 
 
@@ -74,10 +112,12 @@ def get_presence(request: Request):
     if username == "anonymous":
         return _unauthenticated()
 
-    cutoff = (datetime.utcnow() - timedelta(seconds=PRESENCE_TTL)).strftime("%Y-%m-%d %H:%M:%S")
+    now = datetime.utcnow()
+    cutoff = (now - timedelta(seconds=PRESENCE_TTL)).strftime("%Y-%m-%d %H:%M:%S")
+    away_cutoff = (now - timedelta(seconds=AWAY_AFTER)).strftime("%Y-%m-%d %H:%M:%S")
     with get_db() as db:
         rows = db.execute(
-            """SELECT username, song, artist, song_id, playing, party_host, platform, updated
+            """SELECT username, song, artist, song_id, playing, party_host, platform, updated, active_at, idle_known_at, locked_at, lock_seen_at
                FROM   presence
                WHERE  updated >= ?
                ORDER  BY updated DESC""",
@@ -103,6 +143,8 @@ def get_presence(request: Request):
             "partyHost": r["party_host"] or None,
             "platform":  r["platform"] or None,
             "updated":   r["updated"],
+            # awaySince is when they last used anything (UTC).
+            **({"away": True, "awaySince": r["active_at"]} if _away(r, cutoff, away_cutoff) else {"away": False}),
         }
         for r in rows
     ]
@@ -114,6 +156,17 @@ def get_presence(request: Request):
         if not r["username"].endswith("-bot")
     ]
     return {"listeners": listeners, "roster": roster}
+
+
+def _away(r, cutoff, away_cutoff) -> bool:
+    """Away: a device that sees the whole computer says nothing's been
+    touched on any of theirs for AWAY_AFTER, or their screen is locked and
+    nothing's been used since it locked."""
+    if not r["active_at"]:
+        return False
+    idle = r["idle_known_at"] >= cutoff and r["active_at"] < away_cutoff
+    locked = r["lock_seen_at"] >= cutoff and r["locked_at"] and r["active_at"] <= r["locked_at"]
+    return bool(idle or locked)
 
 
 @router.delete("/api/presence")

@@ -33,7 +33,11 @@ CREATE TABLE IF NOT EXISTS presence (
     playing    INTEGER NOT NULL DEFAULT 0,
     party_host TEXT NOT NULL DEFAULT '',
     platform   TEXT NOT NULL DEFAULT '',
-    updated    TEXT NOT NULL DEFAULT (datetime('now'))
+    updated    TEXT NOT NULL DEFAULT (datetime('now')),
+    active_at  TEXT NOT NULL DEFAULT '',
+    idle_known_at TEXT NOT NULL DEFAULT '',
+    locked_at  TEXT NOT NULL DEFAULT '',
+    lock_seen_at TEXT NOT NULL DEFAULT ''
 );
 -- Instagram-Notes-style ephemeral status text — one per user, expires on
 -- its own after NOTE_TTL_HOURS (filtered at query time in GET /api/notes,
@@ -199,6 +203,16 @@ def init_db() -> None:
         # came later still; same migration.
         if "platform" not in cols:
             conn.execute("ALTER TABLE presence ADD COLUMN platform TEXT NOT NULL DEFAULT ''")
+        # Away: when they last touched a keyboard/mouse (any device), and
+        # when a device that can see the whole computer last said so.
+        if "active_at" not in cols:
+            conn.execute("ALTER TABLE presence ADD COLUMN active_at TEXT NOT NULL DEFAULT ''")
+        if "idle_known_at" not in cols:
+            conn.execute("ALTER TABLE presence ADD COLUMN idle_known_at TEXT NOT NULL DEFAULT ''")
+        # ...and when their screen was locked (lock_seen_at: last told so).
+        for col in ("locked_at", "lock_seen_at"):
+            if col not in cols:
+                conn.execute(f"ALTER TABLE presence ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
         # song_json is new — same one-time migration story as party_host above.
         post_cols = [row[1] for row in conn.execute("PRAGMA table_info(posts)").fetchall()]
         if "song_json" not in post_cols:
