@@ -80,6 +80,17 @@ CREATE TABLE IF NOT EXISTS post_reactions (
     created  TEXT NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (post_id, username, emoji)
 );
+-- Stars on music (songs and albums): one row per (kind, item, user). Posts
+-- and photos star with a ⭐ post_reaction and chat with a ⭐ Matrix
+-- reaction; this is for things that live in Navidrome, not here. item_id is
+-- the Navidrome id. Five people starring something turns it gold.
+CREATE TABLE IF NOT EXISTS stars (
+    kind     TEXT NOT NULL,
+    item_id  TEXT NOT NULL,
+    username TEXT NOT NULL,
+    created  TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (kind, item_id, username)
+);
 -- Flat replies (one level, no reply-to-reply nesting — keeps the feed's
 -- reply UI to a simple list under each post rather than real threading).
 CREATE TABLE IF NOT EXISTS post_replies (
