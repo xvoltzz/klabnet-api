@@ -1,0 +1,17 @@
+# LiveKit, the server klabnet's voice channels run through (README: Voice).
+# Started by compose.yml's "voice" profile. No secrets in here: the API key
+# and secret come from .env (LIVEKIT_KEYS in compose.yml).
+
+# Signalling (HTTP + WebSocket). Caddy's voice.klab.gg proxies to this.
+port: 7880
+
+rtc:
+  # The audio itself: every call shares this one UDP port, which the router
+  # forwards here. TCP is the fallback for networks that block UDP.
+  udp_port: 7882
+  tcp_port: 7881
+  # Tell clients the public address (found with STUN) for people outside,
+  # and this machine's own LAN address for people at home, who then talk
+  # to it directly whether or not the router can loop back on itself.
+  use_external_ip: true
+  advertise_internal_ip: true

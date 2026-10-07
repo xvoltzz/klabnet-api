@@ -158,6 +158,16 @@ CREATE TABLE IF NOT EXISTS gifs (
     last_used TEXT
 );
 
+-- Voice channels (routers/voice.py): just the names. Who's in one is
+-- LiveKit's to say, not this table's; room "klabnet-voice-<id>" there.
+CREATE TABLE IF NOT EXISTS voice_channels (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    name       TEXT NOT NULL,
+    position   INTEGER NOT NULL DEFAULT 0,
+    created_by TEXT NOT NULL DEFAULT '',
+    created    TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 CREATE TABLE IF NOT EXISTS music_requests (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     username      TEXT NOT NULL,
@@ -271,6 +281,10 @@ def init_db() -> None:
         conn.execute("DROP TABLE IF EXISTS apps")
         conn.execute("DROP TABLE IF EXISTS sections")
         conn.execute("DROP TABLE IF EXISTS listening_stats")
+        # Voice starts with one channel to drop into. The last channel can't
+        # be deleted (routers/voice.py), so this only ever runs once.
+        if not conn.execute("SELECT 1 FROM voice_channels LIMIT 1").fetchone():
+            conn.execute("INSERT INTO voice_channels(name) VALUES ('Lounge')")
         conn.commit()
     finally:
         conn.close()

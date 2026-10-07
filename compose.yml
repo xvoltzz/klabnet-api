@@ -22,3 +22,25 @@ services:
     environment:
       DB_PATH: /data/prefs.db
       MEDIA_DIR: /media
+      # Voice: how this service asks LiveKit (below, on the host's network)
+      # who's in a channel. Does nothing until the LIVEKIT_* values are in .env.
+      LIVEKIT_API_URL: ${LIVEKIT_API_URL:-http://host.docker.internal:7880}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  # Voice channels (app/routers/voice.py): the LiveKit server the audio
+  # runs through. Off unless .env has COMPOSE_PROFILES=voice, alongside the
+  # LIVEKIT_* values (README: Voice).
+  # Host networking, not a published port: WebRTC has to hand out the
+  # machine's real addresses, and the audio port is forwarded straight here.
+  livekit:
+    image: livekit/livekit-server:v1.13
+    container_name: klabnet-livekit
+    restart: unless-stopped
+    profiles: ["voice"]
+    network_mode: host
+    command: --config /etc/livekit.yaml
+    volumes:
+      - ./livekit.yaml:/etc/livekit.yaml:ro
+    environment:
+      LIVEKIT_KEYS: "${LIVEKIT_API_KEY:-}: ${LIVEKIT_API_SECRET:-}"

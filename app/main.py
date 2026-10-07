@@ -10,7 +10,7 @@ from .config import APP_VERSION, CORS_ORIGINS
 from .db import init_db
 from .media import media_ready
 from .photos_store import backfill_derivatives
-from .routers import feedback, gifs, health, identity, music_requests, notes, photos, posts, prefs, presence, profiles, stars
+from .routers import feedback, gifs, health, identity, music_requests, notes, photos, posts, prefs, presence, profiles, stars, voice
 
 
 @asynccontextmanager
@@ -34,5 +34,5 @@ app.add_middleware(
 )
 
 # photos before posts: its /api/posts/photos/... paths must win over /api/posts/{post_id}.
-for router in (health.router, identity.router, prefs.router, presence.router, notes.router, photos.router, stars.router, posts.router, profiles.router, music_requests.router, feedback.router, gifs.router):
+for router in (health.router, identity.router, prefs.router, presence.router, notes.router, photos.router, stars.router, posts.router, profiles.router, music_requests.router, feedback.router, gifs.router, voice.router):
     app.include_router(router)

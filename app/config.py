@@ -73,6 +73,20 @@ FEEDBACK_BODY_MAX_CHARS  = int(os.environ.get("FEEDBACK_BODY_MAX_CHARS", "4000")
 # ── GIF stash (the picker in chat and the feed) ──
 GIF_MAX_MB = int(os.environ.get("GIF_MAX_MB", "12"))
 
+# ── Voice (drop-in channels on a self-hosted LiveKit server) ──
+# LIVEKIT_URL is what browsers connect to (wss://voice.klab.gg, through
+# Caddy); LIVEKIT_API_URL is how this service reaches the same server to ask
+# who's in a room (http://host:7880, straight over the LAN). The key and
+# secret are LiveKit's own, the pair in its `keys:` config. With any of the
+# first three unset, voice is simply off and the site hides it.
+LIVEKIT_URL        = os.environ.get("LIVEKIT_URL", "").strip().rstrip("/")
+LIVEKIT_API_KEY    = os.environ.get("LIVEKIT_API_KEY", "").strip()
+LIVEKIT_API_SECRET = os.environ.get("LIVEKIT_API_SECRET", "").strip()
+LIVEKIT_API_URL    = (os.environ.get("LIVEKIT_API_URL", "").strip()
+                      or LIVEKIT_URL.replace("wss://", "https://", 1).replace("ws://", "http://", 1)).rstrip("/")
+VOICE_CHANNEL_NAME_MAX_CHARS = int(os.environ.get("VOICE_CHANNEL_NAME_MAX_CHARS", "32"))
+VOICE_MAX_CHANNELS = int(os.environ.get("VOICE_MAX_CHANNELS", "20"))
+
 CORS_ORIGINS = [
     origin.strip()
     for origin in os.environ.get("CORS_ORIGINS", "https://user.klab.gg,https://staging.klab.gg").split(",")

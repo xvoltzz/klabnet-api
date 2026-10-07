@@ -34,6 +34,10 @@ anything else. Admin-only writes (`POST`/`PUT`/`DELETE` on `/api/apps` and
 | `/api/posts/{id}/replies/{reply_id}` | DELETE | own reply or admin | delete a reply |
 | `/api/apps` | GET, POST, PUT, DELETE | GET: any · writes: admin | admin-managed app tiles |
 | `/api/sections` | GET, POST, PUT, DELETE | GET: any · writes: admin | tile groupings |
+| `/api/voice` | GET | any | voice channels and who's in each (asked of LiveKit, cached 2s). `enabled: false` when LiveKit isn't configured |
+| `/api/voice/token` | POST | any | body `{channel}`: where LiveKit is and a 10-minute token for that channel's room, in the caller's name |
+| `/api/voice/channels` | POST | admin | create a channel (body `{name}`) |
+| `/api/voice/channels/{id}` | PATCH, DELETE | admin | rename, or delete (which disconnects whoever's in it; the last channel can't be deleted) |
 
 ## Repository layout
 
@@ -111,6 +115,53 @@ chmod +x hooks/post-receive
 `~/docker/klabnet-api` (the work-tree) needs to already exist with `data/`
 populated before the first push — it's not something the hook bootstraps.
 
+## Voice
+
+Drop-in voice channels (klabnet-web's `js/22-voice.js`). The audio runs
+through a [LiveKit](https://livekit.io) server, which `compose.yml` starts
+next to the API (the `livekit` service, config in `livekit.yaml`). Browsers
+talk to LiveKit directly over WebRTC; this service keeps the channel names,
+asks LiveKit who's in each room, and signs the token that lets someone in
+(`app/routers/voice.py`). LiveKit trusts the signature, so only people
+Authentik let through to `/api/voice/token` can join.
+
+It's off until `.env` (next to `compose.yml` on the server) has:
+
+```sh
+COMPOSE_PROFILES=voice                 # makes `docker compose up` start the livekit service
+LIVEKIT_URL=wss://voice.klab.gg        # what browsers connect to
+LIVEKIT_API_KEY=klabnet                # any name
+LIVEKIT_API_SECRET=<openssl rand -hex 32>
+```
+
+and three things outside this repo exist:
+
+1. **DNS:** `voice.klab.gg` pointing where `user.klab.gg` does.
+2. **Caddy:** a site for it that proxies to LiveKit's signalling port, with
+   no `forward_auth` (LiveKit checks its own tokens), and `/api/voice*`
+   added to the `/api` prefixes `user.klab.gg` and `staging.klab.gg` forward
+   here:
+
+   ```
+   voice.klab.gg {
+       reverse_proxy 192.168.0.37:7880
+   }
+   ```
+3. **Router:** UDP 7882 and TCP 7881 forwarded to 192.168.0.37. That's the
+   audio; it can't go through Caddy.
+
+`docker compose up -d` then starts LiveKit, and `GET /api/voice` answers
+`"enabled": true, "online": true`. `online: false` means this container
+can't reach LiveKit on the host (`LIVEKIT_API_URL`, by default
+`http://host.docker.internal:7880`): a host firewall is the usual reason.
+Setting `LIVEKIT_API_URL=https://voice.klab.gg` in `.env` goes round through
+Caddy instead.
+
+Ports, all on the host's own network: 7880 signalling (LAN only, Caddy
+reaches it), 7881/tcp and 7882/udp audio (forwarded from the internet).
+LiveKit finds the public address by itself (STUN) and also hands out the
+machine's LAN address, so people at home connect straight to it.
+
 ## Environment variables
 
 | Var | Default | Notes |
@@ -122,4 +173,8 @@ populated before the first push — it's not something the hook bootstraps.
 | `NOTE_MAX_CHARS` | `60` | max note length |
 | `POST_MAX_CHARS` | `500` | max reply / photo caption length |
 | `FEED_POST_MAX_CHARS` | `10000` | max feed post length (posts are markdown) |
+| `LIVEKIT_URL` | *(unset)* | voice: the `wss://` address browsers connect to. Voice is off unless this, the key and the secret are all set |
+| `LIVEKIT_API_KEY` / `LIVEKIT_API_SECRET` | *(unset)* | voice: LiveKit's key pair (the same values `compose.yml` hands LiveKit as `LIVEKIT_KEYS`) |
+| `LIVEKIT_API_URL` | `http://host.docker.internal:7880` in compose | voice: how this service reaches LiveKit to ask who's in a room |
+| `VOICE_MAX_CHANNELS` | `20` | most voice channels there can be |
 | `CORS_ORIGINS` | `https://user.klab.gg,https://staging.klab.gg` | comma-separated; only matters for a browser hitting this API cross-origin, which the current frontend doesn't do (it calls relative `/api/...` paths, proxied same-origin through Caddy) |
