@@ -73,6 +73,13 @@ FEEDBACK_BODY_MAX_CHARS  = int(os.environ.get("FEEDBACK_BODY_MAX_CHARS", "4000")
 # ── GIF stash (the picker in chat and the feed) ──
 GIF_MAX_MB = int(os.environ.get("GIF_MAX_MB", "12"))
 
+# ── Playlists (routers/playlists.py) ──
+PLAYLIST_NAME_MAX_CHARS = int(os.environ.get("PLAYLIST_NAME_MAX_CHARS", "80"))
+PLAYLIST_DESC_MAX_CHARS = int(os.environ.get("PLAYLIST_DESC_MAX_CHARS", "600"))
+PLAYLIST_MAX_SONGS      = int(os.environ.get("PLAYLIST_MAX_SONGS", "2000"))
+PLAYLISTS_PER_USER      = int(os.environ.get("PLAYLISTS_PER_USER", "200"))
+PLAYLIST_COVER_MAX_MB   = int(os.environ.get("PLAYLIST_COVER_MAX_MB", "20"))
+
 # ── Voice (drop-in channels on a self-hosted LiveKit server) ──
 # LIVEKIT_URL is what browsers connect to (wss://voice.klab.gg, through
 # Caddy); LIVEKIT_API_URL is how this service reaches the same server to ask

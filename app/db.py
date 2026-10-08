@@ -168,6 +168,57 @@ CREATE TABLE IF NOT EXISTS voice_channels (
     created    TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+-- Playlists (routers/playlists.py). Private to `username` until featured;
+-- featured ones are listed for everyone, and with collab other people can
+-- add songs. cover names its files on the media share ('' = none; the
+-- site then shows the first songs' album art). legacy_id is the id it had
+-- in the owner's prefs, for playlists brought over from there.
+CREATE TABLE IF NOT EXISTS playlists (
+    id          TEXT PRIMARY KEY,
+    username    TEXT NOT NULL,
+    name        TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    color       TEXT NOT NULL DEFAULT '',
+    cover       TEXT NOT NULL DEFAULT '',
+    featured    INTEGER NOT NULL DEFAULT 0,
+    collab      INTEGER NOT NULL DEFAULT 0,
+    legacy_id   TEXT NOT NULL DEFAULT '',
+    created     TEXT NOT NULL DEFAULT (datetime('now')),
+    updated     TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS playlists_by_user ON playlists(username);
+CREATE INDEX IF NOT EXISTS playlists_featured ON playlists(featured, updated);
+-- A song is in a playlist once. song_json is the client's record (what
+-- favourites keep: ids, names, length); cover_art and duration are copied
+-- out of it so lists can count and total without parsing every song.
+CREATE TABLE IF NOT EXISTS playlist_songs (
+    playlist_id TEXT NOT NULL,
+    song_id     TEXT NOT NULL,
+    position    INTEGER NOT NULL,
+    song_json   TEXT NOT NULL,
+    cover_art   TEXT NOT NULL DEFAULT '',
+    duration    INTEGER NOT NULL DEFAULT 0,
+    added_by    TEXT NOT NULL DEFAULT '',
+    added       TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (playlist_id, song_id)
+);
+CREATE INDEX IF NOT EXISTS playlist_songs_order ON playlist_songs(playlist_id, position);
+-- Someone else's featured playlist, kept in your own sidebar.
+CREATE TABLE IF NOT EXISTS playlist_saves (
+    playlist_id TEXT NOT NULL,
+    username    TEXT NOT NULL,
+    created     TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (playlist_id, username)
+);
+-- Every prefs-era playlist id ever brought over, kept after the playlist
+-- itself is deleted, so a device still holding the old list can't bring it
+-- back.
+CREATE TABLE IF NOT EXISTS playlist_imports (
+    username  TEXT NOT NULL,
+    legacy_id TEXT NOT NULL,
+    PRIMARY KEY (username, legacy_id)
+);
+
 CREATE TABLE IF NOT EXISTS music_requests (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     username      TEXT NOT NULL,

@@ -34,6 +34,15 @@ anything else. Admin-only writes (`POST`/`PUT`/`DELETE` on `/api/apps` and
 | `/api/posts/{id}/replies/{reply_id}` | DELETE | own reply or admin | delete a reply |
 | `/api/apps` | GET, POST, PUT, DELETE | GET: any · writes: admin | admin-managed app tiles |
 | `/api/sections` | GET, POST, PUT, DELETE | GET: any · writes: admin | tile groupings |
+| `/api/music-requests/playlists` | GET, POST | any | playlists (`app/routers/playlists.py`). GET: the caller's own and everyone's featured ones, as summaries (no songs). POST `{name, description?, color?, featured?, collab?, songs?}` makes one |
+| `/api/music-requests/playlists/import` | POST | any | `{playlists: [{id, name, songs}]}`: playlists from when they lived in prefs. Each old id is taken once per person, ever |
+| `/api/music-requests/playlists/{id}` | GET, PATCH, DELETE | GET: owner, or anyone if featured · writes: owner or admin | one playlist with its songs; edit its details; delete it |
+| `/api/music-requests/playlists/{id}/songs` | POST | owner, or anyone if featured and `collab` | `{songs: [...]}`: append, skipping ones already in it |
+| `/api/music-requests/playlists/{id}/songs/{song_id}` | DELETE | owner, or whoever added it on a `collab` playlist | take a song out |
+| `/api/music-requests/playlists/{id}/order` | PUT | owner or admin | `{ids: [...]}`: the songs' new order |
+| `/api/music-requests/playlists/{id}/save` | PUT | anyone but the owner | `{saved}`: keep someone's featured playlist in your own sidebar |
+| `/api/music-requests/playlists/{id}/cover` | POST, DELETE | owner or admin | upload a cover (any image, cropped square; kept on the media share at 1000px and 300px), or remove it |
+| `/api/music-requests/playlists/covers/{cover_id}/{l\|s}` | GET | any | a cover file. A new upload is a new id, so these are served as immutable |
 | `/api/voice` | GET | any | voice channels and who's in each (asked of LiveKit, cached 2s). `enabled: false` when LiveKit isn't configured |
 | `/api/voice/token` | POST | any | body `{channel}`: where LiveKit is and a 10-minute token for that channel's room, in the caller's name |
 | `/api/voice/channels` | POST | admin | create a channel (body `{name}`) |
@@ -177,4 +186,8 @@ machine's LAN address, so people at home connect straight to it.
 | `LIVEKIT_API_KEY` / `LIVEKIT_API_SECRET` | *(unset)* | voice: LiveKit's key pair (the same values `compose.yml` hands LiveKit as `LIVEKIT_KEYS`) |
 | `LIVEKIT_API_URL` | `http://host.docker.internal:7880` in compose | voice: how this service reaches LiveKit to ask who's in a room |
 | `VOICE_MAX_CHANNELS` | `20` | most voice channels there can be |
+| `PLAYLIST_MAX_SONGS` | `2000` | most songs in one playlist |
+| `PLAYLISTS_PER_USER` | `200` | most playlists one person can have |
+| `PLAYLIST_NAME_MAX_CHARS` / `PLAYLIST_DESC_MAX_CHARS` | `80` / `600` | playlist name and description lengths |
+| `PLAYLIST_COVER_MAX_MB` | `20` | largest cover upload |
 | `CORS_ORIGINS` | `https://user.klab.gg,https://staging.klab.gg` | comma-separated; only matters for a browser hitting this API cross-origin, which the current frontend doesn't do (it calls relative `/api/...` paths, proxied same-origin through Caddy) |
