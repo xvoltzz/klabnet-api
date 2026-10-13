@@ -1,5 +1,6 @@
 import asyncio
 import re
+import time
 from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Request
@@ -8,8 +9,58 @@ from fastapi.responses import JSONResponse
 from ..auth import get_username
 from ..config import AWAY_AFTER, PRESENCE_TTL
 from ..db import get_db
+from . import session
 
 router = APIRouter()
+
+# The latest beat from each of someone's devices (username -> device ->
+# beat), for choosing which one their card shows. Only this process's
+# memory: a beat is stale in PRESENCE_TTL seconds anyway.
+_beats: dict[str, dict[str, dict]] = {}
+
+
+def _shown(username: str, device: str, beat: dict) -> dict:
+    """The beat someone's card shows, now that this one has arrived.
+
+    Presence is one row per person, and every device they have klabnet
+    open on used to write its own song over it: playing on one and idle on
+    another, the card flipped between the two every few seconds. Now the
+    row is always the device that's really playing: the one their session
+    says is active (routers/session.py) while it plays, else one playing
+    its own music, else the active one paused, else one with a song
+    loaded, else the one they touched last. A device that's only showing
+    what another is playing (`remote`) comes after any that isn't.
+
+    The phone apps aren't in the session and send no device id: together
+    they're one device, "", ranked like any other by what it's playing."""
+    _beats.setdefault(username, {})[device] = beat
+    return _best(username, device)
+
+
+def _best(username: str, keep: str = "") -> dict | None:
+    """The beat to show of those still current (`keep`: one just heard from)."""
+    now = time.time()
+    devices = _beats.get(username, {})
+    # Stale ones go, and so do ones whose page is known to have closed: a
+    # device that was playing when it went mustn't outrank the others.
+    for d in [d for d, b in devices.items()
+              if now - b["at"] > PRESENCE_TTL or (d != keep and session.device_gone(username, d))]:
+        del devices[d]
+    if not devices:
+        _beats.pop(username, None)
+        return None
+    active = session.active_device(username)
+
+    def rank(item):
+        d, b = item
+        own = not b["remote"]
+        mine = bool(active) and d == active
+        return (mine and b["playing"], own and b["playing"], mine, own and bool(b["song"]), own, b["used"], b["at"])
+
+    best = max(devices.items(), key=rank)[1]
+    # A listening party is joined on one device; whichever it is, it shows.
+    party = best["party_host"] or next((b["party_host"] for b in devices.values() if b["party_host"]), "")
+    return dict(best, party_host=party)
 
 
 def _unauthenticated() -> JSONResponse:
@@ -34,6 +85,11 @@ async def post_presence(request: Request):
     song_id    = str(body.get("songId", "")).strip()[:100]
     playing    = bool(body.get("playing", False))
     party_host = str(body.get("partyHost", "")).strip()[:100]
+    # Which of their devices this is (a random id per open page), and
+    # whether it's only showing what another one is playing. Older pages
+    # send neither and count as one device.
+    device     = re.sub(r"[^A-Za-z0-9_-]", "", str(body.get("device", "")))[:40]
+    remote     = bool(body.get("remote", False))
     # What they're on, for the icon on their card: "app:windows",
     # "pwa:ios", "web:macos:firefox". Just letters and colons.
     platform   = re.sub(r"[^a-z:]", "", str(body.get("platform", "")).lower())[:40]
@@ -56,9 +112,17 @@ async def post_presence(request: Request):
     except (TypeError, ValueError):
         locked_for = None
 
+    now = time.time()
+    shown = _shown(username, device, {
+        "song": song, "artist": artist, "song_id": song_id, "playing": playing, "party_host": party_host,
+        "platform": platform, "remote": remote, "at": now,
+        "used": now - active_ago if active_ago is not None else 0.0,
+    })
     # The busiest write there is (every ~8s from every open tab): off the
     # event loop, one connection and one commit.
-    await asyncio.to_thread(_save_presence, username, song, artist, song_id, playing, party_host, platform, active_ago, idle_known, locked_for)
+    await asyncio.to_thread(
+        _save_presence, username, shown["song"], shown["artist"], shown["song_id"], shown["playing"],
+        shown["party_host"], shown["platform"], active_ago, idle_known, locked_for)
     return {"ok": True}
 
 
@@ -170,11 +234,19 @@ def _away(r, cutoff, away_cutoff) -> bool:
 
 
 @router.delete("/api/presence")
-def clear_presence(request: Request):
-    """Let a user remove themselves from presence (e.g. on logout/close)."""
+def clear_presence(request: Request, device: str = ""):
+    """One of someone's devices has gone (signed out, or a phone app put
+    away with nothing playing). They stay around, showing another device,
+    if they have one still open."""
     username = get_username(request)
     if username == "anonymous":
         return _unauthenticated()
+    _beats.get(username, {}).pop(re.sub(r"[^A-Za-z0-9_-]", "", device)[:40], None)
+    shown = _best(username)
+    if shown:
+        _save_presence(username, shown["song"], shown["artist"], shown["song_id"], shown["playing"],
+                       shown["party_host"], shown["platform"])
+        return {"ok": True}
     with get_db() as db:
         db.execute("DELETE FROM presence WHERE username=?", (username,))
         db.commit()

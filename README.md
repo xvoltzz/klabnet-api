@@ -25,7 +25,7 @@ anything else. Admin-only writes (`POST`/`PUT`/`DELETE` on `/api/apps` and
 | `/api/health` | GET | none | liveness check |
 | `/api/me` | GET | any | echoes back derived identity |
 | `/api/prefs` | GET, PUT | any | per-user JSON blob (theme, tile order, favorites, playlists, ...) |
-| `/api/presence` | GET, POST, DELETE | any | who's active right now + what they're listening to |
+| `/api/presence` | GET, POST, DELETE | any | who's active right now + what they're listening to. A beat carries `device` and `remote`; with klabnet open in several places, the card is written from the device that's really playing. DELETE takes away one device (`?device=`, or the phone apps' shared one without it), and the card with it only if that was the last |
 | `/api/notes` | GET, PUT, DELETE | any | Instagram-Notes-style ephemeral status text, one per user, expires after `NOTE_TTL_HOURS` |
 | `/api/posts` | GET, POST | any | feed posts (text + optional `image_mxc` — an `mxc://` URI the browser uploads to Matrix's content repo directly, never routed through this service). GET responses include each post's `reactions` and `reply_count`. |
 | `/api/posts/{id}` | DELETE | own post or admin | delete a post (cascades its reactions/replies) |
@@ -43,6 +43,11 @@ anything else. Admin-only writes (`POST`/`PUT`/`DELETE` on `/api/apps` and
 | `/api/music-requests/playlists/{id}/save` | PUT | anyone but the owner | `{saved}`: keep someone's featured playlist in your own sidebar |
 | `/api/music-requests/playlists/{id}/cover` | POST, DELETE | owner or admin | upload a cover (any image, cropped square; kept on the media share at 1000px and 300px), or remove it |
 | `/api/music-requests/playlists/covers/{cover_id}/{l\|s}` | GET | any | a cover file. A new upload is a new id, so these are served as immutable |
+| `/api/music-requests/session` | GET | any | `{session: true}`: this API has the shared player (`app/routers/session.py`). An older one answers 404 or 405 |
+| `/api/music-requests/session/stream` | GET | any | `?device=&name=&platform=`: a device's end of its person's session, as server-sent events. `hello` (everything as it stands), then `sync` (what changed: `now`, `queue`, `playlist`, `active`, `devices`) and `cmd` (something another device asks this one to do) |
+| `/api/music-requests/session/state` | PUT | a device with its stream open | `{device, now?, queue?, playlist?, claim?}`: what the active device is playing. With `claim` the sender becomes the active device; without it, only if nobody is (otherwise 409) |
+| `/api/music-requests/session/cmd` | POST | a device with its stream open | `{device, cmd, to?}`: handed to the active device (or the one named in `to`): `play`, `resume`, `pause`, `seek`, `next`, `prev`, `queue`, `set`, `take` |
+| `/api/music-requests/session/release` | POST | a device with its stream open | `{device}`: the active device's page is closing |
 | `/api/voice` | GET | any | voice channels and who's in each (asked of LiveKit, cached 2s). `enabled: false` when LiveKit isn't configured |
 | `/api/voice/token` | POST | any | body `{channel}`: where LiveKit is and a 10-minute token for that channel's room, in the caller's name |
 | `/api/voice/channels` | POST | admin | create a channel (body `{name}`) |
