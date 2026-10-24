@@ -211,6 +211,11 @@ def _attach(db, rows, username) -> list:
     return out
 
 
+# A photo post whose photos are all gone isn't listed. Filtered here, before
+# LIMIT, so a page isn't short (_attach() still drops one as a backstop).
+_HAS_PHOTOS = "EXISTS (SELECT 1 FROM photos ph WHERE ph.post_id = posts.id)"
+
+
 @router.get("/api/posts/photos")
 def list_photo_posts(
     request: Request, limit: int = 40, before_sort: str | None = None, before_id: int | None = None,
@@ -228,20 +233,20 @@ def list_photo_posts(
             cols = "id, username, text, image_mxc, song_json, created, shot_at, created AS sort_at"
             if before_id is not None:
                 rows = db.execute(
-                    f"SELECT {cols} FROM posts WHERE kind='photo' AND id < ? ORDER BY id DESC LIMIT ?", (before_id, limit)
+                    f"SELECT {cols} FROM posts WHERE kind='photo' AND {_HAS_PHOTOS} AND id < ? ORDER BY id DESC LIMIT ?", (before_id, limit)
                 ).fetchall()
             else:
-                rows = db.execute(f"SELECT {cols} FROM posts WHERE kind='photo' ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+                rows = db.execute(f"SELECT {cols} FROM posts WHERE kind='photo' AND {_HAS_PHOTOS} ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
         elif before_sort is not None and before_id is not None:
             rows = db.execute(
-                f"""SELECT {_COLS} FROM posts WHERE kind='photo'
+                f"""SELECT {_COLS} FROM posts WHERE kind='photo' AND {_HAS_PHOTOS}
                     AND ({_SORT} < ? OR ({_SORT} = ? AND id < ?))
                     ORDER BY sort_at DESC, id DESC LIMIT ?""",
                 (before_sort, before_sort, before_id, limit),
             ).fetchall()
         else:
             rows = db.execute(
-                f"SELECT {_COLS} FROM posts WHERE kind='photo' ORDER BY sort_at DESC, id DESC LIMIT ?", (limit,)
+                f"SELECT {_COLS} FROM posts WHERE kind='photo' AND {_HAS_PHOTOS} ORDER BY sort_at DESC, id DESC LIMIT ?", (limit,)
             ).fetchall()
         posts = _attach(db, rows, username)
         # The first page also says how many photos there are in all (not
