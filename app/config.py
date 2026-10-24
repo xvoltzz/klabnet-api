@@ -67,6 +67,9 @@ MUSICBRAINZ_USER_AGENT = os.environ.get("MUSICBRAINZ_USER_AGENT", "klabnet-web/2
 GITEA_URL   = os.environ.get("GITEA_URL", "https://git.klab.gg")
 GITEA_REPO  = os.environ.get("GITEA_REPO", "xvoltzz/klabnet-web")
 GITEA_TOKEN = os.environ.get("GITEA_TOKEN", "")
+# Home's "What's new" lists the newest commits to these (owner/name,
+# comma-separated; public repos need no token).
+CHANGES_REPOS = [r.strip() for r in os.environ.get("CHANGES_REPOS", "xvoltzz/klabnet-web,xvoltzz/klabnet-api").split(",") if r.strip()]
 FEEDBACK_TITLE_MAX_CHARS = int(os.environ.get("FEEDBACK_TITLE_MAX_CHARS", "120"))
 FEEDBACK_BODY_MAX_CHARS  = int(os.environ.get("FEEDBACK_BODY_MAX_CHARS", "4000"))
 
