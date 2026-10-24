@@ -33,7 +33,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# photos before posts: its /api/posts/photos/... paths must win over /api/posts/{post_id}.
+# photos and changes before posts: their /api/posts/... paths must win over /api/posts/{post_id}.
 # playlists and session before music_requests, for the same reason (/api/music-requests/playlists/...).
-for router in (health.router, identity.router, prefs.router, presence.router, notes.router, photos.router, stars.router, posts.router, profiles.router, playlists.router, session.router, music_requests.router, feedback.router, changes.router, gifs.router, voice.router):
+for router in (health.router, identity.router, prefs.router, presence.router, notes.router, photos.router, stars.router, changes.router, posts.router, profiles.router, playlists.router, session.router, music_requests.router, feedback.router, gifs.router, voice.router):
     app.include_router(router)

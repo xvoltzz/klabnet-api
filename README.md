@@ -50,6 +50,7 @@ anything else. Admin-only writes (`POST`/`PUT`/`DELETE` on `/api/apps` and
 | `/api/music-requests/session/release` | POST | a device with its stream open | `{device}`: the active device's page is closing |
 | `/api/voice` | GET | any | voice channels and who's in each (asked of LiveKit, cached 2s). `enabled: false` when LiveKit isn't configured |
 | `/api/voice/token` | POST | any | body `{channel}`: where LiveKit is and a 10-minute token for that channel's room, in the caller's name |
+| `/api/posts/changes` | GET | any | the newest commits to klabnet's repos on Gitea (`CHANGES_REPOS`), for Home's "What's new"; kept 5 minutes. Under `/api/posts/` so it rides a prefix Caddy already forwards; `/api/changes` answers too |
 | `/api/voice/channels` | POST | admin | create a channel (body `{name}`) |
 | `/api/voice/channels/{id}` | PATCH, DELETE | admin | rename, or delete (which disconnects whoever's in it; the last channel can't be deleted) |
 

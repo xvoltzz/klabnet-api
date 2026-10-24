@@ -68,7 +68,11 @@ async def _commits(client: httpx.AsyncClient, repo: str) -> list:
     return [_shape(repo, c) for c in raw if isinstance(c, dict) and len(c.get("parents") or []) < 2]
 
 
+# Also under /api/posts/: Caddy only forwards an explicit list of /api
+# prefixes, and /api/changes isn't on it (the page got Caddy's file
+# server's HTML and said "needs the latest klabnet-api").
 @router.get("/api/changes")
+@router.get("/api/posts/changes")
 async def changes(request: Request):
     if get_username(request) == "anonymous":
         return JSONResponse(status_code=401, content={"error": "not authenticated"})
