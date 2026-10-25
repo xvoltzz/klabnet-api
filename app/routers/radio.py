@@ -1,4 +1,4 @@
-"""Radio (experimental): stations that are each one long audio file, on
+"""Radio: stations that are each one long audio file, on
 a loop, that everyone hears at the same point, like the radio in GTA.
 
 Nothing streams. A station has a start time (`epoch`); where it's at is
@@ -8,7 +8,9 @@ clock (GET …/radio/time). The file is served with Range support, so a
 page only fetches from where it tunes in.
 
 Anyone signed in can make a station; its owner (or an admin) can edit or
-delete it. Files live on the media share under radio/, named by a new id
+delete it. A station can be uploaded for someone else: `author` is who
+it's by (shown instead of the owner), and when that's someone's username
+they can edit it too. Files live on the media share under radio/, named by a new id
 for each upload so they can be cached forever. Covers reuse playlists'
 (routers/playlists.py). Under /api/music-requests/ so it rides a prefix
 Caddy already forwards."""
@@ -40,6 +42,33 @@ _ID_RE = re.compile(r"[A-Za-z0-9_-]{8,40}")
 _COLOR_RE = re.compile(r"#[0-9a-fA-F]{6}")
 # Big files: one being written at a time is plenty for a home server.
 _upload_slots = threading.BoundedSemaphore(1)
+# The FM band, and how far apart two stations must be: on the dial a
+# station fades in over 0.25 MHz either side, so closer ones would overlap.
+FREQ_MIN, FREQ_MAX, FREQ_GAP = 87.5, 108.0, 0.5
+
+
+def _frequency(value, db, station_id: str = "") -> float | JSONResponse:
+    try:
+        f = round(float(str(value).replace(",", ".")), 1)
+    except (TypeError, ValueError):
+        return _error(400, "a station needs a frequency, like 98.7")
+    if not FREQ_MIN <= f <= FREQ_MAX:
+        return _error(400, f"frequencies go from {FREQ_MIN} to {FREQ_MAX}")
+    near = db.execute(
+        "SELECT name, frequency FROM radio_stations WHERE id != ? AND ABS(frequency - ?) < ? ORDER BY ABS(frequency - ?) LIMIT 1",
+        (station_id, f, FREQ_GAP - 1e-6, f),
+    ).fetchone()
+    if near:
+        return _error(409, f"too close to {near['name']} on {near['frequency']:.1f}: keep {FREQ_GAP} apart")
+    return f
+
+
+def _author(value) -> str:
+    return str(value or "").strip().lstrip("@")[:60]
+
+
+def _can_edit(r, request: Request, username: str) -> bool:
+    return username in (r["owner"], r["author"]) or is_admin(get_groups(request))
 
 
 def _error(status: int, message: str) -> JSONResponse:
@@ -145,10 +174,10 @@ def _json(r, request: Request, username: str, listeners: dict | None = None) -> 
         tracks = []
     return {
         "id": r["id"], "name": r["name"], "description": r["description"], "color": r["color"] or None,
-        "owner": r["owner"], "duration": r["duration"], "epoch": r["epoch"],
+        "owner": r["owner"], "author": r["author"] or r["owner"], "duration": r["duration"], "epoch": r["epoch"], "frequency": r["frequency"],
         "audio": f"{BASE}/{r['id']}/audio/{r['file_id']}.{r['ext']}",
         "cover": r["cover"] or None, "tracklist": tracks,
-        "canEdit": r["owner"] == username or is_admin(get_groups(request)),
+        "canEdit": _can_edit(r, request, username),
         "listeners": (listeners or {}).get(r["id"], []),
         "created": r["created"],
     }
@@ -172,13 +201,13 @@ def list_stations(request: Request):
         return _error(401, "not authenticated")
     listeners = _listeners()
     with get_db() as db:
-        rows = db.execute("SELECT * FROM radio_stations ORDER BY position, created").fetchall()
+        rows = db.execute("SELECT * FROM radio_stations ORDER BY frequency, created").fetchall()
     return {"now": time.time(), "stations": [_json(r, request, username, listeners) for r in rows]}
 
 
 @router.post(BASE)
 def create_station(request: Request, file: UploadFile = File(...), name: str = Form(...),
-                   description: str = Form(""), color: str = Form(""), tracklist: str = Form("")):
+                   frequency: str = Form(""), author: str = Form(""), description: str = Form(""), color: str = Form(""), tracklist: str = Form("")):
     username = _signed_in(request)
     if not username:
         return _error(401, "not authenticated")
@@ -187,18 +216,28 @@ def create_station(request: Request, file: UploadFile = File(...), name: str = F
         return _error(400, "a station needs a name")
     if not media_ready():
         return _error(503, "storage is offline")
+    # Checked before the (big) upload is written, and again after.
+    with get_db() as db:
+        freq = _frequency(frequency, db)
+    if isinstance(freq, JSONResponse):
+        return freq
     saved = _save_audio(file)
     if isinstance(saved, JSONResponse):
         return saved
     file_id, ext, length, size = saved
     station_id = secrets.token_urlsafe(9)
     with get_db() as db:
+        freq = _frequency(frequency, db)
+        if isinstance(freq, JSONResponse):
+            _remove_audio(file_id, ext)
+            return freq
         pos = db.execute("SELECT COALESCE(MAX(position), 0) + 1 AS p FROM radio_stations").fetchone()["p"]
         db.execute(
-            """INSERT INTO radio_stations(id, name, description, color, owner, file_id, ext, duration, size, epoch, tracklist, position)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            """INSERT INTO radio_stations(id, name, description, color, owner, file_id, ext, duration, size, epoch, tracklist, position, frequency, author)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (station_id, name, description.strip()[:300], color if _COLOR_RE.fullmatch(color or "") else "",
-             username, file_id, ext, length, size, round(time.time(), 3), json.dumps(_tracklist(tracklist)), pos),
+             username, file_id, ext, length, size, round(time.time(), 3), json.dumps(_tracklist(tracklist)), pos, freq,
+             "" if _author(author) == username else _author(author)),
         )
         db.commit()
         row = db.execute("SELECT * FROM radio_stations WHERE id=?", (station_id,)).fetchone()
@@ -210,7 +249,7 @@ def _editable(station_id: str, request: Request, username: str):
         row = db.execute("SELECT * FROM radio_stations WHERE id=?", (station_id,)).fetchone()
     if row is None:
         return None, _error(404, "not found")
-    if row["owner"] != username and not is_admin(get_groups(request)):
+    if not _can_edit(row, request, username):
         return None, _error(403, "not your station")
     return row, None
 
@@ -240,6 +279,15 @@ async def edit_station(station_id: str, request: Request):
     if "color" in body:
         c = str(body["color"] or "")
         sets.append("color=?"); args.append(c if _COLOR_RE.fullmatch(c) else "")
+    if "frequency" in body:
+        with get_db() as db:
+            freq = _frequency(body["frequency"], db, station_id)
+        if isinstance(freq, JSONResponse):
+            return freq
+        sets.append("frequency=?"); args.append(freq)
+    if "author" in body:
+        a = _author(body["author"])
+        sets.append("author=?"); args.append("" if a == row["owner"] else a)
     if "tracklist" in body:
         sets.append("tracklist=?"); args.append(json.dumps(_tracklist(str(body["tracklist"] or ""))))
     if sets:

@@ -276,6 +276,8 @@ CREATE TABLE IF NOT EXISTS radio_stations (
     cover       TEXT NOT NULL DEFAULT '',
     tracklist   TEXT NOT NULL DEFAULT '[]',
     position    INTEGER NOT NULL DEFAULT 0,
+    frequency   REAL NOT NULL DEFAULT 0,
+    author      TEXT NOT NULL DEFAULT '',
     created     TEXT NOT NULL DEFAULT (datetime('now')),
     updated     TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -320,6 +322,19 @@ def init_db() -> None:
         for col in ("locked_at", "lock_seen_at"):
             if col not in cols:
                 conn.execute(f"ALTER TABLE presence ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
+        # Radio stations got a frequency (MHz, on the Radio page's dial)
+        # after the first ones were made: those get a free one each.
+        radio_cols = [row[1] for row in conn.execute("PRAGMA table_info(radio_stations)").fetchall()]
+        if "frequency" not in radio_cols:
+            conn.execute("ALTER TABLE radio_stations ADD COLUMN frequency REAL NOT NULL DEFAULT 0")
+        # author: who the station's by, when it was uploaded for them.
+        if "author" not in radio_cols:
+            conn.execute("ALTER TABLE radio_stations ADD COLUMN author TEXT NOT NULL DEFAULT ''")
+        taken = [r[0] for r in conn.execute("SELECT frequency FROM radio_stations WHERE frequency > 0").fetchall()]
+        for (sid,) in conn.execute("SELECT id FROM radio_stations WHERE frequency <= 0 ORDER BY created").fetchall():
+            f = next(x / 10 for x in range(881, 1080, 20) if all(abs(x / 10 - t) >= 0.5 for t in taken))
+            taken.append(f)
+            conn.execute("UPDATE radio_stations SET frequency=? WHERE id=?", (f, sid))
         # song_json is new — same one-time migration story as party_host above.
         post_cols = [row[1] for row in conn.execute("PRAGMA table_info(posts)").fetchall()]
         if "song_json" not in post_cols:
