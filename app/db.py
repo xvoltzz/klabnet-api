@@ -244,6 +244,22 @@ CREATE TABLE IF NOT EXISTS art_cache (
     checked TEXT NOT NULL DEFAULT (datetime('now')),
     id      TEXT NOT NULL DEFAULT ''
 );
+-- One play of a song: who, what, and how long it's played (adds up from
+-- presence's beats; routers/listens.py). For Music's Activity page.
+CREATE TABLE IF NOT EXISTS listens (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    username  TEXT NOT NULL,
+    song_id   TEXT NOT NULL,
+    song      TEXT NOT NULL DEFAULT '',
+    artist    TEXT NOT NULL DEFAULT '',
+    album     TEXT NOT NULL DEFAULT '',
+    cover_art TEXT NOT NULL DEFAULT '',
+    started   TEXT NOT NULL DEFAULT (datetime('now')),
+    last      TEXT NOT NULL DEFAULT (datetime('now')),
+    seconds   REAL NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS listens_user_last ON listens(username, last);
+CREATE INDEX IF NOT EXISTS listens_started ON listens(started);
 """
 
 

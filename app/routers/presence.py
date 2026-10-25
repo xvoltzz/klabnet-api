@@ -9,7 +9,7 @@ from fastapi.responses import JSONResponse
 from ..auth import get_username
 from ..config import AWAY_AFTER, PRESENCE_TTL
 from ..db import get_db
-from . import session
+from . import listens, session
 
 router = APIRouter()
 
@@ -112,21 +112,57 @@ async def post_presence(request: Request):
     except (TypeError, ValueError):
         locked_for = None
 
+    # Where it's got to (seconds), for the Activity page's live bar, and
+    # what it's on, so a play keeps its album and cover.
+    def secs(v):
+        try:
+            return None if v is None else max(0.0, min(float(v), 86400.0))
+        except (TypeError, ValueError):
+            return None
+    position   = secs(body.get("position"))
+    duration   = secs(body.get("duration"))
+    album      = str(body.get("album", "")).strip()[:200]
+    cover_art  = str(body.get("coverArt", "")).strip()[:100]
+
     now = time.time()
     shown = _shown(username, device, {
         "song": song, "artist": artist, "song_id": song_id, "playing": playing, "party_host": party_host,
-        "platform": platform, "remote": remote, "at": now,
+        "platform": platform, "remote": remote, "at": now, "device": device,
+        "position": position, "duration": duration, "album": album, "cover_art": cover_art,
         "used": now - active_ago if active_ago is not None else 0.0,
     })
+    # Only the beat their card shows counts towards what they've played.
+    counted = shown if shown.get("device") == device else None
     # The busiest write there is (every ~8s from every open tab): off the
     # event loop, one connection and one commit.
     await asyncio.to_thread(
         _save_presence, username, shown["song"], shown["artist"], shown["song_id"], shown["playing"],
-        shown["party_host"], shown["platform"], active_ago, idle_known, locked_for)
+        shown["party_host"], shown["platform"], active_ago, idle_known, locked_for, counted)
     return {"ok": True}
 
 
-def _save_presence(username, song, artist, song_id, playing, party_host, platform, active_ago=None, idle_known=False, locked_for=None):
+def live(username: str) -> dict | None:
+    """What someone's playing right now (their card's device), with how far
+    into it they'll be by now, or None if nothing's loaded."""
+    b = _best(username) if username in _beats else None
+    if not b or not b["song_id"]:
+        return None
+    pos = b.get("position")
+    if pos is not None and b["playing"]:
+        pos += time.time() - b["at"]
+        if b.get("duration"):
+            pos = min(pos, b["duration"])
+    return {"song": b["song"], "artist": b["artist"], "album": b.get("album", ""), "songId": b["song_id"],
+            "coverArt": b.get("cover_art", ""), "playing": b["playing"], "partyHost": b["party_host"] or None,
+            "position": None if pos is None else round(pos, 1), "duration": b.get("duration")}
+
+
+def listening() -> list[str]:
+    """Everyone with a song loaded on a device that's still current."""
+    return [u for u in list(_beats) if live(u)]
+
+
+def _save_presence(username, song, artist, song_id, playing, party_host, platform, active_ago=None, idle_known=False, locked_for=None, counted=None):
     now = datetime.utcnow()
     fmt = "%Y-%m-%d %H:%M:%S"
     active_at = "" if active_ago is None else (now - timedelta(seconds=active_ago)).strftime(fmt)
@@ -166,6 +202,8 @@ def _save_presence(username, song, artist, song_id, playing, party_host, platfor
                 "UPDATE presence SET locked_at = ?, lock_seen_at = ? WHERE username = ?",
                 (locked_at, now.strftime(fmt), username),
             )
+        if counted is not None:
+            listens.record(db, username, counted)
         db.commit()
 
 
