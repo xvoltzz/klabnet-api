@@ -122,13 +122,15 @@ async def post_presence(request: Request):
     position   = secs(body.get("position"))
     duration   = secs(body.get("duration"))
     album      = str(body.get("album", "")).strip()[:200]
+    # The radio station they're tuned in to (routers/radio.py), if any.
+    radio      = re.sub(r"[^A-Za-z0-9_-]", "", str(body.get("radio", "")))[:40]
     cover_art  = str(body.get("coverArt", "")).strip()[:100]
 
     now = time.time()
     shown = _shown(username, device, {
         "song": song, "artist": artist, "song_id": song_id, "playing": playing, "party_host": party_host,
         "platform": platform, "remote": remote, "at": now, "device": device,
-        "position": position, "duration": duration, "album": album, "cover_art": cover_art,
+        "position": position, "duration": duration, "album": album, "cover_art": cover_art, "radio": radio,
         "used": now - active_ago if active_ago is not None else 0.0,
     })
     # Only the beat their card shows counts towards what they've played.

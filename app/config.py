@@ -78,6 +78,8 @@ GIF_MAX_MB = int(os.environ.get("GIF_MAX_MB", "12"))
 
 # ── Playlists (routers/playlists.py) ──
 PLAYLIST_NAME_MAX_CHARS = int(os.environ.get("PLAYLIST_NAME_MAX_CHARS", "80"))
+# Radio (routers/radio.py): the biggest station file one upload can be.
+RADIO_MAX_MB = int(os.environ.get("RADIO_MAX_MB", "1500"))
 PLAYLIST_DESC_MAX_CHARS = int(os.environ.get("PLAYLIST_DESC_MAX_CHARS", "600"))
 PLAYLIST_MAX_SONGS      = int(os.environ.get("PLAYLIST_MAX_SONGS", "2000"))
 PLAYLISTS_PER_USER      = int(os.environ.get("PLAYLISTS_PER_USER", "200"))

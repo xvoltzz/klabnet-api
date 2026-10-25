@@ -260,6 +260,25 @@ CREATE TABLE IF NOT EXISTS listens (
 );
 CREATE INDEX IF NOT EXISTS listens_user_last ON listens(username, last);
 CREATE INDEX IF NOT EXISTS listens_started ON listens(started);
+-- Radio (routers/radio.py): a station is one long file on a loop, at the
+-- same point for everyone: (now - epoch) mod duration.
+CREATE TABLE IF NOT EXISTS radio_stations (
+    id          TEXT PRIMARY KEY,
+    name        TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    color       TEXT NOT NULL DEFAULT '',
+    owner       TEXT NOT NULL,
+    file_id     TEXT NOT NULL,
+    ext         TEXT NOT NULL,
+    duration    REAL NOT NULL,
+    size        INTEGER NOT NULL DEFAULT 0,
+    epoch       REAL NOT NULL,
+    cover       TEXT NOT NULL DEFAULT '',
+    tracklist   TEXT NOT NULL DEFAULT '[]',
+    position    INTEGER NOT NULL DEFAULT 0,
+    created     TEXT NOT NULL DEFAULT (datetime('now')),
+    updated     TEXT NOT NULL DEFAULT (datetime('now'))
+);
 """
 
 
