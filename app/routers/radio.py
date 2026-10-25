@@ -183,6 +183,31 @@ def _json(r, request: Request, username: str, listeners: dict | None = None) -> 
     }
 
 
+def now_on(station_id: str) -> dict | None:
+    """A station as someone tuned in to it hears it right now: for
+    presence (Activity's "Listening now"). None if there's no such station."""
+    if not station_id:
+        return None
+    with get_db() as db:
+        r = db.execute("SELECT * FROM radio_stations WHERE id=?", (station_id,)).fetchone()
+    if r is None or not r["duration"]:
+        return None
+    pos = (time.time() - r["epoch"]) % r["duration"]
+    try:
+        tracks = json.loads(r["tracklist"] or "[]")
+    except ValueError:
+        tracks = []
+    track = ""
+    for t in tracks:
+        if t[0] <= pos:
+            track = t[1]
+        else:
+            break
+    return {"id": r["id"], "name": r["name"], "frequency": r["frequency"], "color": r["color"] or None,
+            "cover": r["cover"] or None, "author": r["author"] or r["owner"], "track": track,
+            "position": round(pos, 1), "duration": r["duration"]}
+
+
 def _signed_in(request: Request) -> str | None:
     u = get_username(request)
     return None if u == "anonymous" else u

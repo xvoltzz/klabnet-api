@@ -145,8 +145,17 @@ async def post_presence(request: Request):
 
 def live(username: str) -> dict | None:
     """What someone's playing right now (their card's device), with how far
-    into it they'll be by now, or None if nothing's loaded."""
+    into it they'll be by now, or None if nothing's loaded. Tuned in to the
+    radio, it's the station (`radio`: routers/radio.py now_on)."""
     b = _best(username) if username in _beats else None
+    if b and b.get("radio"):
+        # Tuned in to a station: that, not the song left paused underneath.
+        from .radio import now_on
+        station = now_on(b["radio"])
+        if station:
+            return {"radio": station, "song": station["track"] or station["name"], "artist": station["name"],
+                    "album": "", "songId": "", "coverArt": "", "playing": True, "partyHost": None,
+                    "position": None, "duration": None}
     if not b or not b["song_id"]:
         return None
     pos = b.get("position")
@@ -247,6 +256,9 @@ def get_presence(request: Request):
             "partyHost": r["party_host"] or None,
             "platform":  r["platform"] or None,
             "updated":   r["updated"],
+            # The radio station they're tuned in to, if any: a card that
+            # tunes in with them rather than looking for a song.
+            "radio":     ((_best(r["username"]) or {}).get("radio") or None) if r["username"] in _beats else None,
             # awaySince is when they last used anything (UTC).
             **({"away": True, "awaySince": r["active_at"]} if _away(r, cutoff, away_cutoff) else {"away": False}),
         }
