@@ -281,6 +281,17 @@ CREATE TABLE IF NOT EXISTS radio_stations (
     created     TEXT NOT NULL DEFAULT (datetime('now')),
     updated     TEXT NOT NULL DEFAULT (datetime('now'))
 );
+-- A station's chat (routers/radio.py): what was said on it, and what was
+-- on when it was said. The newest 300 per station are kept.
+CREATE TABLE IF NOT EXISTS radio_chat (
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    station  TEXT NOT NULL,
+    username TEXT NOT NULL,
+    body     TEXT NOT NULL,
+    track    TEXT NOT NULL DEFAULT '',
+    ts       REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS radio_chat_station ON radio_chat(station, id);
 """
 
 

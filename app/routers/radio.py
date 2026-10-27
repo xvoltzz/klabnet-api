@@ -385,6 +385,7 @@ def delete_station(station_id: str, request: Request):
         return err
     with get_db() as db:
         db.execute("DELETE FROM radio_stations WHERE id=?", (station_id,))
+        db.execute("DELETE FROM radio_chat WHERE station=?", (station_id,))
         db.commit()
     _remove_audio(row["file_id"], row["ext"])
     _delete_cover_files(row["cover"])
@@ -406,3 +407,50 @@ def station_audio(station_id: str, name: str, request: Request):
     if not os.path.isfile(path):
         return _error(404, "not found")
     return FileResponse(path, media_type=_TYPES[ext], headers={"Cache-Control": "private, max-age=31536000, immutable"})
+
+
+# ── A station's chat ──
+# Pages poll it while the station's showing (GET …/chat?after=<last id>).
+# Each line keeps what was on when it was said, from the tracklist.
+_CHAT_KEEP = 300
+_CHAT_MAX = 500
+
+
+def _chat_json(r) -> dict:
+    return {"id": r["id"], "username": r["username"], "body": r["body"], "track": r["track"], "ts": r["ts"]}
+
+
+@router.get(f"{BASE}/{{station_id}}/chat")
+def station_chat(station_id: str, request: Request, after: int = 0):
+    if not _signed_in(request):
+        return _error(401, "not authenticated")
+    with get_db() as db:
+        if after > 0:
+            rows = db.execute("SELECT * FROM radio_chat WHERE station=? AND id>? ORDER BY id LIMIT 200", (station_id, after)).fetchall()
+        else:
+            rows = db.execute("SELECT * FROM (SELECT * FROM radio_chat WHERE station=? ORDER BY id DESC LIMIT 100) ORDER BY id", (station_id,)).fetchall()
+    return {"messages": [_chat_json(r) for r in rows]}
+
+
+@router.post(f"{BASE}/{{station_id}}/chat")
+async def post_chat(station_id: str, request: Request):
+    username = _signed_in(request)
+    if not username:
+        return _error(401, "not authenticated")
+    try:
+        data = await request.json()
+    except ValueError:
+        return _error(400, "bad request")
+    body = str((data or {}).get("body") or "").strip()[:_CHAT_MAX]
+    if not body:
+        return _error(400, "say something")
+    on = now_on(station_id)
+    if on is None:
+        return _error(404, "no such station")
+    with get_db() as db:
+        cur = db.execute("INSERT INTO radio_chat (station, username, body, track, ts) VALUES (?,?,?,?,?)",
+                         (station_id, username, body, on["track"], time.time()))
+        db.execute("DELETE FROM radio_chat WHERE station=? AND id <= ?", (station_id, cur.lastrowid - _CHAT_KEEP))
+        db.commit()
+        row = db.execute("SELECT * FROM radio_chat WHERE id=?", (cur.lastrowid,)).fetchone()
+    return _chat_json(row)
