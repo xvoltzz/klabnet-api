@@ -288,7 +288,6 @@ CREATE TABLE IF NOT EXISTS radio_chat (
     station  TEXT NOT NULL,
     username TEXT NOT NULL,
     body     TEXT NOT NULL,
-    track    TEXT NOT NULL DEFAULT '',
     ts       REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS radio_chat_station ON radio_chat(station, id);

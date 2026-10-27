@@ -167,17 +167,33 @@ def _listeners() -> dict:
     return out
 
 
+def _on_now(tracks: list, r) -> list:
+    """The tracklist as a listener gets it: only what's on now, and when it
+    ends (as a cue with no name), so a page knows when to ask again. What's
+    played and what's coming stay off the wire; the owner wants what's next
+    to be a surprise."""
+    if not r["duration"]:
+        return []
+    pos = (time.time() - r["epoch"]) % r["duration"]
+    cur = [t for t in tracks if t[0] <= pos][-1:]
+    nxt = [[t[0], ""] for t in tracks if t[0] > pos][:1]
+    return cur + nxt
+
+
 def _json(r, request: Request, username: str, listeners: dict | None = None) -> dict:
     try:
         tracks = json.loads(r["tracklist"] or "[]")
     except ValueError:
         tracks = []
+    can_edit = _can_edit(r, request, username)
+    if not can_edit:
+        tracks = _on_now(tracks, r)
     return {
         "id": r["id"], "name": r["name"], "description": r["description"], "color": r["color"] or None,
         "owner": r["owner"], "author": r["author"] or r["owner"], "duration": r["duration"], "epoch": r["epoch"], "frequency": r["frequency"],
         "audio": f"{BASE}/{r['id']}/audio/{r['file_id']}.{r['ext']}",
         "cover": r["cover"] or None, "tracklist": tracks,
-        "canEdit": _can_edit(r, request, username),
+        "canEdit": can_edit,
         "listeners": (listeners or {}).get(r["id"], []),
         "created": r["created"],
     }
@@ -411,13 +427,12 @@ def station_audio(station_id: str, name: str, request: Request):
 
 # ── A station's chat ──
 # Pages poll it while the station's showing (GET …/chat?after=<last id>).
-# Each line keeps what was on when it was said, from the tracklist.
 _CHAT_KEEP = 300
 _CHAT_MAX = 500
 
 
 def _chat_json(r) -> dict:
-    return {"id": r["id"], "username": r["username"], "body": r["body"], "track": r["track"], "ts": r["ts"]}
+    return {"id": r["id"], "username": r["username"], "body": r["body"], "ts": r["ts"]}
 
 
 @router.get(f"{BASE}/{{station_id}}/chat")
@@ -444,12 +459,11 @@ async def post_chat(station_id: str, request: Request):
     body = str((data or {}).get("body") or "").strip()[:_CHAT_MAX]
     if not body:
         return _error(400, "say something")
-    on = now_on(station_id)
-    if on is None:
-        return _error(404, "no such station")
     with get_db() as db:
-        cur = db.execute("INSERT INTO radio_chat (station, username, body, track, ts) VALUES (?,?,?,?,?)",
-                         (station_id, username, body, on["track"], time.time()))
+        if db.execute("SELECT 1 FROM radio_stations WHERE id=?", (station_id,)).fetchone() is None:
+            return _error(404, "no such station")
+        cur = db.execute("INSERT INTO radio_chat (station, username, body, ts) VALUES (?,?,?,?)",
+                         (station_id, username, body, time.time()))
         db.execute("DELETE FROM radio_chat WHERE station=? AND id <= ?", (station_id, cur.lastrowid - _CHAT_KEEP))
         db.commit()
         row = db.execute("SELECT * FROM radio_chat WHERE id=?", (cur.lastrowid,)).fetchone()
