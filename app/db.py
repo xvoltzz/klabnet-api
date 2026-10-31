@@ -39,10 +39,9 @@ CREATE TABLE IF NOT EXISTS presence (
     locked_at  TEXT NOT NULL DEFAULT '',
     lock_seen_at TEXT NOT NULL DEFAULT ''
 );
--- Instagram-Notes-style ephemeral status text — one per user, expires on
--- its own after NOTE_TTL_HOURS (filtered at query time in GET /api/notes,
--- same pattern PRESENCE_TTL already uses for presence — no cleanup job,
--- an expired row just stops being returned).
+-- Each person's note: one per user, their latest. Notes used to expire
+-- after NOTE_TTL_HOURS; they don't now, and clearing keeps the last one
+-- (routers/notes.py).
 CREATE TABLE IF NOT EXISTS notes (
     username TEXT PRIMARY KEY,
     text     TEXT NOT NULL,

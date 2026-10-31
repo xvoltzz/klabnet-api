@@ -42,7 +42,6 @@ PHOTOS_PER_POST     = int(os.environ.get("PHOTOS_PER_POST", "10"))
 ADMIN_GROUP  = os.environ.get("ADMIN_GROUP", "klabnet-admin")
 PRESENCE_TTL = int(os.environ.get("PRESENCE_TTL", "30"))  # seconds
 AWAY_AFTER   = int(os.environ.get("AWAY_AFTER", "300"))   # seconds without input before someone shows as away
-NOTE_TTL_HOURS  = int(os.environ.get("NOTE_TTL_HOURS", "24"))
 NOTE_MAX_CHARS  = int(os.environ.get("NOTE_MAX_CHARS", "60"))  # same cap Instagram Notes uses
 POST_MAX_CHARS  = int(os.environ.get("POST_MAX_CHARS", "500"))
 # Feed posts are markdown and can run long; replies and photo captions keep POST_MAX_CHARS.

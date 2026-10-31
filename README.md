@@ -26,7 +26,7 @@ anything else. Admin-only writes (`POST`/`PUT`/`DELETE` on `/api/apps` and
 | `/api/me` | GET | any | echoes back derived identity |
 | `/api/prefs` | GET, PUT | any | per-user JSON blob (theme, tile order, favorites, playlists, ...) |
 | `/api/presence` | GET, POST, DELETE | any | who's active right now + what they're listening to. A beat carries `device` and `remote` (and `position`, `duration`, `album`, `coverArt`, for Activity); with klabnet open in several places, the card is written from the device that's really playing. DELETE takes away one device (`?device=`, or the phone apps' shared one without it), and the card with it only if that was the last |
-| `/api/notes` | GET, PUT, DELETE | any | Instagram-Notes-style ephemeral status text, one per user, expires after `NOTE_TTL_HOURS` |
+| `/api/notes` | GET, PUT, DELETE | any | Each person's note, one per user: their latest, kept until they write another (clearing and DELETE keep it) |
 | `/api/posts` | GET, POST | any | feed posts (text + optional `image_mxc` — an `mxc://` URI the browser uploads to Matrix's content repo directly, never routed through this service). GET responses include each post's `reactions` and `reply_count`. |
 | `/api/posts/{id}` | DELETE | own post or admin | delete a post (cascades its reactions/replies) |
 | `/api/posts/{id}/reactions` | PUT | any | toggle the caller's reaction (body `{emoji}`) — adds it, or removes it if already set |
@@ -191,7 +191,6 @@ machine's LAN address, so people at home connect straight to it.
 | `DB_PATH` | `/data/prefs.db` | set to `./data/prefs.db` for local dev |
 | `ADMIN_GROUP` | `klabnet-admin` | Authentik group required for admin writes |
 | `PRESENCE_TTL` | `30` | seconds a presence row stays "active" |
-| `NOTE_TTL_HOURS` | `24` | hours a note stays visible before expiring |
 | `NOTE_MAX_CHARS` | `60` | max note length |
 | `POST_MAX_CHARS` | `500` | max reply / photo caption length |
 | `FEED_POST_MAX_CHARS` | `10000` | max feed post length (posts are markdown) |
