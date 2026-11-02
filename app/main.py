@@ -10,7 +10,7 @@ from .config import APP_VERSION, CORS_ORIGINS
 from .db import init_db
 from .media import media_ready
 from .photos_store import backfill_derivatives
-from .routers import changes, emoji, feedback, people, gifs, health, recap, identity, listens, music_requests, notes, photos, playlists, posts, prefs, presence, profiles, radio, session, stars, voice
+from .routers import changes, emoji, feedback, people, gifs, health, recap, identity, listens, lyrics, music_requests, notes, photos, playlists, posts, prefs, presence, profiles, radio, session, stars, voice
 
 
 @asynccontextmanager
@@ -34,6 +34,6 @@ app.add_middleware(
 )
 
 # photos, changes, people and recap before posts: their /api/posts/... paths must win over /api/posts/{post_id}.
-# playlists, session, listens and radio before music_requests, for the same reason (/api/music-requests/playlists/..., /activity, /radio).
-for router in (health.router, identity.router, prefs.router, presence.router, listens.router, notes.router, photos.router, stars.router, changes.router, people.router, recap.router, emoji.router, posts.router, profiles.router, playlists.router, session.router, radio.router, music_requests.router, feedback.router, gifs.router, voice.router):
+# playlists, session, listens, lyrics and radio before music_requests, for the same reason (/api/music-requests/playlists/..., /activity, /radio).
+for router in (health.router, identity.router, prefs.router, presence.router, listens.router, notes.router, photos.router, stars.router, changes.router, people.router, recap.router, emoji.router, posts.router, profiles.router, playlists.router, session.router, radio.router, lyrics.router, music_requests.router, feedback.router, gifs.router, voice.router):
     app.include_router(router)

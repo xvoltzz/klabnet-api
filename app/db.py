@@ -315,6 +315,14 @@ CREATE TABLE IF NOT EXISTS custom_emoji (
     animated INTEGER NOT NULL DEFAULT 0,
     created  TEXT NOT NULL DEFAULT (datetime('now'))
 );
+-- Lyrics from LRCLIB (routers/lyrics.py), one row a song as the site
+-- names it (title, artist, album, length). body is LRCLIB's answer as
+-- JSON, or '' for "none there": kept a few days, then asked again.
+CREATE TABLE IF NOT EXISTS lyrics_cache (
+    key     TEXT PRIMARY KEY,
+    body    TEXT NOT NULL DEFAULT '',
+    checked TEXT NOT NULL DEFAULT (datetime('now'))
+);
 """
 
 
