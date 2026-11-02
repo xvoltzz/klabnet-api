@@ -32,6 +32,8 @@ anything else. Admin-only writes (`POST`/`PUT`/`DELETE` on `/api/apps` and
 | `/api/posts/{id}/reactions` | PUT | any | toggle the caller's reaction (body `{emoji}`) — adds it, or removes it if already set |
 | `/api/posts/{id}/replies` | GET, POST | any | flat (one-level) replies on a post |
 | `/api/posts/{id}/replies/{reply_id}` | DELETE | own reply or admin | delete a reply |
+| `/api/posts/emoji` | GET, POST | any | custom emoji (`:name:` in posts, chat and reactions). POST is multipart `name` + `file`: a still picture is shrunk to 128px PNG, an animated GIF/WebP kept as sent (≤512KB). Files on the media share under `emoji/`, served immutable from `/api/posts/emoji/files/<file>` |
+| `/api/posts/emoji/{name}` | DELETE | who added it, or admin | delete a custom emoji |
 | `/api/apps` | GET, POST, PUT, DELETE | GET: any · writes: admin | admin-managed app tiles |
 | `/api/sections` | GET, POST, PUT, DELETE | GET: any · writes: admin | tile groupings |
 | `/api/music-requests/playlists` | GET, POST | any | playlists (`app/routers/playlists.py`). GET: the caller's own and everyone's featured ones, as summaries (no songs). POST `{name, description?, color?, featured?, collab?, songs?}` makes one |

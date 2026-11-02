@@ -67,6 +67,8 @@ GITEA_TOKEN = os.environ.get("GITEA_TOKEN", "")
 CHANGES_REPOS = [r.strip() for r in os.environ.get("CHANGES_REPOS", "xvoltzz/klabnet-web,xvoltzz/klabnet-api").split(",") if r.strip()]
 FEEDBACK_TITLE_MAX_CHARS = int(os.environ.get("FEEDBACK_TITLE_MAX_CHARS", "120"))
 FEEDBACK_BODY_MAX_CHARS  = int(os.environ.get("FEEDBACK_BODY_MAX_CHARS", "4000"))
+CUSTOM_EMOJI_MAX_KB      = int(os.environ.get("CUSTOM_EMOJI_MAX_KB", "1024"))  # an upload, before it's shrunk
+CUSTOM_EMOJI_MAX         = int(os.environ.get("CUSTOM_EMOJI_MAX", "500"))      # all of them, everyone's
 
 # ── GIF stash (the picker in chat and the feed) ──
 GIF_MAX_MB = int(os.environ.get("GIF_MAX_MB", "12"))

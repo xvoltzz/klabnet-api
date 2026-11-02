@@ -306,6 +306,15 @@ CREATE TABLE IF NOT EXISTS feedback (
     created  TEXT NOT NULL DEFAULT (datetime('now')),
     updated  TEXT NOT NULL DEFAULT (datetime('now'))
 );
+-- Custom emoji (routers/emoji.py): :name: in posts, chat and reactions.
+-- file: its file on the media share, emoji/<file>; a new upload is a new file.
+CREATE TABLE IF NOT EXISTS custom_emoji (
+    name     TEXT PRIMARY KEY,
+    file     TEXT NOT NULL,
+    username TEXT NOT NULL,
+    animated INTEGER NOT NULL DEFAULT 0,
+    created  TEXT NOT NULL DEFAULT (datetime('now'))
+);
 """
 
 
