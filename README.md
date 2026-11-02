@@ -34,6 +34,9 @@ anything else. Admin-only writes (`POST`/`PUT`/`DELETE` on `/api/apps` and
 | `/api/posts/{id}/replies/{reply_id}` | DELETE | own reply or admin | delete a reply |
 | `/api/posts/emoji` | GET, POST | any | custom emoji (`:name:` in posts, chat and reactions). POST is multipart `name` + `file`: a still picture is shrunk to 128px PNG, an animated GIF/WebP kept as sent (≤512KB). Files on the media share under `emoji/`, served immutable from `/api/posts/emoji/files/<file>` |
 | `/api/posts/emoji/{name}` | DELETE | who added it, or admin | delete a custom emoji |
+| `/api/posts/people` | GET | any | everyone klabnet knows, with first/last seen, posts, replies and time listened (Home's lists); kept a minute |
+| `/api/posts/people/{username}` | GET | any | one person's profile page: counts, their posts and photos, gold (5 ⭐) posts, top artists, songs on repeat and recent listening |
+| `/api/posts/recap?since=` | GET | any | the bell's recap since a Unix time (held to 7 days): replies to your posts, @mentions, reactions to your posts and photo tags (`forYou`), and new posts, photos, songs shared, featured playlists and new stations by others (`around`) |
 | `/api/apps` | GET, POST, PUT, DELETE | GET: any · writes: admin | admin-managed app tiles |
 | `/api/sections` | GET, POST, PUT, DELETE | GET: any · writes: admin | tile groupings |
 | `/api/music-requests/playlists` | GET, POST | any | playlists (`app/routers/playlists.py`). GET: the caller's own and everyone's featured ones, as summaries (no songs). POST `{name, description?, color?, featured?, collab?, songs?}` makes one |
