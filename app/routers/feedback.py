@@ -1,109 +1,61 @@
-"""Bug reports / feature requests, filed straight into Gitea.
+"""Bug reports and ideas, kept here.
 
-People were never going to open git.klab.gg to report that a button was
-broken, so this puts the report box in the app and does the filing for
-them. Issues are created by a bot account (GITEA_TOKEN) with the reporter's
-klabnet username recorded in the body — posting *as* the user would need a
-Gitea admin token plus klabnet usernames matching Gitea ones exactly, which
-they don't.
-
-The Gitea calls happen here rather than from the browser for the same
-reasons the MusicBrainz ones do (see music_requests.py): the token must
-never reach a browser, and it keeps CORS out of the picture entirely.
+They used to be filed as Gitea issues by a bot account. Now they're rows in
+the database: anyone signed in can post one and see what's been posted
+(so the same thing isn't reported twice), and the owner reviews them (with
+Claude) and marks them done. An admin can mark one done or reply to it;
+whoever posted it, or an admin, can delete it.
 """
 
-import time
-
-import httpx
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
-from ..auth import get_username
-from ..config import (
-    FEEDBACK_BODY_MAX_CHARS,
-    FEEDBACK_TITLE_MAX_CHARS,
-    GITEA_REPO,
-    GITEA_TOKEN,
-    GITEA_URL,
-)
+from ..auth import get_groups, get_username, is_admin
+from ..config import FEEDBACK_BODY_MAX_CHARS, FEEDBACK_TITLE_MAX_CHARS
+from ..db import get_db
 
 router = APIRouter()
 
-# Maps the form's type onto a Gitea label. Labels must already exist on the
-# repo; an unknown label name is silently dropped by Gitea rather than
-# erroring, so a missing one degrades to "issue filed, just untagged".
-TYPE_LABELS = {"bug": "bug", "feature": "enhancement"}
-
-_TIMEOUT = 10.0
-
-# Listing is a plain proxy of a public endpoint, so it's cheap to cache and
-# rude not to — the frontend polls it whenever the panel opens.
-_LIST_TTL = 60.0
-_list_cache: dict = {"at": 0.0, "data": None}
+KINDS = ("bug", "idea")
+STATES = ("open", "done", "wontfix")
 
 
 def _unauthenticated() -> JSONResponse:
     return JSONResponse(status_code=401, content={"error": "not authenticated"})
 
 
-def _not_configured() -> JSONResponse:
-    return JSONResponse(
-        status_code=503,
-        content={"error": "issue tracker not configured"},
-    )
-
-
-def _issues_url() -> str:
-    return f"{GITEA_URL.rstrip('/')}/api/v1/repos/{GITEA_REPO}/issues"
-
-
-def _shape(issue: dict) -> dict:
-    """Only the fields the frontend actually renders — the raw Gitea issue
-    object carries a full user record, labels, milestones and timestamps we
-    have no use for, and forwarding all of it leaks more than we need to."""
+def _shape(row, me: str, admin: bool) -> dict:
     return {
-        "number": issue.get("number"),
-        "title": issue.get("title") or "",
-        "state": issue.get("state") or "open",
-        "url": issue.get("html_url") or "",
-        "labels": [lbl.get("name") for lbl in (issue.get("labels") or []) if lbl.get("name")],
-        "created": issue.get("created_at") or "",
-        "comments": issue.get("comments") or 0,
+        "id": row["id"],
+        "kind": row["kind"],
+        "title": row["title"],
+        "body": row["body"],
+        "username": row["username"],
+        "state": row["state"],
+        "reply": row["reply"],
+        "created": row["created"],
+        "updated": row["updated"],
+        "mine": row["username"] == me,
+        "can_delete": row["username"] == me or admin,
     }
 
 
 @router.get("/api/feedback")
-async def list_feedback(request: Request):
-    """Open + recently-closed issues, so someone can see their report landed
-    and whether it's been dealt with before filing a duplicate."""
-    if get_username(request) == "anonymous":
+def list_feedback(request: Request, state: str = ""):
+    """Everything posted, open ones first, newest first within that.
+    `state=open` (or done, wontfix) narrows it."""
+    me = get_username(request)
+    if me == "anonymous":
         return _unauthenticated()
-    if not GITEA_URL or not GITEA_REPO:
-        return _not_configured()
-
-    now = time.monotonic()
-    if _list_cache["data"] is not None and now - _list_cache["at"] < _LIST_TTL:
-        return {"issues": _list_cache["data"], "cached": True}
-
-    try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
-            res = await client.get(
-                _issues_url(),
-                params={"state": "all", "limit": 50, "type": "issues"},
-                headers={"Accept": "application/json"},
-            )
-        if res.status_code != 200:
-            return JSONResponse(status_code=502, content={"error": "issue tracker unavailable"})
-        raw = res.json()
-        if not isinstance(raw, list):
-            return JSONResponse(status_code=502, content={"error": "unexpected response"})
-    except httpx.HTTPError:
-        return JSONResponse(status_code=502, content={"error": "issue tracker unreachable"})
-
-    issues = [_shape(i) for i in raw if isinstance(i, dict)]
-    _list_cache["at"] = now
-    _list_cache["data"] = issues
-    return {"issues": issues, "cached": False}
+    admin = is_admin(get_groups(request))
+    with get_db() as db:
+        if state in STATES:
+            rows = db.execute("SELECT * FROM feedback WHERE state=? ORDER BY id DESC LIMIT 500", (state,)).fetchall()
+        else:
+            rows = db.execute(
+                "SELECT * FROM feedback ORDER BY state='open' DESC, id DESC LIMIT 500"
+            ).fetchall()
+    return {"items": [_shape(r, me, admin) for r in rows], "admin": admin}
 
 
 @router.post("/api/feedback")
@@ -111,87 +63,84 @@ async def create_feedback(request: Request):
     username = get_username(request)
     if username == "anonymous":
         return _unauthenticated()
-    if not GITEA_URL or not GITEA_REPO or not GITEA_TOKEN:
-        return _not_configured()
-
     try:
         body = await request.json()
         if not isinstance(body, dict):
-            return JSONResponse(status_code=400, content={"error": "invalid body"})
+            raise ValueError
     except Exception:
         return JSONResponse(status_code=400, content={"error": "invalid body"})
 
-    kind = str(body.get("type") or "bug").strip().lower()
-    if kind not in TYPE_LABELS:
+    kind = str(body.get("type") or body.get("kind") or "bug").strip().lower()
+    if kind == "feature":
+        kind = "idea"
+    if kind not in KINDS:
         kind = "bug"
     title = str(body.get("title") or "").strip()[:FEEDBACK_TITLE_MAX_CHARS]
     detail = str(body.get("body") or "").strip()[:FEEDBACK_BODY_MAX_CHARS]
     if not title:
         return JSONResponse(status_code=400, content={"error": "title required"})
-
-    # Context the reporter can't be expected to supply but that makes a
-    # report actionable. Kept to what the browser already sent us.
-    ua = (request.headers.get("user-agent") or "")[:300]
+    # What makes a report actionable that the reporter can't be expected
+    # to supply: where they were and what they're running.
     page = str(body.get("page") or "").strip()[:200]
+    version = str(body.get("version") or "").strip()[:40]
+    ua = (request.headers.get("user-agent") or "")[:300]
 
-    issue_body = (
-        f"{detail}\n\n"
-        f"---\n"
-        f"Reported from klabnet by **{username}**\n"
-        + (f"Page: `{page}`\n" if page else "")
-        + (f"User agent: `{ua}`\n" if ua else "")
-    )
+    with get_db() as db:
+        cur = db.execute(
+            "INSERT INTO feedback (username, kind, title, body, page, version, ua) VALUES (?,?,?,?,?,?,?)",
+            (username, kind, title, detail, page, version, ua),
+        )
+        db.commit()
+        row = db.execute("SELECT * FROM feedback WHERE id=?", (cur.lastrowid,)).fetchone()
+    return {"ok": True, "item": _shape(row, username, is_admin(get_groups(request)))}
 
+
+@router.patch("/api/feedback/{item_id}")
+async def update_feedback(item_id: int, request: Request):
+    """An admin marks one done (or won't fix, or open again) and may say
+    something about it (`reply`)."""
+    username = get_username(request)
+    if username == "anonymous":
+        return _unauthenticated()
+    if not is_admin(get_groups(request)):
+        return JSONResponse(status_code=403, content={"error": "admins only"})
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
-            res = await client.post(
-                _issues_url(),
-                json={"title": title, "body": issue_body},
-                headers={
-                    "Authorization": f"token {GITEA_TOKEN}",
-                    "Content-Type": "application/json",
-                    "Accept": "application/json",
-                },
-            )
-    except httpx.HTTPError:
-        return JSONResponse(status_code=502, content={"error": "issue tracker unreachable"})
+        body = await request.json()
+        if not isinstance(body, dict):
+            raise ValueError
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "invalid body"})
+    sets, args = [], []
+    if "state" in body:
+        if body["state"] not in STATES:
+            return JSONResponse(status_code=400, content={"error": "bad state"})
+        sets.append("state=?"); args.append(body["state"])
+    if "reply" in body:
+        sets.append("reply=?"); args.append(str(body["reply"] or "").strip()[:FEEDBACK_BODY_MAX_CHARS])
+    if not sets:
+        return JSONResponse(status_code=400, content={"error": "nothing to change"})
+    with get_db() as db:
+        cur = db.execute(
+            f"UPDATE feedback SET {', '.join(sets)}, updated=datetime('now') WHERE id=?", (*args, item_id)
+        )
+        db.commit()
+        if not cur.rowcount:
+            return JSONResponse(status_code=404, content={"error": "not found"})
+        row = db.execute("SELECT * FROM feedback WHERE id=?", (item_id,)).fetchone()
+    return {"ok": True, "item": _shape(row, username, True)}
 
-    if res.status_code not in (200, 201):
-        return JSONResponse(status_code=502, content={"error": "could not file issue"})
 
-    created = res.json() if res.headers.get("content-type", "").startswith("application/json") else {}
-    number = created.get("number")
-
-    # Labels are applied as a follow-up rather than inline: Gitea's create
-    # call takes label IDs, not names, so posting names inline silently
-    # drops them. This endpoint resolves the name once and is allowed to
-    # fail without failing the report — an untagged issue still got filed.
-    label = TYPE_LABELS[kind]
-    if number:
-        try:
-            async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
-                labels_res = await client.get(
-                    f"{GITEA_URL.rstrip('/')}/api/v1/repos/{GITEA_REPO}/labels",
-                    headers={"Authorization": f"token {GITEA_TOKEN}", "Accept": "application/json"},
-                )
-                if labels_res.status_code == 200:
-                    match = next(
-                        (l["id"] for l in labels_res.json()
-                         if isinstance(l, dict) and str(l.get("name", "")).lower() == label),
-                        None,
-                    )
-                    if match is not None:
-                        await client.post(
-                            f"{_issues_url()}/{number}/labels",
-                            json={"labels": [match]},
-                            headers={"Authorization": f"token {GITEA_TOKEN}", "Accept": "application/json"},
-                        )
-        except httpx.HTTPError:
-            pass
-
-    _list_cache["data"] = None  # the new issue should show up immediately
-    return {
-        "ok": True,
-        "number": number,
-        "url": created.get("html_url") or "",
-    }
+@router.delete("/api/feedback/{item_id}")
+def delete_feedback(item_id: int, request: Request):
+    username = get_username(request)
+    if username == "anonymous":
+        return _unauthenticated()
+    with get_db() as db:
+        row = db.execute("SELECT username FROM feedback WHERE id=?", (item_id,)).fetchone()
+        if not row:
+            return JSONResponse(status_code=404, content={"error": "not found"})
+        if row["username"] != username and not is_admin(get_groups(request)):
+            return JSONResponse(status_code=403, content={"error": "not yours"})
+        db.execute("DELETE FROM feedback WHERE id=?", (item_id,))
+        db.commit()
+    return {"ok": True}

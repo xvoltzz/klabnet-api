@@ -290,6 +290,22 @@ CREATE TABLE IF NOT EXISTS radio_chat (
     ts       REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS radio_chat_station ON radio_chat(station, id);
+-- Bug reports and ideas from the in-app button (routers/feedback.py).
+-- state: open, done or wontfix; reply: what an admin said about it.
+CREATE TABLE IF NOT EXISTS feedback (
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT NOT NULL,
+    kind     TEXT NOT NULL DEFAULT 'bug',
+    title    TEXT NOT NULL,
+    body     TEXT NOT NULL DEFAULT '',
+    page     TEXT NOT NULL DEFAULT '',
+    version  TEXT NOT NULL DEFAULT '',
+    ua       TEXT NOT NULL DEFAULT '',
+    state    TEXT NOT NULL DEFAULT 'open',
+    reply    TEXT NOT NULL DEFAULT '',
+    created  TEXT NOT NULL DEFAULT (datetime('now')),
+    updated  TEXT NOT NULL DEFAULT (datetime('now'))
+);
 """
 
 
