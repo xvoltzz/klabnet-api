@@ -125,13 +125,19 @@ async def post_presence(request: Request):
     # The radio station they're tuned in to (routers/radio.py), if any.
     radio      = re.sub(r"[^A-Za-z0-9_-]", "", str(body.get("radio", "")))[:40]
     cover_art  = str(body.get("coverArt", "")).strip()[:100]
+    # Where in klabnet they are (the page), for Home's "what's everyone
+    # doing", and the status they've set: "" (online), "away", "dnd" or
+    # "invisible" (left out of presence for everyone else).
+    where      = re.sub(r"[^a-z]", "", str(body.get("where", "")).lower())[:16]
+    status     = str(body.get("status", "")).lower()
+    status     = status if status in ("away", "dnd", "invisible") else ""
 
     now = time.time()
     shown = _shown(username, device, {
         "song": song, "artist": artist, "song_id": song_id, "playing": playing, "party_host": party_host,
         "platform": platform, "remote": remote, "at": now, "device": device,
         "position": position, "duration": duration, "album": album, "cover_art": cover_art, "radio": radio,
-        "used": now - active_ago if active_ago is not None else 0.0,
+        "used": now - active_ago if active_ago is not None else 0.0, "where": where, "status": status,
     })
     # Only the beat their card shows counts towards what they've played.
     counted = shown if shown.get("device") == device else None
@@ -148,6 +154,9 @@ def live(username: str) -> dict | None:
     into it they'll be by now, or None if nothing's loaded. Tuned in to the
     radio, it's the station (`radio`: routers/radio.py now_on)."""
     b = _best(username) if username in _beats else None
+    # Invisible: nothing playing, as far as anyone can tell.
+    if b and _latest(username).get("status") == "invisible":
+        return None
     if b and b.get("radio"):
         # Tuned in to a station: that, not the song left paused underneath.
         from .radio import now_on
@@ -166,6 +175,16 @@ def live(username: str) -> dict | None:
     return {"song": b["song"], "artist": b["artist"], "album": b.get("album", ""), "songId": b["song_id"],
             "coverArt": b.get("cover_art", ""), "playing": b["playing"], "partyHost": b["party_host"] or None,
             "position": None if pos is None else round(pos, 1), "duration": b.get("duration")}
+
+
+def _latest(username: str) -> dict:
+    """The beat of the device they used last: where they are and the
+    status they set (every device sends the same, from synced settings;
+    the newest wins while one catches up)."""
+    devices = _beats.get(username) or {}
+    if not devices:
+        return {}
+    return max(devices.values(), key=lambda b: (b.get("used") or 0, b["at"]))
 
 
 def listening() -> list[str]:
@@ -246,6 +265,7 @@ def get_presence(request: Request):
             """SELECT username, last_seen FROM users ORDER BY last_seen DESC"""
         ).fetchall()
 
+    latest = {r["username"]: _latest(r["username"]) for r in rows}
     listeners = [
         {
             "username":  r["username"],
@@ -259,10 +279,18 @@ def get_presence(request: Request):
             # The radio station they're tuned in to, if any: a card that
             # tunes in with them rather than looking for a song.
             "radio":     ((_best(r["username"]) or {}).get("radio") or None) if r["username"] in _beats else None,
-            # awaySince is when they last used anything (UTC).
-            **({"away": True, "awaySince": r["active_at"]} if _away(r, cutoff, away_cutoff) else {"away": False}),
+            # Where in klabnet (the page of the device they used last) and
+            # the status they set.
+            "where":     latest[r["username"]].get("where") or None,
+            "status":    latest[r["username"]].get("status") or None,
+            # awaySince is when they last used anything (UTC). Setting
+            # yourself away is away.
+            **({"away": True, "awaySince": r["active_at"]}
+               if _away(r, cutoff, away_cutoff) or latest[r["username"]].get("status") == "away" else {"away": False}),
         }
         for r in rows
+        # Invisible: not here, as far as anyone else can tell.
+        if r["username"] == username or latest[r["username"]].get("status") != "invisible"
     ]
     roster = [
         {"username": r["username"], "lastSeen": r["last_seen"]}
