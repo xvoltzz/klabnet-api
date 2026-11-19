@@ -61,6 +61,13 @@ anything else. Admin-only writes (`POST`/`PUT`/`DELETE` on `/api/apps` and
 | `/api/music-requests/session/state` | PUT | a device with its stream open | `{device, now?, queue?, playlist?, claim?}`: what the active device is playing. With `claim` the sender becomes the active device; without it, only if nobody is (otherwise 409) |
 | `/api/music-requests/session/cmd` | POST | a device with its stream open | `{device, cmd, to?}`: handed to the active device (or the one named in `to`): `play`, `resume`, `pause`, `seek`, `next`, `prev`, `queue`, `set`, `take` |
 | `/api/music-requests/session/release` | POST | a device with its stream open | `{device}`: the active device's page is closing |
+| `/api/posts/videos` | GET, POST | any | videos (`app/routers/videos.py`), each a `posts` row with kind `video`, so reactions and replies are the posts' own routes. GET `?limit=&before_id=&offset=&user=&sort=new\|popular&q=`: `{videos, total}`, others' only once ready, yours always. POST (multipart): `file` (mp4, mov, mkv, webm, avi, m4v; up to `VIDEO_MAX_MB`), `title`, `description`; answers at once with `status: processing`, and ffmpeg makes the HLS ladder in the background |
+| `/api/posts/videos/continue` | GET | any | your videos to carry on with (watched past 5s and short of 95%), newest first |
+| `/api/posts/videos/{id}` | GET, PATCH, DELETE | any / owner or admin | one video; edit `title`, `description`; delete it, its comments, reactions, progress, views and files |
+| `/api/posts/videos/{id}/poster` | PUT | owner or admin | a thumbnail of your own (multipart `file`), in place of the frame at 10% |
+| `/api/posts/videos/{id}/view` | POST | any | counts you as a viewer (views are people; once each 6 hours refreshes it) |
+| `/api/posts/videos/{id}/progress` | PUT | any | `{position}`: where you stopped; 95% in or more clears it |
+| `/api/posts/videos/{id}/files/{file}/{path}` | GET | any | the ladder (`master.m3u8`, `v<n>/…`), posters and storyboard; immutable, the file id is per upload |
 | `/api/voice` | GET | any | voice channels and who's in each (asked of LiveKit, cached 2s). `enabled: false` when LiveKit isn't configured |
 | `/api/voice/token` | POST | any | body `{channel}`: where LiveKit is and a 10-minute token for that channel's room, in the caller's name |
 | `/api/posts/changes` | GET | any | the newest commits to klabnet's repos on Gitea (`CHANGES_REPOS`), for Home's "What's new"; kept 5 minutes. Under `/api/posts/` so it rides a prefix Caddy already forwards; `/api/changes` answers too |
@@ -143,6 +150,24 @@ chmod +x hooks/post-receive
 `~/docker/klabnet-api` (the work-tree) needs to already exist with `data/`
 populated before the first push — it's not something the hook bootstraps.
 
+## Videos
+
+klabnet's own YouTube (`app/routers/videos.py`, klabnet-web's Videos page).
+An upload is kept on the media share as it came (`videos/<id[:2]>/<id>/source.<ext>`)
+and queued for ffmpeg, which the Docker image installs. One video is made at a
+time, on one thread: an HLS ladder of fMP4 rungs (1080p 5000k, 720p 2800k, 480p
+1200k, 360p 700k, measured on the short side so portrait phone videos count as
+the same), H.264 High at `VIDEO_PRESET` and AAC 128k, 4-second segments with
+keyframes aligned across rungs, two posters at 10% in and a storyboard of
+160px frames for the seek bar. Rotation from phones is respected. A job a
+restart cut short starts again at the next startup (ffmpeg dies with the
+server, so two never write the same folder).
+
+It's CPU-heavy (every rung is encoded at once). `VIDEO_PRESET` trades CPU for
+file size: `faster` or `medium` make smaller files if the box has room.
+The site plays it with hls.js (Safari natively). A video can be shared to the
+Feed (`POST /api/posts` with `video: {id, start?}`).
+
 ## Voice
 
 Drop-in voice channels (klabnet-web's `js/22-voice.js`). The audio runs
@@ -208,4 +233,7 @@ machine's LAN address, so people at home connect straight to it.
 | `PLAYLISTS_PER_USER` | `200` | most playlists one person can have |
 | `PLAYLIST_NAME_MAX_CHARS` / `PLAYLIST_DESC_MAX_CHARS` | `80` / `600` | playlist name and description lengths |
 | `PLAYLIST_COVER_MAX_MB` | `20` | largest cover upload |
+| `VIDEO_MAX_MB` | `4096` | largest video upload. Caddy's request body limit (if it has one) has to allow it too |
+| `VIDEO_TITLE_MAX_CHARS` / `VIDEO_DESC_MAX_CHARS` | `100` / `5000` | video title and description lengths |
+| `VIDEO_PRESET` | `veryfast` | x264's preset for the ladder |
 | `CORS_ORIGINS` | `https://user.klab.gg,https://staging.klab.gg` | comma-separated; only matters for a browser hitting this API cross-origin, which the current frontend doesn't do (it calls relative `/api/...` paths, proxied same-origin through Caddy) |

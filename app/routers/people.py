@@ -12,7 +12,7 @@ from ..auth import get_username
 from ..db import get_db
 from .listens import LISTEN_MIN
 from .photos import _COLS as _PHOTO_COLS, _attach
-from .posts import _reactions_and_reply_counts, _row_to_post
+from .posts import _attach_videos, _reactions_and_reply_counts, _row_to_post
 
 STAR = "⭐"
 GOLD_AT = 5  # stars that make a post gold (the site's KLAB_GOLD_AT)
@@ -65,7 +65,7 @@ def person(username: str, request: Request):
             user = {"username": username, "first_seen": None, "last_seen": None}
         if user is None or username.endswith("-bot"):
             return JSONResponse(status_code=404, content={"error": "no one by that name"})
-        cols = "id, username, text, image_mxc, song_json, created"
+        cols = "id, username, text, image_mxc, song_json, video_json, created"
         rows = db.execute(
             f"SELECT {cols} FROM posts WHERE kind='' AND username = ? ORDER BY id DESC LIMIT 30", (username,)
         ).fetchall()
@@ -95,6 +95,8 @@ def person(username: str, request: Request):
             "stars": n("SELECT COUNT(*) FROM post_reactions r JOIN posts p ON p.id = r.post_id WHERE p.username = ? AND r.emoji = ?", username, STAR),
             "listened": round(n("SELECT SUM(seconds) FROM listens WHERE username = ?", username)),
             "plays": n("SELECT COUNT(*) FROM listens WHERE username = ? AND seconds >= ?", username, LISTEN_MIN),
+            "videos": n("""SELECT COUNT(*) FROM videos v JOIN posts p ON p.id = v.post_id
+                           WHERE p.username = ? AND v.status = 'ready'""", username),
         }
         artists = [
             {"name": r["artist"], "seconds": round(r["s"])}
@@ -118,17 +120,19 @@ def person(username: str, request: Request):
                    WHERE username = ? AND seconds >= ? GROUP BY song_id ORDER BY last DESC LIMIT 8""",
                 (username, LISTEN_MIN))
         ]
-    gold = []
-    for r in gold_rows:
-        post = _row_to_post(r, reactions, replies)
-        post["kind"] = r["kind"] or "post"
-        gold.append(post)
+        gold = []
+        for r in gold_rows:
+            post = _row_to_post(r, reactions, replies)
+            post["kind"] = r["kind"] or "post"
+            gold.append(post)
+        _attach_videos(db, gold)
+        posts = _attach_videos(db, [_row_to_post(r, reactions, replies) for r in rows])
     return {
         "username": user["username"],
         "firstSeen": user["first_seen"],
         "lastSeen": user["last_seen"],
         "counts": counts,
-        "posts": [_row_to_post(r, reactions, replies) for r in rows],
+        "posts": posts,
         "photos": photos,
         "gold": gold,
         "listening": {"artists": artists, "songs": songs, "recent": recent},

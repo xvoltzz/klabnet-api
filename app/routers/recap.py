@@ -4,7 +4,7 @@ bell. Two parts:
   for_you   things about you: replies to your posts, @mentions of you (in
             posts and replies), reactions to your posts (one item per post),
             and photos you were tagged in.
-  around    the rest, counted: new posts, photos, songs shared, playlists
+  around    the rest, counted: new posts, photos, videos, songs shared, playlists
             featured and radio stations made, by other people.
 
 `since` is a Unix time from the client (when it last opened the recap),
@@ -59,12 +59,13 @@ def recap(request: Request, since: float = 0):
     with get_db() as db:
         # Replies to your posts.
         for r in db.execute(
-            """SELECT r.id, r.post_id, r.username, r.text, r.created, p.text AS ptext
+            """SELECT r.id, r.post_id, r.username, r.text, r.created, p.text AS ptext, p.kind,
+                      (SELECT title FROM videos WHERE post_id = p.id) AS vtitle
                FROM post_replies r JOIN posts p ON p.id = r.post_id
                WHERE p.username = ? AND r.username != ? AND r.created > ?
                ORDER BY r.id DESC LIMIT 30""", (me, me, at)):
             items.append({"kind": "reply", "at": _iso(r["created"]), "who": [r["username"]], "postId": r["post_id"],
-                          "text": _snip(r["text"]), "on": _snip(r["ptext"])})
+                          "text": _snip(r["text"]), "on": _snip(r["vtitle"] or r["ptext"]), "video": r["kind"] == "video"})
         # @you in a post, or in a reply on someone else's post.
         like = f"%@{me}%"
         for r in db.execute(
@@ -81,14 +82,16 @@ def recap(request: Request, since: float = 0):
                               "text": _snip(r["text"]), "reply": True})
         # Reactions to your posts: one item a post, everyone who reacted.
         rows = db.execute(
-            """SELECT x.post_id, x.username, x.emoji, x.created, p.text AS ptext, p.kind
+            """SELECT x.post_id, x.username, x.emoji, x.created, p.text AS ptext, p.kind,
+                      (SELECT title FROM videos WHERE post_id = p.id) AS vtitle
                FROM post_reactions x JOIN posts p ON p.id = x.post_id
                WHERE p.username = ? AND x.username != ? AND x.created > ?
                ORDER BY x.created DESC LIMIT 300""", (me, me, at)).fetchall()
         by_post: dict[int, dict] = {}
         for r in rows:
             it = by_post.setdefault(r["post_id"], {"kind": "react", "at": _iso(r["created"]), "who": [], "emoji": [],
-                                                   "postId": r["post_id"], "on": _snip(r["ptext"]), "photo": r["kind"] == "photo"})
+                                                   "postId": r["post_id"], "on": _snip(r["vtitle"] or r["ptext"]),
+                                                   "photo": r["kind"] == "photo", "video": r["kind"] == "video"})
             if r["username"] not in it["who"]:
                 it["who"].append(r["username"])
             if r["emoji"] not in it["emoji"]:
@@ -124,7 +127,8 @@ def recap(request: Request, since: float = 0):
                 if p["username"] not in seen:
                     seen.append(p["username"])
             return seen
-        words = [p for p in posts if p["kind"] != "photo"]
+        words = [p for p in posts if p["kind"] == ""]
+        video_posts = [p for p in posts if p["kind"] == "video"]
         latest = [{"postId": p["id"], "who": p["username"], "text": _snip(p["text"]), "at": _iso(p["created"]),
                    "song": bool(p["song_json"])} for p in words[:3]]
         playlists = [{"id": r["id"], "name": r["name"], "who": r["username"]} for r in db.execute(
@@ -141,6 +145,7 @@ def recap(request: Request, since: float = 0):
         "around": {
             "posts": len(words), "postPeople": people(words), "latest": latest,
             "photos": photos, "photoPosts": len(photo_ids), "photoPeople": people([p for p in posts if p["kind"] == "photo"]),
+            "videos": len(video_posts), "videoPeople": people(video_posts),
             "songs": songs[:5], "songCount": len(songs),
             "playlists": playlists, "stations": stations,
         },

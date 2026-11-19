@@ -315,6 +315,48 @@ CREATE TABLE IF NOT EXISTS custom_emoji (
     animated INTEGER NOT NULL DEFAULT 0,
     created  TEXT NOT NULL DEFAULT (datetime('now'))
 );
+-- Videos (routers/videos.py). A video is a `posts` row with kind='video'
+-- (its text is the description), so reactions and replies are the posts'
+-- own; this row is the rest, keyed by that post id. Files live on the media
+-- share under videos/<file_id[:2]>/<file_id>/: the original as source.<ext>,
+-- the HLS ladder (master.m3u8, v<n>/…), posters and a storyboard. status is
+-- processing (queued or being made), ready or failed. rungs: the ladder as
+-- JSON; storyboard: its tile grid as JSON; poster: the stem of the poster
+-- files (a new one per custom upload, so URLs never change underneath).
+CREATE TABLE IF NOT EXISTS videos (
+    post_id    INTEGER PRIMARY KEY,
+    title      TEXT NOT NULL,
+    file_id    TEXT NOT NULL,
+    ext        TEXT NOT NULL,
+    status     TEXT NOT NULL DEFAULT 'processing',
+    progress   REAL NOT NULL DEFAULT 0,
+    error      TEXT NOT NULL DEFAULT '',
+    duration   REAL,
+    width      INTEGER NOT NULL DEFAULT 0,
+    height     INTEGER NOT NULL DEFAULT 0,
+    size       INTEGER NOT NULL DEFAULT 0,
+    rungs      TEXT NOT NULL DEFAULT '[]',
+    storyboard TEXT NOT NULL DEFAULT '',
+    poster     TEXT NOT NULL DEFAULT '',
+    updated    TEXT NOT NULL DEFAULT (datetime('now'))
+);
+-- Where each person stopped in a video; cleared once they finish it.
+CREATE TABLE IF NOT EXISTS video_progress (
+    username TEXT NOT NULL,
+    post_id  INTEGER NOT NULL,
+    position REAL NOT NULL,
+    updated  TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (username, post_id)
+);
+CREATE INDEX IF NOT EXISTS video_progress_recent ON video_progress(username, updated);
+-- Who's watched a video: one row a person (views are people), `at` the
+-- last time it counted.
+CREATE TABLE IF NOT EXISTS video_views (
+    post_id  INTEGER NOT NULL,
+    username TEXT NOT NULL,
+    at       REAL NOT NULL,
+    PRIMARY KEY (post_id, username)
+);
 -- Lyrics from LRCLIB (routers/lyrics.py), one row a song as the site
 -- names it (title, artist, album, length). body is LRCLIB's answer as
 -- JSON, or '' for "none there": kept a few days, then asked again.
@@ -381,6 +423,9 @@ def init_db() -> None:
         post_cols = [row[1] for row in conn.execute("PRAGMA table_info(posts)").fetchall()]
         if "song_json" not in post_cols:
             conn.execute("ALTER TABLE posts ADD COLUMN song_json TEXT NOT NULL DEFAULT ''")
+        # video_json: a video shared in a feed post ({id, start}), routers/videos.py.
+        if "video_json" not in post_cols:
+            conn.execute("ALTER TABLE posts ADD COLUMN video_json TEXT NOT NULL DEFAULT ''")
         # kind is new too: '' for feed posts, 'photo' for Photos-tab posts,
         # so the feed and the Photos tab each list only their own.
         if "kind" not in post_cols:
