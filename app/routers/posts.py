@@ -143,6 +143,7 @@ def _row_to_post(r, reactions: dict, reply_counts: dict) -> dict:
         "image_mxc": r["image_mxc"],
         "song": song,
         "created": r["created"],
+        "edited": (r["edited"] if "edited" in r.keys() else "") or None,
         "reactions": reactions.get(r["id"], {}),
         "reply_count": reply_counts.get(r["id"], 0),
         "video": None,
@@ -159,12 +160,12 @@ def get_posts(request: Request, limit: int = 50, before_id: int | None = None):
     with get_db() as db:
         if before_id is not None:
             rows = db.execute(
-                "SELECT id, username, text, image_mxc, song_json, video_json, created FROM posts WHERE kind='' AND id < ? ORDER BY id DESC LIMIT ?",
+                "SELECT id, username, text, image_mxc, song_json, video_json, created, edited FROM posts WHERE kind='' AND id < ? ORDER BY id DESC LIMIT ?",
                 (before_id, limit),
             ).fetchall()
         else:
             rows = db.execute(
-                "SELECT id, username, text, image_mxc, song_json, video_json, created FROM posts WHERE kind='' ORDER BY id DESC LIMIT ?",
+                "SELECT id, username, text, image_mxc, song_json, video_json, created, edited FROM posts WHERE kind='' ORDER BY id DESC LIMIT ?",
                 (limit,),
             ).fetchall()
         reactions, reply_counts = _reactions_and_reply_counts(db, [r["id"] for r in rows], username)
@@ -203,10 +204,46 @@ async def create_post(request: Request):
         )
         db.commit()
         row = db.execute(
-            "SELECT id, username, text, image_mxc, song_json, video_json, created FROM posts WHERE id=?",
+            "SELECT id, username, text, image_mxc, song_json, video_json, created, edited FROM posts WHERE id=?",
             (cur.lastrowid,),
         ).fetchone()
         return _attach_videos(db, [_row_to_post(row, {}, {})])[0]
+
+
+@router.patch("/api/posts/{post_id}")
+async def edit_post(post_id: int, request: Request):
+    """Change a feed post's text. Only its writer can: an admin may delete
+    someone's post but not put words in it. The song, picture and video stay."""
+    username = get_username(request)
+    if username == "anonymous":
+        return _unauthenticated()
+    try:
+        body = await request.json()
+        if not isinstance(body, dict):
+            raise ValueError("body must be a JSON object")
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "invalid JSON"})
+    text = str(body.get("text", "")).strip()
+    if len(text) > FEED_POST_MAX_CHARS:
+        return JSONResponse(status_code=400, content={"error": f"post is too long (max {FEED_POST_MAX_CHARS:,} characters)"})
+    with get_db() as db:
+        row = db.execute(
+            "SELECT username, kind, image_mxc, song_json, video_json FROM posts WHERE id=?", (post_id,)
+        ).fetchone()
+        if row is None or row["kind"] != "":
+            return JSONResponse(status_code=404, content={"error": "not found"})
+        if row["username"] != username:
+            return JSONResponse(status_code=403, content={"error": "not your post"})
+        if not text and not row["image_mxc"] and not row["song_json"] and not row["video_json"]:
+            return JSONResponse(status_code=400, content={"error": "a post with nothing else in it needs some text"})
+        db.execute("UPDATE posts SET text=?, edited=datetime('now') WHERE id=?", (text, post_id))
+        db.commit()
+        out = db.execute(
+            "SELECT id, username, text, image_mxc, song_json, video_json, created, edited FROM posts WHERE id=?",
+            (post_id,),
+        ).fetchone()
+        reactions, reply_counts = _reactions_and_reply_counts(db, [post_id], username)
+        return _attach_videos(db, [_row_to_post(out, reactions, reply_counts)])[0]
 
 
 @router.delete("/api/posts/{post_id}")

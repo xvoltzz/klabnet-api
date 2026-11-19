@@ -435,6 +435,10 @@ def init_db() -> None:
         # '' means unknown, and the post sorts by when it was posted.
         if "shot_at" not in post_cols:
             conn.execute("ALTER TABLE posts ADD COLUMN shot_at TEXT NOT NULL DEFAULT ''")
+        # edited: when a feed post's text was last changed (PATCH /api/posts/{id}),
+        # '' if never. Shown as "edited" beside the time.
+        if "edited" not in post_cols:
+            conn.execute("ALTER TABLE posts ADD COLUMN edited TEXT NOT NULL DEFAULT ''")
         # art_cache.id (which file on the media share an album's art is)
         # came after the table did; same migration, and rows from before
         # get theirs from their key.

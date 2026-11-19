@@ -15,6 +15,10 @@ ALLOWED_PREF_KEYS = {
     "tile_order", "hidden_tiles", "section_order", "notes", "login_song",
     "favorites", "play_history", "playlists", "settings", "theme", "perf",
     "volume", "tile_groups", "bg_dark", "bg_light", "status",
+    # Favourite albums and artists (klabnet-web 05-favorites.js), kept like
+    # `favorites` (songs): slim records, not Navidrome stars, since everyone
+    # plays through one Navidrome account.
+    "fav_albums", "fav_artists",
 }
 
 
