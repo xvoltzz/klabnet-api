@@ -34,6 +34,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from ..auth import get_groups, get_username, is_admin
 from ..config import (CLIP_MAX_SECONDS, MEDIA_DIR, VIDEO_AUDIO_KBPS, VIDEO_CRF, VIDEO_DESC_MAX_CHARS, VIDEO_MAX_MB, VIDEO_PRESET,
                       VIDEO_TITLE_MAX_CHARS)
+from .. import encoder
 from ..db import get_db
 from ..media import media_ready
 from .posts import _reactions_and_reply_counts
@@ -281,6 +282,27 @@ def _run(cmd: list[str], duration: float | None, lo: float, hi: float, report=No
         raise RuntimeError(" / ".join(l for l in tail[-3:] if l) or f"ffmpeg exited {proc.returncode}")
 
 
+
+def _encode(make, duration: float | None, lo: float, hi: float, report=None, what: str = "a video",
+            clean=None) -> str:
+    """An encode on the chosen encoder (app/encoder.py): make(enc) is its
+    ffmpeg. On the GPU, one job at a time; a GPU failure is logged and the
+    same encode run again with x264 (after clean(), which clears what the
+    failed run left), so no video fails because of the GPU. Returns the
+    encoder that made it."""
+    if encoder.choice() == "nvenc":
+        try:
+            with encoder.slot:
+                _run(make("nvenc"), duration, lo, hi, report)
+            return "nvenc"
+        except RuntimeError as e:
+            print(f"videos: NVENC failed for {what} ({e}); making it again with x264")
+            if clean:
+                clean()
+    _run(make("x264"), duration, lo, hi, report)
+    return "x264"
+
+
 _zscale: bool | None = None
 
 
@@ -295,9 +317,12 @@ def _has_zscale() -> bool:
     return _zscale
 
 
-def _ladder_cmd(src: str, out: str, rungs: list[dict], info: dict) -> list[str]:
+def _ladder_cmd(src: str, out: str, rungs: list[dict], info: dict, enc: str = "x264") -> list[str]:
+    """ffmpeg for the ladder, with x264 (the CPU) or NVENC (the GPU:
+    app/encoder.py). Same rungs, frame rate and keyframes either way."""
     n = len(rungs)
-    rate, _ = _out_fps(info)
+    rate, fps = _out_fps(info)
+    gpu_all = enc == "nvenc" and encoder.gpu_ladder(info)
     # One frame rate for every rung (the source's, or 60 above that; a
     # variable-rate phone video comes out constant at its average), and
     # HDR brought to SDR once, before the split, so it isn't washed out.
@@ -309,15 +334,26 @@ def _ladder_cmd(src: str, out: str, rungs: list[dict], info: dict) -> list[str]:
         else:
             print("videos: an HDR source, and this ffmpeg has no zscale: the ladder will look washed out")
     chains = [f"[0:v]{','.join(pre)},split={n}" + "".join(f"[s{i}]" for i in range(n))]
-    chains += [f"[s{i}]scale={r['w']}:{r['h']}:flags=lanczos,format=yuv420p[v{i}]" for i, r in enumerate(rungs)]
-    cmd = ["ffmpeg", "-hide_banner", "-y", "-i", src, "-filter_complex", ";".join(chains)]
+    if gpu_all:
+        # Decoded on the GPU and scaled there: the frames never leave it.
+        chains += [f"[s{i}]scale_cuda={r['w']}:{r['h']}:interp_algo=lanczos:format=yuv420p[v{i}]" for i, r in enumerate(rungs)]
+        head = ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda", "-extra_hw_frames", "8"]
+    else:
+        chains += [f"[s{i}]scale={r['w']}:{r['h']}:flags=lanczos,format=yuv420p[v{i}]" for i, r in enumerate(rungs)]
+        # NVENC with CPU filters: NVDEC still decodes what it can (frames
+        # come back to the CPU for zscale and scale).
+        head = ["-hwaccel", "cuda"] if enc == "nvenc" and encoder.gpu_decodes(info) else []
+    cmd = ["ffmpeg", "-hide_banner", "-y", *head, "-i", src, "-filter_complex", ";".join(chains)]
     audio = info["audio"]
     for i in range(n):
         cmd += ["-map", f"[v{i}]"]
         if audio:
             cmd += ["-map", "0:a:0"]
-    cmd += ["-c:v", "libx264", "-preset", VIDEO_PRESET, "-crf", str(VIDEO_CRF), "-profile:v", "high",
-            "-force_key_frames", f"expr:gte(t,n_forced*{SEGMENT})", "-sc_threshold", "0"]
+    if enc == "nvenc":
+        cmd += encoder.nvenc_ladder_args(fps, SEGMENT)
+    else:
+        cmd += ["-c:v", "libx264", "-preset", VIDEO_PRESET, "-crf", str(VIDEO_CRF), "-profile:v", "high",
+                "-force_key_frames", f"expr:gte(t,n_forced*{SEGMENT})", "-sc_threshold", "0"]
     if info.get("hdr"):
         cmd += ["-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709"]
     for i, r in enumerate(rungs):
@@ -439,6 +475,18 @@ def _keep(name: str, ext: str) -> bool:
     return name == f"source.{ext}" or name.startswith("thumb.")
 
 
+def _clear_ladder(folder: str, n: int) -> None:
+    """What a failed ladder run left: empty rung folders and no master."""
+    for i in range(n):
+        p = os.path.join(folder, f"v{i}")
+        shutil.rmtree(p, ignore_errors=True)
+        os.makedirs(p, exist_ok=True)
+    try:
+        os.remove(os.path.join(folder, "master.m3u8"))
+    except OSError:
+        pass
+
+
 def build(post_id: int, folder: str, ext: str, report=None) -> dict:
     """The whole job in a folder holding source.<ext> (and maybe thumb.*):
     the ladder, the posters, the storyboard and the Original. Returns the
@@ -460,7 +508,8 @@ def build(post_id: int, folder: str, ext: str, report=None) -> dict:
         os.makedirs(os.path.join(folder, f"v{i}"), exist_ok=True)
     if report:
         report(0.0)
-    _run(_ladder_cmd(src, folder, rungs, info), info["duration"], 0.0, 0.85, report)
+    _encode(lambda enc: _ladder_cmd(src, folder, rungs, info, enc), info["duration"], 0.0, 0.85, report,
+            f"the ladder of {os.path.basename(folder)}", lambda: _clear_ladder(folder, len(rungs)))
     _fix_master(folder, rungs)
     original = make_original(src, folder, info)
     board = _stills(src, folder, info["duration"], info["width"], info["height"], report)

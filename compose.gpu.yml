@@ -1,0 +1,20 @@
+# The NVIDIA GPU for video encoding (README: Videos → GPU (NVIDIA)).
+# Used on top of compose.yml when .env has
+#   COMPOSE_FILE=compose.yml:compose.gpu.yml
+#   VIDEO_ENCODER=auto        (or nvenc)
+# Needs the driver and nvidia-container-toolkit on the Docker host (in the
+# LXC, on Proxmox). Without this file nothing changes: x264 on the CPU.
+services:
+  klabnet-api:
+    environment:
+      # video: libnvidia-encode / libnvcuvid (NVENC, NVDEC); compute: CUDA
+      # (scale_cuda); utility: nvidia-smi.
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,video,utility
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu, video, compute, utility]

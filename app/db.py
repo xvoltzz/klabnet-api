@@ -625,6 +625,11 @@ def init_db() -> None:
             conn.execute("ALTER TABLE videos ADD COLUMN clip_of INTEGER NOT NULL DEFAULT 0")
             conn.execute("ALTER TABLE videos ADD COLUMN clip_start REAL NOT NULL DEFAULT 0")
             conn.execute("ALTER TABLE videos ADD COLUMN clip_end REAL NOT NULL DEFAULT 0")
+        # clip_cut: what the worker cuts, decided when the clip was asked
+        # for (JSON: the upload's ranges, with the edit's mutes, gain, crop
+        # and rotation), so a later edit of the video can't change it.
+        if "clip_cut" not in video_cols:
+            conn.execute("ALTER TABLE videos ADD COLUMN clip_cut TEXT NOT NULL DEFAULT ''")
         conn.execute("CREATE INDEX IF NOT EXISTS videos_kind ON videos(kind, published, post_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS videos_source ON videos(source_id) WHERE source_id != ''")
         # art_cache.id (which file on the media share an album's art is)

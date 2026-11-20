@@ -10,6 +10,7 @@ from .config import APP_VERSION, CORS_ORIGINS
 from .db import init_db
 from .media import media_ready
 from .photos_store import backfill_derivatives
+from . import encoder
 from .routers import changes, live, emoji, feedback, people, gifs, health, recap, identity, listens, lyrics, music_requests, notes, photos, playlists, posts, prefs, presence, profiles, radio, rooms, session, stars, studio, tv, videos, voice, week
 
 
@@ -20,6 +21,10 @@ async def lifespan(app: FastAPI):
     # background, so startup (and every request meanwhile) isn't held up.
     if media_ready():
         threading.Thread(target=backfill_derivatives, name="photo-backfill", daemon=True).start()
+        # Which encoder videos are made with (app/encoder.py: x264, or
+        # NVENC when VIDEO_ENCODER says so and it works), tested and logged
+        # off the startup path.
+        threading.Thread(target=encoder.choice, name="video-encoder", daemon=True).start()
         # Videos a restart caught halfway through being made.
         videos.resume_jobs()
         # Studio edits a restart caught halfway through rendering.

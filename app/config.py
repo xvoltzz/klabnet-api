@@ -94,6 +94,13 @@ VIDEO_PRESET          = os.environ.get("VIDEO_PRESET", "medium").strip() or "med
 VIDEO_CRF             = int(os.environ.get("VIDEO_CRF", "18"))
 # The ladder's audio when the source's isn't already AAC stereo.
 VIDEO_AUDIO_KBPS      = int(os.environ.get("VIDEO_AUDIO_KBPS", "192"))
+# Which encoder (app/encoder.py): x264 (the CPU), nvenc (an NVIDIA GPU) or
+# auto (NVENC when a test encode works at startup). README: GPU (NVIDIA).
+VIDEO_ENCODER         = os.environ.get("VIDEO_ENCODER", "x264").strip().lower() or "x264"
+# NVENC's constant quality (lower is better and bigger; 19 is about x264's
+# CRF 18) and preset (p1 fastest … p7 best).
+VIDEO_NVENC_CQ        = int(os.environ.get("VIDEO_NVENC_CQ", "19"))
+VIDEO_NVENC_PRESET    = os.environ.get("VIDEO_NVENC_PRESET", "p7").strip() or "p7"
 # Clips (routers/clips.py): short videos, mostly gameplay. Longer uploads to
 # Clips are refused (upload them as a video instead), and so is a longer
 # range clipped from a video.

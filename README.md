@@ -191,7 +191,7 @@ restart cut short starts again at the next startup.
 Encoding is CPU-heavy: every rung at once. Measured on a 12-thread desktop at
 `medium`: a minute of 1080p60 (fast motion and noise, the worst case) took
 about 3 minutes; a minute of 4K30 about 5. Real footage is usually quicker.
-GPU encoders (VAAPI, QSV, NVENC) aren't wired up yet.
+An NVIDIA card can do it instead (`VIDEO_ENCODER`, below: "GPU (NVIDIA)").
 
 **Original.** When the upload's codecs are ones browsers play (video H.264,
 HEVC, AV1 or VP9; audio AAC, Opus, MP3 or none), it's also remuxed without
@@ -206,6 +206,14 @@ upload and edit, the YouTube date when imported) and what every list orders
 by; `posts.created` stays when it arrived. Videos are never Feed posts. One
 that came out more than two days before it arrived (an import) is left out of
 the recap's and This week's "new videos", so an import doesn't flood them.
+
+**Clips from a range** (`POST /api/posts/videos/{id}/clip`, routers/clips.py)
+take times in the video as viewers see it: for one edited in the studio, the
+edit being served, so a range across a cut is the parts either side joined,
+with the edit's mutes, gain, crop and rotation. What's cut is fixed when the
+clip is asked for (`videos.clip_cut`: the upload's ranges and the look), so a
+later edit doesn't change it. The studio sends `timeline: "upload"` (owner or
+admin only) with its editor's `edit`, since it works in the upload's time.
 
 **Tools** (run beside the API, on its database and media share; in Docker:
 `docker compose exec api python -m app.tools.<name> …`):
@@ -234,6 +242,97 @@ the recap's and This week's "new videos", so an import doesn't flood them.
 The site plays it with hls.js (Safari natively). A video can be shared to the
 Feed (`POST /api/posts` with `video: {id, start?}`).
 
+### GPU (NVIDIA)
+
+`app/encoder.py`. With `VIDEO_ENCODER=nvenc` (or `auto`: NVENC when a
+one-frame test encode works at startup, else x264; the log says which) every
+encode runs on NVENC: the ladder, the studio's intermediate, clips' cuts and
+`reencode_videos`. Same rungs, sizes, frame rates, 4s aligned keyframes
+(`-g`, `-strict_gop`, `-no-scenecut`, `-forced-idr` and `-force_key_frames`)
+and per-rung ceilings as x264; h264_nvenc High 8-bit 4:2:0 at `-preset p7
+-tune hq -rc vbr -cq VIDEO_NVENC_CQ` (19, about x264's CRF 18) with two-pass
+lookahead (`-multipass fullres -rc-lookahead 32`), spatial and temporal AQ
+and three B-frames as references (`-b_ref_mode middle`). For the 1080p60 test
+source the ladder is:
+
+```
+ffmpeg -hide_banner -y -hwaccel cuda -hwaccel_output_format cuda -extra_hw_frames 8 -i src.mp4
+  -filter_complex '[0:v]fps=60/1,split=4[s0][s1][s2][s3];[s0]scale_cuda=1920:1080:interp_algo=lanczos:format=yuv420p[v0];…'
+  -map '[v0]' -map 0:a:0 … -c:v h264_nvenc -preset p7 -tune hq -profile:v high -rc vbr -cq 19 -b:v 0
+  -multipass fullres -spatial-aq 1 -temporal-aq 1 -rc-lookahead 32 -bf 3 -b_ref_mode middle
+  -g 240 -keyint_min 240 -strict_gop 1 -no-scenecut 1 -forced-idr 1 -force_key_frames 'expr:gte(t,n_forced*4)'
+  -maxrate:v:0 15000k -bufsize:v:0 30000k … -f hls …
+```
+
+- *Where the frames are:* an SDR source NVDEC reads (H.264 8-bit, HEVC, VP9
+  or AV1, 4:2:0) is decoded and scaled on the GPU (`scale_cuda`) and never
+  leaves it, when this ffmpeg has `scale_cuda`. Otherwise (HDR, which is
+  tone-mapped on the CPU with zscale as before; 4:2:2/4:4:4 or ProRes; an
+  ffmpeg without CUDA filters) the filters run on the CPU and only the encode
+  is on the GPU.
+- *The studio's intermediate* is h264_nvenc CQ 14 (an HDR source stays HDR:
+  hevc_nvenc Main10 CQ 16, no libx265 needed); a clip's cut is CQ 12. The
+  trims, volume, crop and rotation are CPU filters either way.
+- *Never failed because of the GPU:* an encode that fails on NVENC (no
+  driver, a source NVDEC chokes on, too many sessions) is logged ("NVENC
+  failed for … making it again with x264") and run again with x264. One GPU
+  encode runs at a time (a GeForce has a handful of sessions and the ladder
+  takes one per rung).
+- *Quality:* Ada's NVENC (RTX 40) at p7 with lookahead and AQ is close to x264
+  `medium` at the same bitrate, and the CQ and ceilings keep files about the
+  same size; it does a 4K60 ladder many times faster than the CPU. Lower
+  `VIDEO_NVENC_CQ` for bigger, better files.
+
+Setting it up on Proxmox (an LXC running Docker; a 4070 Ti, say):
+
+1. **The host** runs NVIDIA's driver (the `.run` from nvidia.com, or Debian's
+   `nvidia-driver` with the PVE headers). `nvidia-smi` on the host shows the
+   card. Make the device nodes appear at boot (`nvidia-persistenced`, or run
+   `nvidia-smi` once) and load `nvidia-uvm` (`/etc/modules-load.d/nvidia.conf`:
+   `nvidia`, `nvidia_uvm`).
+2. **The LXC** gets the devices (`/etc/pve/lxc/<id>.conf`; the majors are
+   in `ls -l /dev/nvidia*`: 195 for nvidia0/nvidiactl, the uvm and caps ones
+   vary, so check):
+   ```
+   lxc.cgroup2.devices.allow: c 195:* rwm
+   lxc.cgroup2.devices.allow: c 509:* rwm
+   lxc.cgroup2.devices.allow: c 234:* rwm
+   lxc.mount.entry: /dev/nvidia0 dev/nvidia0 none bind,optional,create=file
+   lxc.mount.entry: /dev/nvidiactl dev/nvidiactl none bind,optional,create=file
+   lxc.mount.entry: /dev/nvidia-uvm dev/nvidia-uvm none bind,optional,create=file
+   lxc.mount.entry: /dev/nvidia-uvm-tools dev/nvidia-uvm-tools none bind,optional,create=file
+   lxc.mount.entry: /dev/nvidia-caps dev/nvidia-caps none bind,optional,create=dir
+   ```
+3. **Inside the LXC**, the same driver version's userspace only:
+   `./NVIDIA-Linux-x86_64-<ver>.run --no-kernel-module`. `nvidia-smi` works
+   there now.
+4. **Docker** in the LXC: install `nvidia-container-toolkit` (NVIDIA's apt
+   repo), then `nvidia-ctk runtime configure --runtime=docker` and restart
+   Docker. In an unprivileged LXC also set `no-cgroups = true` in
+   `/etc/nvidia-container-runtime/config.toml`.
+5. **klabnet-api:** in `.env`,
+   ```
+   COMPOSE_FILE=compose.yml:compose.gpu.yml
+   VIDEO_ENCODER=auto
+   ```
+   (`compose.gpu.yml` gives the service the GPU with the `video`
+   capability, which is what mounts `libnvidia-encode` and `libnvcuvid` into
+   the container). Then `docker compose up -d --build`.
+6. **Check:** `docker compose logs klabnet-api | grep encoding` says NVENC;
+   `docker compose exec klabnet-api ffmpeg -hide_banner -encoders | grep nvenc`
+   lists h264_nvenc; `docker compose exec klabnet-api ffmpeg -hide_banner -filters | grep scale_cuda`
+   says whether scaling is on the GPU too; during a job `nvidia-smi` on the
+   host shows an `ffmpeg` process and the encoder busy (`nvidia-smi dmon -s u`,
+   the `enc` column). `python -m app.tools.reencode_videos --id N` remakes one
+   to compare.
+
+The image's ffmpeg is Debian's, which has NVENC/NVDEC (it loads the driver's
+libraries at run time, so the CPU path is unchanged on a machine without a
+GPU). If its `-filters` has no `scale_cuda`, decoding is still on the GPU and
+scaling on the CPU; jellyfin-ffmpeg (a drop-in with the CUDA filters and
+`tonemap_cuda`) would move all of it to the GPU, at the cost of a second apt
+repo in the image; not done.
+
 
 ### The studio
 
@@ -245,14 +344,18 @@ js/43-studio.js). Nothing it does touches the upload.
   upload's time. One edit renders at a time, on its own thread: the upload is
   cut and filtered into an intermediate `original.mp4` (x264 CRF 14 at the
   source's size and frame rate; HEVC 10-bit CRF 16 when the source is HDR and
-  the ffmpeg has libx265), then the normal ladder and stills, in a new folder
+  the ffmpeg has libx265; with NVENC, h264_nvenc CQ 14 / hevc_nvenc Main10
+  CQ 16), then the normal ladder and stills, in a new folder
   that's swapped in when it's done. The unedited ladder is kept in `base/` for
   the editor's preview, with a waveform (`studio-wave.png`). An edit a restart
   caught halfway is started again; `reencode_videos` makes an edited video
   from its edit.
 - **Annotations, cards and the end screen** (`GET/PUT …/annotations`,
   `…/cards`, `…/endscreen`; viewers read all three with `GET …/overlays`;
-  `POST …/cards/{card}/vote {option}` for polls), in the edited video's time.
+  `POST …/cards/{card}/vote {option}` for polls), in the time of the edit
+  last saved. While that edit renders (or after its render failed) viewers
+  get them moved into the time of the version being served, and what falls in
+  a part it cut is left out until the swap.
   Tables `video_annotations`, `video_cards`, `video_card_votes`,
   `video_endscreen`, deleted with the video.
 

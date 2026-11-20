@@ -9,8 +9,10 @@ merged by case with the games already used.
 
   GET  /api/posts/videos/clips          ?game=&user=&q=&sort=new|top&window=week|month|all
   GET  /api/posts/videos/clips/games    the games used, with counts
-  POST /api/posts/videos/{id}/clip      {start, end, title?, game?}: a clip
-                                        made from a range of a video
+  POST /api/posts/videos/{id}/clip      {start, end, title?, game?, timeline?,
+                                        edit?}: a clip made from a range of
+                                        a video, in the time viewers see
+                                        (make_clip says more)
 
 Uploading one is Videos' upload with kind=clip (and game). A clip made from
 a range keeps where it came from (clip_of, clip_start, clip_end) and starts
@@ -20,6 +22,7 @@ ladder as for any upload.
 
 Included into videos.router ahead of its /{post_id} routes, so "clips" is
 never taken for a video id. videos.py is imported lazily: it imports this."""
+import json
 import os
 import secrets
 import shutil
@@ -128,9 +131,19 @@ def list_games(request: Request, user: str = ""):
 
 @router.post("/api/posts/videos/{post_id}/clip")
 async def make_clip(post_id: int, request: Request):
-    """{start, end, title?, game?, description?}: a new clip of yours, the
-    range [start, end) of that video (anyone's that you can watch), made
-    from its upload through the ladder. It links back to the video."""
+    """{start, end, title?, game?, description?, timeline?, edit?}: a new
+    clip of yours, the range [start, end) of that video (anyone's that you
+    can watch), made from its upload through the ladder. It links back to
+    the video.
+
+    The times are the video as people watch it (timeline 'edited', the
+    default): for a video edited in the studio, the edit being served, so a
+    range across a cut is the parts either side of it joined, with the
+    edit's mutes, gain, crop and rotation, just as it played. The studio
+    sends timeline 'upload' (the owner's or an admin's only): times in the
+    upload, with `edit` (its editor's edit, saved or not; none: the upload
+    as it came) applied to that range."""
+    from . import studio as ST
     from . import videos as V
     username = _me(request)
     if not username:
@@ -148,14 +161,45 @@ async def make_clip(post_id: int, request: Request):
         return _error(404, "not found")
     if src["status"] != "ready":
         return _error(409, "the video's still being made")
-    length = src["duration"] or 0
     if not (start >= 0 and end > start):
         return _error(400, "the clip has to end after it starts")
-    end = min(end, length) if length else end
-    if end - start < MIN_SECONDS:
+    live = ST._loads(src["edit_live"], None)
+    upload_len = ((ST._loads(src["base"], {}) or {}).get("duration") if live else src["duration"]) or 0
+    timeline = str(body.get("timeline") or "edited")
+    if timeline == "upload":
+        if not V._can_edit(src["username"], request, username):
+            return _error(403, "only the video's owner can clip its upload")
+        end = min(end, upload_len) if upload_len else end
+        try:
+            look = ST.clean_edit(body.get("edit"), upload_len) if body.get("edit") else None
+        except ValueError as e:
+            return _error(400, str(e))
+        if look:
+            keep = [[max(a, start), min(b, end)] for a, b in look["keep"] if min(b, end) - max(a, start) > 0.001]
+        else:
+            keep = [[start, end]]
+        # Where it is in the video as served, for "clipped from … at 1:23".
+        live_keep = (live or {}).get("keep")
+        at_a = ST.retime(keep[0][0], None, live_keep, True) if keep else start
+        at_b = ST.retime(keep[-1][1], None, live_keep, True) if keep else end
+    elif timeline == "edited":
+        length = src["duration"] or 0
+        end = min(end, length) if length else end
+        look = live
+        keep = ST.to_upload(live["keep"], start, end) if live else [[start, end]]
+        at_a, at_b = start, end
+    else:
+        return _error(400, "timeline is 'edited' or 'upload'")
+    span = sum(b - a for a, b in keep)
+    if span < MIN_SECONDS:
         return _error(400, "a clip has to be at least a second long")
-    if end - start > CLIP_MAX_SECONDS + 0.05:
+    if span > CLIP_MAX_SECONDS + 0.05:
         return _error(400, f"a clip can be up to {V._clock(CLIP_MAX_SECONDS)} long")
+    lo, hi = keep[0][0], keep[-1][1]
+    clip_cut = {"keep": [[round(a, 3), round(b, 3)] for a, b in keep],
+                "mute": [[a, b] for a, b in (look or {}).get("mute", []) if b > lo and a < hi],
+                "muteAll": bool((look or {}).get("muteAll")), "gain": (look or {}).get("gain") or 0,
+                "crop": (look or {}).get("crop"), "rotate": (look or {}).get("rotate") or 0}
     if not os.path.isfile(os.path.join(V._folder(src["file_id"]), f"source.{src['ext']}")):
         return _error(409, "that video's upload isn't kept, so it can't be clipped")
     if not media_ready():
@@ -173,10 +217,10 @@ async def make_clip(post_id: int, request: Request):
         cur = db.execute("INSERT INTO posts(username, text, kind) VALUES (?, ?, 'video')", (username, description))
         clip_id = cur.lastrowid
         db.execute("""INSERT INTO videos(post_id, title, file_id, ext, duration, width, height, kind, game,
-                                         clip_of, clip_start, clip_end, published)
-                      VALUES (?, ?, ?, 'mkv', ?, ?, ?, 'clip', ?, ?, ?, ?, datetime('now'))""",
-                   (clip_id, title, file_id, round(end - start, 3), src["width"], src["height"], game,
-                    post_id, round(start, 3), round(end, 3)))
+                                         clip_of, clip_start, clip_end, clip_cut, published)
+                      VALUES (?, ?, ?, 'mkv', ?, ?, ?, 'clip', ?, ?, ?, ?, ?, datetime('now'))""",
+                   (clip_id, title, file_id, round(span, 3), src["width"], src["height"], game,
+                    post_id, round(at_a, 3), round(at_b, 3), json.dumps(clip_cut)))
         db.commit()
     V._enqueue(clip_id)
     with get_db() as db:
@@ -186,9 +230,13 @@ async def make_clip(post_id: int, request: Request):
 def cut(row, report=None) -> None:
     """The worker's first step for a clip made from a range: the range of
     the video it's of, cut from that video's upload into this clip's folder
-    as source.mkv. Re-encoded (x264 CRF 12, the source's frame rate and
-    picture) so it starts on the very frame asked for; the ladder and the
-    Original are then made from it. Raises when the video's gone."""
+    as source.mkv, through the studio's render (studio.intermediate_cmd):
+    the upload's ranges in clip_cut (more than one when the range spanned
+    a cut of an edited video) joined, with that edit's mutes, gain, crop
+    and rotation. Re-encoded near-losslessly (x264 CRF 12, or NVENC CQ 12)
+    so it starts on the very frame asked for; the ladder and the Original
+    are then made from it. Raises when the video's gone."""
+    from . import studio as ST
     from . import videos as V
     with get_db() as db:
         src = db.execute("SELECT file_id, ext FROM videos WHERE post_id=?", (row["clip_of"],)).fetchone()
@@ -200,17 +248,17 @@ def cut(row, report=None) -> None:
     info = V.probe(path)
     if info is None:
         raise RuntimeError("couldn't read the video it was clipped from")
-    start, length = float(row["clip_start"]), float(row["clip_end"]) - float(row["clip_start"])
+    edit = ST._loads(row["clip_cut"] if "clip_cut" in row.keys() else "", None) or {}
+    if not edit.get("keep"):
+        # A clip asked for before clip_cut: the upload's range as it came.
+        edit = {"keep": [[float(row["clip_start"]), float(row["clip_end"])]]}
+    edit = {"mute": [], "muteAll": False, "gain": 0, "crop": None, "rotate": 0, **edit}
+    length = sum(b - a for a, b in edit["keep"])
     out = os.path.join(V._folder(row["file_id"]), f"source.{row['ext']}")
     tmp = out + ".partial"
-    cmd = ["ffmpeg", "-hide_banner", "-y", "-ss", f"{start:.3f}", "-i", path, "-t", f"{length:.3f}",
-           "-map", "0:v:0", "-c:v", "libx264", "-preset", "fast", "-crf", "12"]
-    if info["audio"]:
-        cmd[cmd.index("-c:v"):cmd.index("-c:v")] = ["-map", "0:a:0"]
-        cmd += ["-c:a", "aac", "-b:a", "320k"]
-    cmd += ["-map_metadata", "-1", "-f", "matroska", tmp]
     try:
-        V._run(cmd, length, 0.0, 1.0, report)
+        V._encode(lambda enc: ST.intermediate_cmd(path, tmp, edit, info, enc, crf=12, fmt="matroska")[0],
+                  length, 0.0, 1.0, report, f"clip {row['post_id']}")
         os.replace(tmp, out)
     finally:
         if os.path.exists(tmp):

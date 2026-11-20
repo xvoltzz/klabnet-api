@@ -20,8 +20,11 @@ way). The unedited ladder (and the raw remux) ride along in the new folder's
 base/, so the studio can always preview the whole upload. Reverting is a
 render with no edit: videos.build() from the upload, as at first.
 
-Annotations, cards and the end screen are in the edited timeline; the site
-moves them when the cuts change (and drops what falls in a removed part).
+Annotations, cards and the end screen are in the wanted edit's timeline
+(videos.edit); the site moves them when the cuts change (and drops what
+falls in a removed part). Until that edit's render is swapped in, viewers
+get them moved into the time of the render being served (_served), so
+they never show shifted.
 Their GETs are for anyone signed in, with the video; PUT replaces all of a
 kind (owner/admin). Under /api/posts/videos because Caddy only forwards a
 fixed list of /api prefixes."""
@@ -197,12 +200,67 @@ def _has_x265() -> bool:
     return _x265
 
 
-def intermediate_cmd(src: str, dest: str, edit: dict, info: dict) -> tuple[list[str], bool]:
-    """ffmpeg for the edit, from the upload to one high-quality mp4 (the
-    Original (edited)), and whether it kept HDR."""
+def to_upload(keep: list, a: float, b: float) -> list[list[float]]:
+    """[a, b) of the edited timeline (keep's) as ranges of the upload: one
+    range, or several when it spans a cut."""
+    out, pos = [], 0.0
+    for ka, kb in keep:
+        span = kb - ka
+        s, e = max(a, pos), min(b, pos + span)
+        if e - s > 0.001:
+            out.append([round(ka + s - pos, 3), round(ka + e - pos, 3)])
+        pos += span
+    return out
+
+
+def upload_at(keep: list, t: float) -> float:
+    """A point of the edited timeline in the upload's."""
+    pos = 0.0
+    for ka, kb in keep:
+        if t < pos + (kb - ka):
+            return ka + max(0.0, t - pos)
+        pos += kb - ka
+    return keep[-1][1] if keep else t
+
+
+def edited_at(keep: list, u: float, snap: bool = False) -> float | None:
+    """A point of the upload in the edited timeline; None in a removed part
+    (or, with snap, where the next kept part starts)."""
+    pos = 0.0
+    for ka, kb in keep:
+        if u < ka:
+            return pos if snap else None
+        if u <= kb:
+            return pos + u - ka
+        pos += kb - ka
+    return pos if snap else None
+
+
+def retime(t: float, frm: list | None, to: list | None, snap: bool = False) -> float | None:
+    """A time in one edit's timeline in another's (None: the whole upload)."""
+    u = upload_at(frm, t) if frm else t
+    return edited_at(to, u, snap) if to else u
+
+
+def _nvenc_master(cq: int, hdr: bool) -> list[str]:
+    from .. import encoder
+    return encoder.nvenc_master_args(cq, hdr)
+
+
+def intermediate_cmd(src: str, dest: str, edit: dict, info: dict, enc: str = "x264", crf: int = INTERMEDIATE_CRF,
+                     fmt: str = "mp4") -> tuple[list[str], bool]:
+    """ffmpeg for the edit, from the upload to one high-quality file (the
+    Original (edited), or a clip's cut), and whether it kept HDR. x264 CRF
+    `crf` (HEVC 10-bit for HDR when libx265 is there) on the CPU; with
+    enc='nvenc', h264_nvenc at CQ `crf` (hevc_nvenc Main10 for HDR, always
+    kept). The filters (trims, volume, crop, rotate, tone mapping) are the
+    CPU's either way. The input is read from just before the first kept
+    part, so a short range of a long video doesn't decode all of it."""
     rate, _ = V._out_fps(info)
     keeps = edit["keep"]
     n = len(keeps)
+    off = max(0.0, keeps[0][0])
+    until = keeps[-1][1] - off + 1.0
     w, h = info["width"], info["height"]
     pre = []
     rot = edit.get("rotate") or 0
@@ -225,45 +283,56 @@ def intermediate_cmd(src: str, dest: str, edit: dict, info: dict) -> tuple[list[
         pre.append(f"crop={tw}:{th}")
         w, h = tw, th
     hdr = bool(info.get("hdr"))
-    keep_hdr = hdr and _has_x265()
+    keep_hdr = hdr and (enc == "nvenc" or _has_x265())
     post = [f"fps={rate}"]
     if hdr and not keep_hdr and V._has_zscale():
         post += ["zscale=t=linear:npl=100", "format=gbrpf32le", "zscale=p=bt709",
                  "tonemap=tonemap=hable:desat=0", "zscale=t=bt709:m=bt709:r=tv"]
-    post.append("format=yuv420p10le" if keep_hdr else "format=yuv420p")
+    post.append(("format=p010le" if enc == "nvenc" else "format=yuv420p10le") if keep_hdr else "format=yuv420p")
     chains = [f"[0:v]{','.join(pre + ['null'])},split={n}" + "".join(f"[vs{i}]" for i in range(n))]
-    chains += [f"[vs{i}]trim=start={a:.3f}:end={b:.3f},setpts=PTS-STARTPTS[vk{i}]" for i, (a, b) in enumerate(keeps)]
+    chains += [f"[vs{i}]trim=start={a - off:.3f}:end={b - off:.3f},setpts=PTS-STARTPTS[vk{i}]" for i, (a, b) in enumerate(keeps)]
     audio = info["audio"] and not edit.get("muteAll")
     if audio:
         apre = ["aresample=48000"]
         if edit.get("mute"):
-            enable = "+".join(f"between(t,{a:.3f},{b:.3f})" for a, b in edit["mute"])
-            apre.append(f"volume=volume=0:enable='{enable}'")
+            enable = "+".join(f"between(t,{a - off:.3f},{b - off:.3f})" for a, b in edit["mute"] if b > off)
+            if enable:
+                apre.append(f"volume=volume=0:enable='{enable}'")
         if edit.get("gain"):
             apre.append(f"volume={edit['gain']:+.1f}dB")
         chains.append(f"[0:a:0]{','.join(apre)},asplit={n}" + "".join(f"[as{i}]" for i in range(n)))
-        chains += [f"[as{i}]atrim=start={a:.3f}:end={b:.3f},asetpts=PTS-STARTPTS[ak{i}]" for i, (a, b) in enumerate(keeps)]
+        chains += [f"[as{i}]atrim=start={a - off:.3f}:end={b - off:.3f},asetpts=PTS-STARTPTS[ak{i}]" for i, (a, b) in enumerate(keeps)]
         chains.append("".join(f"[vk{i}][ak{i}]" for i in range(n)) + f"concat=n={n}:v=1:a=1[vc][ac]")
     else:
         chains.append("".join(f"[vk{i}]" for i in range(n)) + f"concat=n={n}:v=1:a=0[vc]")
     chains.append(f"[vc]{','.join(post)}[vout]")
-    cmd = ["ffmpeg", "-hide_banner", "-y", "-i", src, "-filter_complex", ";".join(chains), "-map", "[vout]"]
+    cmd = ["ffmpeg", "-hide_banner", "-y"]
+    if off > 0:
+        cmd += ["-ss", f"{off:.3f}"]
+    cmd += ["-t", f"{until:.3f}", "-i", src, "-filter_complex", ";".join(chains), "-map", "[vout]"]
     if audio:
         cmd += ["-map", "[ac]"]
-    if keep_hdr:
-        c = _color_info(src)
-        cmd += ["-c:v", "libx265", "-preset", VIDEO_PRESET, "-crf", "16", "-tag:v", "hvc1",
+    c = _color_info(src) if keep_hdr else {}
+    if keep_hdr and enc == "nvenc":
+        cmd += _nvenc_master(crf + 2, True) + [
+            "-color_primaries", c["prim"] or "bt2020", "-color_trc", c["trc"] or "smpte2084",
+            "-colorspace", c["space"] or "bt2020nc"]
+    elif keep_hdr:
+        cmd += ["-c:v", "libx265", "-preset", VIDEO_PRESET, "-crf", str(crf + 2), "-tag:v", "hvc1",
                 "-color_primaries", c["prim"] or "bt2020", "-color_trc", c["trc"] or "smpte2084",
                 "-colorspace", c["space"] or "bt2020nc", "-x265-params", "repeat-headers=1:log-level=error"]
     else:
-        cmd += ["-c:v", "libx264", "-preset", VIDEO_PRESET, "-crf", str(INTERMEDIATE_CRF), "-profile:v", "high"]
+        cmd += _nvenc_master(crf, False) if enc == "nvenc" else \
+            ["-c:v", "libx264", "-preset", VIDEO_PRESET, "-crf", str(crf), "-profile:v", "high"]
         if hdr:
             cmd += ["-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709"]
     if audio:
         cmd += ["-c:a", "aac", "-b:a", "256k", "-ac", "2", "-ar", "48000"]
     else:
         cmd += ["-an"]
-    cmd += ["-movflags", "+faststart", "-map_metadata", "-1", "-f", "mp4", dest]
+    if fmt == "mp4":
+        cmd += ["-movflags", "+faststart"]
+    cmd += ["-map_metadata", "-1", "-f", fmt, dest]
     return cmd, keep_hdr
 
 
@@ -282,10 +351,15 @@ def render_edit(folder: str, ext: str, edit: dict, report=None) -> dict:
             shutil.rmtree(p) if os.path.isdir(p) else os.remove(p)
     inter = os.path.join(folder, "original.mp4")
     tmp = inter + ".partial.mp4"
-    cmd, kept_hdr = intermediate_cmd(src, tmp, edit, info)
+    kept = {}
+
+    def make_inter(enc):
+        cmd, kept["hdr"] = intermediate_cmd(src, tmp, edit, info, enc)
+        return cmd
     if report:
         report(0.0)
-    V._run(cmd, length, 0.0, 0.45, report)
+    V._encode(make_inter, length, 0.0, 0.45, report, f"the edit of {os.path.basename(folder)}")
+    kept_hdr = kept["hdr"]
     os.replace(tmp, inter)
     made = V.probe(inter)
     if made is None:
@@ -293,7 +367,8 @@ def render_edit(folder: str, ext: str, edit: dict, report=None) -> dict:
     rungs = V._rungs(made["width"], made["height"], V._out_fps(made)[1])
     for i in range(len(rungs)):
         os.makedirs(os.path.join(folder, f"v{i}"), exist_ok=True)
-    V._run(V._ladder_cmd(inter, folder, rungs, made), made["duration"], 0.45, 0.9, report)
+    V._encode(lambda enc: V._ladder_cmd(inter, folder, rungs, made, enc), made["duration"], 0.45, 0.9, report,
+              f"the ladder of {os.path.basename(folder)}", lambda: V._clear_ladder(folder, len(rungs)))
     V._fix_master(folder, rungs)
     board = V._stills(inter, folder, made["duration"], made["width"], made["height"], report)
     size = os.path.getsize(inter)
@@ -735,10 +810,37 @@ def _links_of(anns, cards, end) -> list[dict]:
     return links
 
 
-def _overlays(db, row, username: str, owner: bool) -> dict:
+def _served(anns: list[dict], cards: list[dict], row) -> tuple[list[dict], list[dict]]:
+    """Annotations and cards as the render being served needs them. They're
+    saved in the wanted edit's time; while that edit renders (or after its
+    render failed) the files are still the last one's, so they're moved
+    into its time (through the upload's), and what falls in a part it
+    removes is left out until the swap. The end screen counts from the end,
+    so it needs nothing."""
+    want, live = _loads(row["edit"], None), _loads(row["edit_live"], None)
+    if (row["edit"] or "") == (row["edit_live"] or ""):
+        return anns, cards
+    frm, to = (want or {}).get("keep"), (live or {}).get("keep")
+    out_a = []
+    for a in anns:
+        s, e = retime(a["start"], frm, to, True), retime(max(a["start"], a["end"] - 0.01), frm, to, True)
+        if s is None or e is None or e - s < 0.2:
+            continue
+        out_a.append({**a, "start": round(s, 2), "end": round(e + 0.01, 2)})
+    out_c = []
+    for c in cards:
+        at = retime(c["at"], frm, to)
+        if at is not None:
+            out_c.append({**c, "at": round(at, 2)})
+    return out_a, out_c
+
+
+def _overlays(db, row, username: str, owner: bool, served: bool = False) -> dict:
     anns = _annotations(db, row["post_id"])
     cards = _cards(db, row["post_id"], username, owner)
     end = _endscreen(db, row["post_id"])
+    if served:
+        anns, cards = _served(anns, cards, row)
     return {"annotations": anns, "cards": cards, "endscreen": end,
             "refs": _expand(db, _links_of(anns, cards, end), row["username"], row["post_id"], username)}
 
@@ -851,7 +953,7 @@ def get_overlays(post_id: int, request: Request):
         row = _row(db, post_id)
         if row is None:
             return _error(404, "not found")
-        return _overlays(db, row, username, V._can_edit(row["username"], request, username))
+        return _overlays(db, row, username, V._can_edit(row["username"], request, username), served=True)
 
 
 def _length(row) -> float:
@@ -870,9 +972,10 @@ def get_annotations(post_id: int, request: Request):
     if not V._signed_in(request):
         return _error(401, "not authenticated")
     with get_db() as db:
-        if _row(db, post_id) is None:
+        row = _row(db, post_id)
+        if row is None:
             return _error(404, "not found")
-        return {"annotations": _annotations(db, post_id)}
+        return {"annotations": _served(_annotations(db, post_id), [], row)[0]}
 
 
 @router.put(f"{BASE}/{{post_id}}/annotations")
@@ -904,7 +1007,7 @@ def get_cards(post_id: int, request: Request):
         row = _row(db, post_id)
         if row is None:
             return _error(404, "not found")
-        return {"cards": _cards(db, post_id, username, V._can_edit(row["username"], request, username))}
+        return {"cards": _served([], _cards(db, post_id, username, V._can_edit(row["username"], request, username)), row)[1]}
 
 
 @router.put(f"{BASE}/{{post_id}}/cards")
@@ -956,7 +1059,10 @@ async def vote(post_id: int, card_id: str, request: Request):
                       ON CONFLICT(video_id, card_id, username) DO UPDATE SET option=excluded.option, at=datetime('now')""",
                    (post_id, card_id, username, option))
         db.commit()
-        card = next(x for x in _cards(db, post_id, username, V._can_edit(row["username"], request, username)) if x["id"] == card_id)
+        cards = _served([], _cards(db, post_id, username, V._can_edit(row["username"], request, username)), row)[1]
+        card = next((x for x in cards if x["id"] == card_id), None)
+        if card is None:
+            return _error(404, "not found")
         return card
 
 
