@@ -344,6 +344,7 @@ def _json_many(db, rows, request: Request, username: str) -> list[dict]:
         "views": r["views"], "reactions": reactions.get(r["post_id"], {}), "reply_count": replies.get(r["post_id"], 0),
         "watched": watched.get(r["post_id"]),
         "canEdit": admin or r["username"] == username,
+        **({"unlisted": True} if r["unlisted"] else {}),
     } for r in rows]
 
 
@@ -395,11 +396,10 @@ def _save_upload(file: UploadFile) -> tuple[str, str, int] | JSONResponse:
     return file_id, ext, size
 
 
-@router.post(BASE)
-def upload(request: Request, file: UploadFile = File(...), title: str = Form(""), description: str = Form("")):
-    username = _signed_in(request)
-    if not username:
-        return _error(401, "not authenticated")
+def create(request: Request, username: str, file: UploadFile, title: str, description: str, unlisted: bool = False) -> int | JSONResponse:
+    """An upload made into a video and queued for ffmpeg: its post id. An
+    unlisted one (uploaded straight into a TV channel, routers/tv.py) is
+    left out of Videos' lists."""
     if not media_ready():
         return _error(503, "storage is offline")
     if not shutil.which("ffmpeg"):
@@ -418,13 +418,24 @@ def upload(request: Request, file: UploadFile = File(...), title: str = Form("")
     with get_db() as db:
         cur = db.execute("INSERT INTO posts(username, text, kind) VALUES (?, ?, 'video')", (username, description.strip()))
         post_id = cur.lastrowid
-        db.execute("""INSERT INTO videos(post_id, title, file_id, ext, duration, width, height, size)
-                      VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                   (post_id, title, file_id, ext, info["duration"], info["width"], info["height"], size))
+        db.execute("""INSERT INTO videos(post_id, title, file_id, ext, duration, width, height, size, unlisted)
+                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   (post_id, title, file_id, ext, info["duration"], info["width"], info["height"], size, 1 if unlisted else 0))
         db.commit()
-        out = _one(db, post_id, request, username)
     _enqueue(post_id)
-    return out
+    return post_id
+
+
+@router.post(BASE)
+def upload(request: Request, file: UploadFile = File(...), title: str = Form(""), description: str = Form("")):
+    username = _signed_in(request)
+    if not username:
+        return _error(401, "not authenticated")
+    post_id = create(request, username, file, title, description)
+    if isinstance(post_id, JSONResponse):
+        return post_id
+    with get_db() as db:
+        return _one(db, post_id, request, username)
 
 
 @router.get(BASE)
@@ -437,7 +448,7 @@ def list_videos(request: Request, limit: int = 24, before_id: int | None = None,
     if not username:
         return _error(401, "not authenticated")
     limit = max(1, min(limit, 100))
-    where, args = ["(v.status='ready' OR p.username=?)"], [username]
+    where, args = ["(v.status='ready' OR p.username=?)", "v.unlisted=0"], [username]
     if user:
         where.append("p.username=?"); args.append(user.strip().lower())
     for word in q.split()[:8]:
@@ -465,7 +476,7 @@ def continue_watching(request: Request):
     with get_db() as db:
         rows = db.execute(f"""SELECT {_COLS} FROM video_progress g JOIN videos v ON v.post_id = g.post_id
                               JOIN posts p ON p.id = v.post_id
-                              WHERE g.username=? AND v.status='ready' AND g.position > 5
+                              WHERE g.username=? AND v.status='ready' AND v.unlisted=0 AND g.position > 5
                                 AND (v.duration IS NULL OR g.position < v.duration * ?)
                               ORDER BY g.updated DESC LIMIT 20""", (username, DONE_AT)).fetchall()
         return {"videos": _json_many(db, rows, request, username)}
@@ -568,6 +579,7 @@ def delete_files_for(post_id: int, db) -> str | None:
     db.execute("DELETE FROM videos WHERE post_id=?", (post_id,))
     db.execute("DELETE FROM video_progress WHERE post_id=?", (post_id,))
     db.execute("DELETE FROM video_views WHERE post_id=?", (post_id,))
+    db.execute("DELETE FROM tv_items WHERE video_id=?", (post_id,))
     return r["file_id"] if r else None
 
 

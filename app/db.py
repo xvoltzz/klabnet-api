@@ -338,8 +338,34 @@ CREATE TABLE IF NOT EXISTS videos (
     rungs      TEXT NOT NULL DEFAULT '[]',
     storyboard TEXT NOT NULL DEFAULT '',
     poster     TEXT NOT NULL DEFAULT '',
+    unlisted   INTEGER NOT NULL DEFAULT 0,
     updated    TEXT NOT NULL DEFAULT (datetime('now'))
 );
+-- TV channels (routers/tv.py): a lineup of videos on a loop, at the same
+-- point for everyone, like a radio station: (now - epoch) mod the lineup's
+-- length. number is the channel's place on the dial (1-99). A video
+-- uploaded straight into a channel is unlisted (videos.unlisted): it plays
+-- there and stays out of Videos' lists.
+CREATE TABLE IF NOT EXISTS tv_channels (
+    id          TEXT PRIMARY KEY,
+    name        TEXT NOT NULL,
+    number      INTEGER NOT NULL UNIQUE,
+    color       TEXT NOT NULL DEFAULT '',
+    description TEXT NOT NULL DEFAULT '',
+    cover       TEXT NOT NULL DEFAULT '',
+    author      TEXT NOT NULL DEFAULT '',
+    created_by  TEXT NOT NULL,
+    epoch       REAL NOT NULL,
+    created     TEXT NOT NULL DEFAULT (datetime('now')),
+    updated     TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS tv_items (
+    channel_id TEXT NOT NULL,
+    pos        INTEGER NOT NULL,
+    video_id   INTEGER NOT NULL,
+    PRIMARY KEY (channel_id, pos)
+);
+CREATE INDEX IF NOT EXISTS tv_items_video ON tv_items(video_id);
 -- Where each person stopped in a video; cleared once they finish it.
 CREATE TABLE IF NOT EXISTS video_progress (
     username TEXT NOT NULL,
@@ -439,6 +465,11 @@ def init_db() -> None:
         # '' if never. Shown as "edited" beside the time.
         if "edited" not in post_cols:
             conn.execute("ALTER TABLE posts ADD COLUMN edited TEXT NOT NULL DEFAULT ''")
+        # videos.unlisted: a video uploaded straight into a TV channel
+        # (routers/tv.py), kept out of Videos' lists.
+        video_cols = [row[1] for row in conn.execute("PRAGMA table_info(videos)").fetchall()]
+        if "unlisted" not in video_cols:
+            conn.execute("ALTER TABLE videos ADD COLUMN unlisted INTEGER NOT NULL DEFAULT 0")
         # art_cache.id (which file on the media share an album's art is)
         # came after the table did; same migration, and rows from before
         # get theirs from their key.

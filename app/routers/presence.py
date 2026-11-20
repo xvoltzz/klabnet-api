@@ -124,6 +124,8 @@ async def post_presence(request: Request):
     album      = str(body.get("album", "")).strip()[:200]
     # The radio station they're tuned in to (routers/radio.py), if any.
     radio      = re.sub(r"[^A-Za-z0-9_-]", "", str(body.get("radio", "")))[:40]
+    # The TV channel they're watching (routers/tv.py), if any.
+    tv         = re.sub(r"[^A-Za-z0-9_-]", "", str(body.get("tv", "")))[:40]
     cover_art  = str(body.get("coverArt", "")).strip()[:100]
     # Where in klabnet they are (the page), for Home's "what's everyone
     # doing", and the status they've set: "" (online), "away", "dnd" or
@@ -136,7 +138,7 @@ async def post_presence(request: Request):
     shown = _shown(username, device, {
         "song": song, "artist": artist, "song_id": song_id, "playing": playing, "party_host": party_host,
         "platform": platform, "remote": remote, "at": now, "device": device,
-        "position": position, "duration": duration, "album": album, "cover_art": cover_art, "radio": radio,
+        "position": position, "duration": duration, "album": album, "cover_art": cover_art, "radio": radio, "tv": tv,
         "used": now - active_ago if active_ago is not None else 0.0, "where": where, "status": status,
     })
     # Only the beat their card shows counts towards what they've played.
@@ -279,6 +281,9 @@ def get_presence(request: Request):
             # The radio station they're tuned in to, if any: a card that
             # tunes in with them rather than looking for a song.
             "radio":     ((_best(r["username"]) or {}).get("radio") or None) if r["username"] in _beats else None,
+            # The TV channel they're watching (routers/tv.py), from the
+            # device they used last.
+            "tv":        latest[r["username"]].get("tv") or None,
             # Where in klabnet (the page of the device they used last) and
             # the status they set.
             "where":     latest[r["username"]].get("where") or None,

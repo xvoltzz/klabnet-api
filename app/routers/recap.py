@@ -106,7 +106,9 @@ def recap(request: Request, since: float = 0):
         # Around klabnet.
         posts = db.execute(
             """SELECT id, username, text, song_json, kind, created FROM posts
-               WHERE username != ? AND created > ? ORDER BY id DESC LIMIT 500""", (me, at)).fetchall()
+               WHERE username != ? AND created > ?
+                 AND id NOT IN (SELECT post_id FROM videos WHERE unlisted = 1)
+               ORDER BY id DESC LIMIT 500""", (me, at)).fetchall()
         photo_ids = [p["id"] for p in posts if p["kind"] == "photo"]
         photos = 0
         if photo_ids:
