@@ -18,12 +18,24 @@ Unlike the radio's surprise tracklist, everyone gets the whole lineup: a
 TV guide says what's next. Anyone signed in can make a channel; whoever
 made it, its author, or an admin edits or deletes it. Covers reuse
 playlists' (routers/playlists.py). Under /api/posts/tv because Caddy
-forwards /api/posts/*."""
+forwards /api/posts/*.
+
+Programs (the guide): anyone can schedule a block of videos on any
+channel at a set start, into time nothing else holds ("movie at 9 on 3").
+While one is on, the channel plays it from its start, everyone at the same
+point; outside programs the loop runs on as if they weren't there (it
+doesn't restart after one, it's where it would have been). A program's
+videos must be ready by its start: when it starts, each item is marked
+aired or skipped once (tv_program_items.aired), so everyone skips the same
+ones and the timeline doesn't move when a late one finishes. Programs are
+kept for two days after their start, then dropped. The channel's JSON
+carries the programs on now and coming (with everything a player needs),
+so a page switches at the boundary on its own."""
 import re
 import secrets
 import time
 
-from fastapi import APIRouter, File, Form, Request, UploadFile
+from fastapi import APIRouter, File, Form, Query, Request, UploadFile
 from fastapi.responses import JSONResponse
 
 from ..auth import get_groups, get_username, is_admin
@@ -38,6 +50,10 @@ BASE = "/api/posts/tv"
 _COLOR_RE = re.compile(r"#[0-9a-fA-F]{6}")
 NUMBER_MIN, NUMBER_MAX = 1, 99
 LINEUP_MAX = 500
+PROGRAM_ITEMS_MAX = 50
+PROGRAM_MAX_LEN = 24 * 3600
+PROGRAM_AHEAD = 30 * 86400
+DAY = 86400
 
 
 def _error(status: int, message: str) -> JSONResponse:
@@ -103,13 +119,21 @@ def _lineups(db, channel_ids: list[str]) -> dict[str, list[dict]]:
                           FROM tv_items t JOIN videos v ON v.post_id = t.video_id JOIN posts p ON p.id = v.post_id
                           WHERE t.channel_id IN ({marks}) ORDER BY t.channel_id, t.pos""", channel_ids).fetchall()
     for r in rows:
-        u = videos._urls(r)
+        u = _vurls(r)
         out[r["channel_id"]].append({
             "id": r["post_id"], "title": r["title"], "username": r["username"], "duration": r["duration"],
             "status": r["status"], "progress": r["progress"], "hls": u["hls"], "poster": u["poster"],
             "posterSmall": u["posterSmall"], "unlisted": bool(r["unlisted"]),
         })
     return out
+
+
+def _vurls(r) -> dict:
+    """Videos' file URLs for a row of ours (which doesn't select every
+    column Videos may read)."""
+    d = dict(r)
+    d.setdefault("original", None)
+    return videos._urls(d)
 
 
 def _playable(item: dict) -> bool:
@@ -138,6 +162,118 @@ def _now_next(items: list[dict], epoch: float, at: float) -> dict:
     return {"total": total, "now": None, "next": None}
 
 
+def _program_items(db, program_ids: list[str]) -> dict[str, list[dict]]:
+    """Each program's videos in order, as _lineups' items plus `aired`."""
+    out: dict[str, list[dict]] = {p: [] for p in program_ids}
+    if not program_ids:
+        return out
+    marks = ",".join("?" * len(program_ids))
+    rows = db.execute(f"""SELECT t.program_id, t.pos, t.aired, v.post_id, v.title, v.file_id, v.status, v.progress, v.poster,
+                                 v.storyboard, v.duration, v.unlisted, p.username
+                          FROM tv_program_items t JOIN videos v ON v.post_id = t.video_id JOIN posts p ON p.id = v.post_id
+                          WHERE t.program_id IN ({marks}) ORDER BY t.program_id, t.pos""", program_ids).fetchall()
+    for r in rows:
+        u = _vurls(r)
+        out[r["program_id"]].append({
+            "id": r["post_id"], "pos": r["pos"], "title": r["title"], "username": r["username"], "duration": r["duration"],
+            "status": r["status"], "progress": r["progress"], "hls": u["hls"], "poster": u["poster"],
+            "posterSmall": u["posterSmall"], "unlisted": bool(r["unlisted"]), "aired": r["aired"],
+        })
+    return out
+
+
+def _settle(db, now: float) -> None:
+    """Programs that have started decide, once, which of their videos play:
+    the ones ready by then. Later readiness doesn't move the timeline."""
+    rows = db.execute("""SELECT DISTINCT t.program_id FROM tv_program_items t JOIN tv_programs p ON p.id = t.program_id
+                         WHERE t.aired IS NULL AND p.start <= ?""", (now,)).fetchall()
+    if not rows:
+        return
+    items = _program_items(db, [r[0] for r in rows])
+    for pid, its in items.items():
+        for i in its:
+            if i["aired"] is None:
+                db.execute("UPDATE tv_program_items SET aired=? WHERE program_id=? AND pos=?", (1 if _playable(i) else 0, pid, i["pos"]))
+    # Ones whose videos have all gone since.
+    db.execute("UPDATE tv_program_items SET aired=0 WHERE aired IS NULL AND program_id IN (SELECT id FROM tv_programs WHERE start <= ?)", (now,))
+    db.commit()
+
+
+def _plays(p: dict, now: float) -> list[dict]:
+    """What a program plays: once started, what was ready at its start;
+    before, what's ready now (a guess until then)."""
+    if p["start"] <= now:
+        return [i for i in p["items"] if i["aired"]]
+    return [i for i in p["items"] if _playable(i)]
+
+
+def _programs(db, channel_ids: list[str], frm: float, to: float, now: float | None = None) -> dict[str, list[dict]]:
+    """Programs on these channels that overlap [frm, to), by start. `end`
+    is the time it holds: what plays once it's started, all of its videos
+    before (so a late one still has its slot)."""
+    now = time.time() if now is None else now
+    out: dict[str, list[dict]] = {c: [] for c in channel_ids}
+    if not channel_ids:
+        return out
+    _settle(db, now)
+    marks = ",".join("?" * len(channel_ids))
+    rows = db.execute(f"""SELECT * FROM tv_programs WHERE channel_id IN ({marks}) AND start < ? AND start > ?
+                          ORDER BY start""", (*channel_ids, to, frm - PROGRAM_MAX_LEN - 60)).fetchall()
+    items = _program_items(db, [r["id"] for r in rows])
+    for r in rows:
+        p = {"id": r["id"], "channelId": r["channel_id"], "start": r["start"], "title": r["title"], "note": r["note"],
+             "createdBy": r["created_by"], "created": r["created"], "items": items[r["id"]]}
+        started = r["start"] <= now
+        length = sum((i["duration"] or 0) for i in (_plays(p, now) if started else p["items"]))
+        p["end"] = round(r["start"] + length, 3)
+        if p["end"] <= frm:
+            continue
+        for i in p["items"]:
+            i["plays"] = bool(i["aired"]) if started else _playable(i)
+        out[r["channel_id"]].append(p)
+    return out
+
+
+def _mini(p: dict) -> dict:
+    return {"id": p["id"], "title": p["title"], "createdBy": p["createdBy"], "start": p["start"], "end": p["end"]}
+
+
+def _airing(items: list[dict], epoch: float, programs: list[dict], at: float) -> dict:
+    """_now_next with programs: one that's on plays from its start; the
+    loop's item is cut short by one coming, and picks up after it where
+    the loop would have been."""
+    for p in programs:
+        sched = _plays(p, at)
+        length = sum(i["duration"] for i in sched)
+        if not (p["start"] <= at < p["start"] + length):
+            continue
+        pos, start = at - p["start"], 0.0
+        for k, item in enumerate(sched):
+            if pos < start + item["duration"] or k == len(sched) - 1:
+                end = p["start"] + start + item["duration"]
+                if k + 1 < len(sched):
+                    nxt, nprog = sched[k + 1], _mini(p)
+                else:
+                    after = _airing(items, epoch, [q for q in programs if q is not p], end + 0.001)["now"]
+                    nxt, nprog = after, (after or {}).get("program")
+                return {
+                    "total": sum(i["duration"] for i in items if _playable(i)),
+                    "now": {"id": item["id"], "title": item["title"], "posterSmall": item["posterSmall"],
+                            "start": round(start, 3), "duration": item["duration"], "at": round(pos - start, 2),
+                            "program": _mini(p)},
+                    "next": {"id": nxt["id"], "title": nxt["title"], "posterSmall": nxt["posterSmall"],
+                             "in": round(end - at, 1), "program": nprog} if nxt else None,
+                }
+            start += item["duration"]
+    nn = _now_next(items, epoch, at)
+    coming = next((p for p in programs if p["start"] > at and _plays(p, at)), None)
+    if coming and (nn["now"] is None or coming["start"] - at < nn["next"]["in"]):
+        first = _plays(coming, at)[0]
+        nn["next"] = {"id": first["id"], "title": first["title"], "posterSmall": first["posterSmall"],
+                      "in": round(coming["start"] - at, 1), "program": _mini(coming)}
+    return nn
+
+
 def _watchers() -> dict[str, list[str]]:
     """Who's watching what, from presence's beats (the device each person
     used last). Invisible people aren't counted."""
@@ -150,9 +286,11 @@ def _watchers() -> dict[str, list[str]]:
     return out
 
 
-def _json(r, items: list[dict], request: Request, username: str, watchers: dict | None = None, full: bool = False) -> dict:
+def _json(r, items: list[dict], request: Request, username: str, watchers: dict | None = None, full: bool = False,
+          programs: list[dict] | None = None) -> dict:
     t = time.time()
-    nn = _now_next(items, r["epoch"], t)
+    programs = programs or []
+    nn = _airing(items, r["epoch"], programs, t)
     can_edit = _can_edit(r, request, username)
     sched = [i for i in items if _playable(i)]
     out = {
@@ -166,11 +304,24 @@ def _json(r, items: list[dict], request: Request, username: str, watchers: dict 
         "canEdit": can_edit,
         "watchers": (watchers or {}).get(r["id"], []),
         "created": r["created"],
+        # Programs on now and coming (a day and a half), what the player
+        # follows: each one's videos, and which of them play.
+        "programs": [_program_json(p, r, request, username) for p in programs],
     }
     if full or can_edit:
         # Everything in the lineup, ready or not, for the editor.
         out["lineup"] = items
     return out
+
+
+def _program_json(p: dict, channel, request: Request, username: str) -> dict:
+    return {**p, "channelNumber": channel["number"],
+            "canEdit": username == p["createdBy"] or _can_edit(channel, request, username)}
+
+
+def _soon(db, channel_ids: list[str]) -> dict[str, list[dict]]:
+    t = time.time()
+    return _programs(db, channel_ids, t, t + 36 * 3600, t)
 
 
 def _load(db, channel_id: str):
@@ -191,7 +342,8 @@ def _out(channel_id: str, request: Request, username: str) -> dict:
     with get_db() as db:
         row = _load(db, channel_id)
         items = _lineups(db, [channel_id])[channel_id]
-    return _json(row, items, request, username, _watchers(), full=True)
+        progs = _soon(db, [channel_id])[channel_id]
+    return _json(row, items, request, username, _watchers(), full=True, programs=progs)
 
 
 async def _body(request: Request) -> dict | JSONResponse:
@@ -212,6 +364,248 @@ def server_time():
     return {"now": time.time()}
 
 
+# ── Programs (the guide). Before /{channel_id}, so "programs" isn't one. ──
+
+def _clash(db, channel_id: str, start: float, end: float, skip: str = "") -> dict | None:
+    for p in _programs(db, [channel_id], start, end)[channel_id]:
+        if p["id"] != skip and p["start"] < end and start < p["end"]:
+            return p
+    return None
+
+
+def _clash_error(p: dict) -> JSONResponse:
+    return JSONResponse(status_code=409, content={
+        "error": f"that clashes with “{p['title']}”", "clash": _mini(p)})
+
+
+def _program_videos(db, raw) -> list[dict] | JSONResponse:
+    """The videos for a program, in order: each one has to exist and have a
+    known length (it can still be processing; it plays if it's ready by
+    the start)."""
+    ids = _video_ids(raw)
+    if isinstance(ids, JSONResponse):
+        return ids
+    if not ids:
+        return _error(400, "a program needs at least one video")
+    if len(ids) > PROGRAM_ITEMS_MAX:
+        return _error(400, f"a program can hold {PROGRAM_ITEMS_MAX} videos")
+    marks = ",".join("?" * len(set(ids)))
+    found = {r["post_id"]: r for r in db.execute(
+        f"SELECT post_id, title, status, duration FROM videos WHERE post_id IN ({marks})", list(set(ids)))}
+    out = []
+    for v in ids:
+        r = found.get(v)
+        if r is None:
+            return _error(404, "one of those videos is gone")
+        if r["status"] == "failed" or not (r["duration"] or 0) > 0.5:
+            return _error(400, f"“{r['title'] or 'Untitled'}” can’t be scheduled: it didn’t process")
+        out.append({"id": v, "title": r["title"], "duration": r["duration"]})
+    if sum(v["duration"] for v in out) > PROGRAM_MAX_LEN:
+        return _error(400, "a program can run for 24 hours at most")
+    return out
+
+
+def _float(value) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _start(value, now: float) -> float | JSONResponse:
+    try:
+        start = float(value)
+    except (TypeError, ValueError):
+        return _error(400, "a program needs a start time")
+    if start < now - 60:
+        return _error(400, "that time has gone")
+    if start > now + PROGRAM_AHEAD:
+        return _error(400, "programs can be scheduled up to 30 days ahead")
+    return round(max(start, now), 3)
+
+
+def _channel_for(db, value):
+    v = str(value or "").strip()
+    row = _load(db, v)
+    if row is None and v.isdigit():
+        row = db.execute("SELECT * FROM tv_channels WHERE number=?", (int(v),)).fetchone()
+    return row
+
+
+def _program_out(db, program_id: str, request: Request, username: str) -> dict | None:
+    r = db.execute("SELECT channel_id, start FROM tv_programs WHERE id=?", (program_id,)).fetchone()
+    if r is None:
+        return None
+    channel = _load(db, r["channel_id"])
+    p = next((x for x in _programs(db, [r["channel_id"]], r["start"] - 1, r["start"] + 1)[r["channel_id"]] if x["id"] == program_id), None)
+    return _program_json(p, channel, request, username) if p and channel else None
+
+
+def _tidy(db, now: float) -> None:
+    """Programs drop off two days after they start (a day of history)."""
+    old = [r[0] for r in db.execute("SELECT id FROM tv_programs WHERE start < ?", (now - 2 * DAY,))]
+    if old:
+        marks = ",".join("?" * len(old))
+        db.execute(f"DELETE FROM tv_program_items WHERE program_id IN ({marks})", old)
+        db.execute(f"DELETE FROM tv_programs WHERE id IN ({marks})", old)
+        db.commit()
+
+
+@router.get(f"{BASE}/programs")
+def list_programs(request: Request, frm: float | None = Query(None, alias="from"), to: float | None = None):
+    """Every channel's programs that overlap [from, to) (unix seconds;
+    now − 1h … now + 24h by default, at most 8 days)."""
+    username = _signed_in(request)
+    if not username:
+        return _error(401, "not authenticated")
+    t = time.time()
+    frm = t - 3600 if frm is None else frm
+    to = t + DAY if to is None else to
+    to = min(to, frm + 8 * DAY)
+    with get_db() as db:
+        _tidy(db, t)
+        rows = db.execute("SELECT * FROM tv_channels ORDER BY number").fetchall()
+        progs = _programs(db, [r["id"] for r in rows], frm, to, t)
+    out = [_program_json(p, r, request, username) for r in rows for p in progs[r["id"]]]
+    out.sort(key=lambda p: (p["start"], p["channelNumber"]))
+    return {"now": t, "from": frm, "to": to, "programs": out}
+
+
+@router.get(f"{BASE}/programs/{{program_id}}")
+def get_program(program_id: str, request: Request):
+    username = _signed_in(request)
+    if not username:
+        return _error(401, "not authenticated")
+    with get_db() as db:
+        out = _program_out(db, program_id, request, username)
+    return out if out else _error(404, "not found")
+
+
+@router.post(f"{BASE}/programs")
+async def create_program(request: Request):
+    """{channel (id or number), start (unix seconds), title, note, videos}:
+    into free time on any channel, by anyone signed in."""
+    username = _signed_in(request)
+    if not username:
+        return _error(401, "not authenticated")
+    body = await _body(request)
+    if isinstance(body, JSONResponse):
+        return body
+    t = time.time()
+    with get_db() as db:
+        channel = _channel_for(db, body.get("channel"))
+        if channel is None:
+            return _error(404, "no such channel")
+        start = _start(body.get("start"), t)
+        if isinstance(start, JSONResponse):
+            return start
+        vids = _program_videos(db, body.get("videos"))
+        if isinstance(vids, JSONResponse):
+            return vids
+        end = start + sum(v["duration"] for v in vids)
+        clash = _clash(db, channel["id"], start, end)
+        if clash:
+            return _clash_error(clash)
+        title = " ".join(str(body.get("title") or "").split())[:80] or vids[0]["title"] or "Untitled"
+        program_id = secrets.token_urlsafe(9)
+        db.execute("INSERT INTO tv_programs(id, channel_id, start, title, note, created_by) VALUES (?, ?, ?, ?, ?, ?)",
+                   (program_id, channel["id"], start, title, str(body.get("note") or "").strip()[:300], username))
+        db.executemany("INSERT INTO tv_program_items(program_id, pos, video_id) VALUES (?, ?, ?)",
+                       [(program_id, i, v["id"]) for i, v in enumerate(vids)])
+        db.commit()
+        return _program_out(db, program_id, request, username)
+
+
+def _program_editable(db, program_id: str, request: Request, username: str):
+    r = db.execute("SELECT * FROM tv_programs WHERE id=?", (program_id,)).fetchone()
+    if r is None:
+        return None, _error(404, "not found")
+    channel = _load(db, r["channel_id"])
+    if not (username == r["created_by"] or (channel is not None and _can_edit(channel, request, username))):
+        return None, _error(403, "not yours to change")
+    return r, None
+
+
+@router.patch(f"{BASE}/programs/{{program_id}}")
+async def edit_program(program_id: str, request: Request):
+    """Title and note any time; channel, start and videos only before it
+    starts."""
+    username = _signed_in(request)
+    if not username:
+        return _error(401, "not authenticated")
+    body = await _body(request)
+    if isinstance(body, JSONResponse):
+        return body
+    t = time.time()
+    with get_db() as db:
+        r, err = _program_editable(db, program_id, request, username)
+        if err:
+            return err
+        started = r["start"] <= t
+        if started and any(k in body for k in ("channel", "start", "videos")):
+            moved = (
+                ("channel" in body and (_channel_for(db, body["channel"]) or {"id": None})["id"] != r["channel_id"])
+                or ("start" in body and abs(_float(body["start"]) - r["start"]) > 1)
+                or "videos" in body
+            )
+            if moved:
+                return _error(400, "it’s already on: only its title and note can change")
+        sets, args = [], []
+        if "title" in body:
+            title = " ".join(str(body["title"] or "").split())[:80]
+            if not title:
+                return _error(400, "a program needs a title")
+            sets.append("title=?"); args.append(title)
+        if "note" in body:
+            sets.append("note=?"); args.append(str(body["note"] or "").strip()[:300])
+        if not started:
+            channel_id, start = r["channel_id"], r["start"]
+            if "channel" in body:
+                channel = _channel_for(db, body["channel"])
+                if channel is None:
+                    return _error(404, "no such channel")
+                channel_id = channel["id"]
+            if "start" in body:
+                start = _start(body["start"], t)
+                if isinstance(start, JSONResponse):
+                    return start
+            if "videos" in body:
+                vids = _program_videos(db, body["videos"])
+                if isinstance(vids, JSONResponse):
+                    return vids
+            else:
+                vids = [{"id": i["id"], "duration": i["duration"] or 0}
+                        for i in _program_items(db, [program_id])[program_id]]
+            clash = _clash(db, channel_id, start, start + sum(v["duration"] for v in vids), skip=program_id)
+            if clash:
+                return _clash_error(clash)
+            sets += ["channel_id=?", "start=?"]; args += [channel_id, start]
+            if "videos" in body:
+                db.execute("DELETE FROM tv_program_items WHERE program_id=?", (program_id,))
+                db.executemany("INSERT INTO tv_program_items(program_id, pos, video_id) VALUES (?, ?, ?)",
+                               [(program_id, i, v["id"]) for i, v in enumerate(vids)])
+        if sets:
+            db.execute(f"UPDATE tv_programs SET {', '.join(sets)} WHERE id=?", (*args, program_id))
+        db.commit()
+        return _program_out(db, program_id, request, username)
+
+
+@router.delete(f"{BASE}/programs/{{program_id}}")
+def delete_program(program_id: str, request: Request):
+    """Gone from the guide; one that's on stops, and the loop carries on."""
+    username = _signed_in(request)
+    if not username:
+        return _error(401, "not authenticated")
+    with get_db() as db:
+        r, err = _program_editable(db, program_id, request, username)
+        if err:
+            return err
+        db.execute("DELETE FROM tv_program_items WHERE program_id=?", (program_id,))
+        db.execute("DELETE FROM tv_programs WHERE id=?", (program_id,))
+        db.commit()
+    return {"ok": True}
+
+
 @router.get(BASE)
 def list_channels(request: Request):
     username = _signed_in(request)
@@ -221,7 +615,8 @@ def list_channels(request: Request):
     with get_db() as db:
         rows = db.execute("SELECT * FROM tv_channels ORDER BY number").fetchall()
         lineups = _lineups(db, [r["id"] for r in rows])
-    return {"now": time.time(), "channels": [_json(r, lineups[r["id"]], request, username, watchers) for r in rows]}
+        progs = _soon(db, [r["id"] for r in rows])
+    return {"now": time.time(), "channels": [_json(r, lineups[r["id"]], request, username, watchers, programs=progs[r["id"]]) for r in rows]}
 
 
 @router.get(f"{BASE}/{{channel_id}}")
@@ -237,7 +632,8 @@ def get_channel(channel_id: str, request: Request):
         if row is None:
             return _error(404, "not found")
         items = _lineups(db, [row["id"]])[row["id"]]
-    return {"now": time.time(), **_json(row, items, request, username, _watchers(), full=True)}
+        progs = _soon(db, [row["id"]])[row["id"]]
+    return {"now": time.time(), **_json(row, items, request, username, _watchers(), full=True, programs=progs)}
 
 
 @router.post(BASE)
@@ -458,8 +854,12 @@ def delete_channel(channel_id: str, request: Request):
         own = [r[0] for r in db.execute(
             """SELECT DISTINCT t.video_id FROM tv_items t JOIN videos v ON v.post_id = t.video_id
                WHERE t.channel_id=? AND v.unlisted=1
-                 AND NOT EXISTS (SELECT 1 FROM tv_items o WHERE o.video_id = t.video_id AND o.channel_id != t.channel_id)""",
+                 AND NOT EXISTS (SELECT 1 FROM tv_items o WHERE o.video_id = t.video_id AND o.channel_id != t.channel_id)
+                 AND NOT EXISTS (SELECT 1 FROM tv_program_items pi JOIN tv_programs pr ON pr.id = pi.program_id
+                                 WHERE pi.video_id = t.video_id AND pr.channel_id != t.channel_id)""",
             (channel_id,))]
+        db.execute("DELETE FROM tv_program_items WHERE program_id IN (SELECT id FROM tv_programs WHERE channel_id=?)", (channel_id,))
+        db.execute("DELETE FROM tv_programs WHERE channel_id=?", (channel_id,))
         db.execute("DELETE FROM tv_items WHERE channel_id=?", (channel_id,))
         db.execute("DELETE FROM tv_channels WHERE id=?", (channel_id,))
         for post_id in own:

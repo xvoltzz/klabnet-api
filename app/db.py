@@ -366,6 +366,28 @@ CREATE TABLE IF NOT EXISTS tv_items (
     PRIMARY KEY (channel_id, pos)
 );
 CREATE INDEX IF NOT EXISTS tv_items_video ON tv_items(video_id);
+-- TV programs (routers/tv.py, the guide): a block scheduled on a channel
+-- at a set start (unix seconds, UTC), played from its start for everyone;
+-- outside programs the channel's loop runs on as if they weren't there.
+-- aired is decided once the program starts: 1 the item plays, 0 it wasn't
+-- ready and is skipped, NULL not started yet.
+CREATE TABLE IF NOT EXISTS tv_programs (
+    id         TEXT PRIMARY KEY,
+    channel_id TEXT NOT NULL,
+    start      REAL NOT NULL,
+    title      TEXT NOT NULL,
+    note       TEXT NOT NULL DEFAULT '',
+    created_by TEXT NOT NULL,
+    created    TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS tv_programs_start ON tv_programs(channel_id, start);
+CREATE TABLE IF NOT EXISTS tv_program_items (
+    program_id TEXT NOT NULL,
+    pos        INTEGER NOT NULL,
+    video_id   INTEGER NOT NULL,
+    aired      INTEGER,
+    PRIMARY KEY (program_id, pos)
+);
 -- Where each person stopped in a video; cleared once they finish it.
 CREATE TABLE IF NOT EXISTS video_progress (
     username TEXT NOT NULL,
