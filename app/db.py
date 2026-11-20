@@ -405,6 +405,35 @@ CREATE TABLE IF NOT EXISTS video_views (
     at       REAL NOT NULL,
     PRIMARY KEY (post_id, username)
 );
+-- Video playlists (routers/video_playlists.py): Music's playlists for
+-- videos. Private to `username` until featured; a featured one is listed
+-- for everyone. cover is a cover id of Music's playlist cover pipeline
+-- (playlists/<id[:2]>/<id>-l|s.jpg on the media share, '' = the first
+-- videos' posters as a 2x2). source_id: the YouTube playlist it was
+-- imported from (app/tools/import_youtube.py), so a re-run skips it.
+CREATE TABLE IF NOT EXISTS video_playlists (
+    id          TEXT PRIMARY KEY,
+    username    TEXT NOT NULL,
+    name        TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    cover       TEXT NOT NULL DEFAULT '',
+    featured    INTEGER NOT NULL DEFAULT 0,
+    source_id   TEXT NOT NULL DEFAULT '',
+    created     TEXT NOT NULL DEFAULT (datetime('now')),
+    updated     TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS video_playlists_by_user ON video_playlists(username);
+CREATE INDEX IF NOT EXISTS video_playlists_featured ON video_playlists(featured, updated);
+CREATE TABLE IF NOT EXISTS video_playlist_items (
+    playlist_id TEXT NOT NULL,
+    pos         INTEGER NOT NULL,
+    video_id    INTEGER NOT NULL,
+    added_by    TEXT NOT NULL DEFAULT '',
+    added       TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (playlist_id, video_id)
+);
+CREATE INDEX IF NOT EXISTS video_playlist_items_order ON video_playlist_items(playlist_id, pos);
+CREATE INDEX IF NOT EXISTS video_playlist_items_video ON video_playlist_items(video_id);
 -- Lyrics from LRCLIB (routers/lyrics.py), one row a song as the site
 -- names it (title, artist, album, length). body is LRCLIB's answer as
 -- JSON, or '' for "none there": kept a few days, then asked again.
@@ -518,6 +547,22 @@ def init_db() -> None:
         video_cols = [row[1] for row in conn.execute("PRAGMA table_info(videos)").fetchall()]
         if "unlisted" not in video_cols:
             conn.execute("ALTER TABLE videos ADD COLUMN unlisted INTEGER NOT NULL DEFAULT 0")
+        # videos.published: when it came out (settable, e.g. a YouTube
+        # video's own date when imported), which every list orders by;
+        # posts.created stays when it arrived on klabnet. Rows from before
+        # get their created time. source_id: the YouTube id it was imported
+        # from (app/tools/import_youtube.py), so a re-run skips it.
+        # original: the upload remuxed for direct play (source.mp4) as JSON,
+        # '' = none (routers/videos.py).
+        if "published" not in video_cols:
+            conn.execute("ALTER TABLE videos ADD COLUMN published TEXT NOT NULL DEFAULT ''")
+        conn.execute("UPDATE videos SET published = COALESCE((SELECT created FROM posts WHERE posts.id = videos.post_id), datetime('now')) WHERE published = ''")
+        if "source_id" not in video_cols:
+            conn.execute("ALTER TABLE videos ADD COLUMN source_id TEXT NOT NULL DEFAULT ''")
+        if "original" not in video_cols:
+            conn.execute("ALTER TABLE videos ADD COLUMN original TEXT NOT NULL DEFAULT ''")
+        conn.execute("CREATE INDEX IF NOT EXISTS videos_published ON videos(published, post_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS videos_source ON videos(source_id) WHERE source_id != ''")
         # art_cache.id (which file on the media share an album's art is)
         # came after the table did; same migration, and rows from before
         # get theirs from their key.

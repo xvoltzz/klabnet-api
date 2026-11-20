@@ -61,13 +61,18 @@ anything else. Admin-only writes (`POST`/`PUT`/`DELETE` on `/api/apps` and
 | `/api/music-requests/session/state` | PUT | a device with its stream open | `{device, now?, queue?, playlist?, claim?}`: what the active device is playing. With `claim` the sender becomes the active device; without it, only if nobody is (otherwise 409) |
 | `/api/music-requests/session/cmd` | POST | a device with its stream open | `{device, cmd, to?}`: handed to the active device (or the one named in `to`): `play`, `resume`, `pause`, `seek`, `next`, `prev`, `queue`, `set`, `take` |
 | `/api/music-requests/session/release` | POST | a device with its stream open | `{device}`: the active device's page is closing |
-| `/api/posts/videos` | GET, POST | any | videos (`app/routers/videos.py`), each a `posts` row with kind `video`, so reactions and replies are the posts' own routes. GET `?limit=&before_id=&offset=&user=&sort=new\|popular&q=`: `{videos, total}`, others' only once ready, yours always. POST (multipart): `file` (mp4, mov, mkv, webm, avi, m4v; up to `VIDEO_MAX_MB`), `title`, `description`; answers at once with `status: processing`, and ffmpeg makes the HLS ladder in the background |
+| `/api/posts/videos` | GET, POST | any | videos (`app/routers/videos.py`), each a `posts` row with kind `video`, so reactions and replies are the posts' own routes. GET `?limit=&before_id=&offset=&user=&sort=new\|old\|popular&q=`: `{videos, total}`, ordered by `published` (`new` newest first, `old` oldest first; `before_id` pages on from that video), others' only once ready, yours always. POST (multipart): `file` (mp4, mov, mkv, webm, avi, m4v; up to `VIDEO_MAX_MB`), `title`, `description`, `published` (optional: a date or an ISO date-time, not in the future; blank is now); answers at once with `status: processing`, and ffmpeg makes the HLS ladder in the background |
 | `/api/posts/videos/continue` | GET | any | your videos to carry on with (watched past 5s and short of 95%), newest first |
-| `/api/posts/videos/{id}` | GET, PATCH, DELETE | any / owner or admin | one video; edit `title`, `description`; delete it, its comments, reactions, progress, views and files |
+| `/api/posts/videos/playlists` | GET, POST | any | video playlists (`app/routers/video_playlists.py`): yours and everyone's featured ones; POST `{name, description?, featured?, videos?: [id…]}` |
+| `/api/posts/videos/playlists/{id}` | GET, PATCH, DELETE | any (private: owner) / owner or admin | one with its videos in order; PATCH `name`, `description`, `featured`, `videos` (the whole order) |
+| `/api/posts/videos/playlists/{id}/videos` | POST | owner or admin | `{videos: [id…]}` added at the end (`added`: how many were new) |
+| `/api/posts/videos/playlists/{id}/videos/{video}` | DELETE | owner or admin | takes one out |
+| `/api/posts/videos/playlists/{id}/cover` | POST, DELETE | owner or admin | a cover (multipart `file`) through Music's playlist cover pipeline, served from `/api/music-requests/playlists/covers/…` |
+| `/api/posts/videos/{id}` | GET, PATCH, DELETE | any / owner or admin | one video (with `published` and `original`); edit `title`, `description`, `published`; delete it, its comments, reactions, progress, views and files |
 | `/api/posts/videos/{id}/poster` | PUT | owner or admin | a thumbnail of your own (multipart `file`), in place of the frame at 10% |
 | `/api/posts/videos/{id}/view` | POST | any | counts you as a viewer (views are people; once each 6 hours refreshes it) |
 | `/api/posts/videos/{id}/progress` | PUT | any | `{position}`: where you stopped; 95% in or more clears it |
-| `/api/posts/videos/{id}/files/{file}/{path}` | GET | any | the ladder (`master.m3u8`, `v<n>/…`), posters and storyboard; immutable, the file id is per upload |
+| `/api/posts/videos/{id}/files/{file}/{path}` | GET | any | the ladder (`master.m3u8`, `v<n>/…`), posters, storyboard and `original.mp4` (with Range requests); immutable, the file id is per upload (and per rebuild) |
 | `/api/voice` | GET | any | voice channels and who's in each (asked of LiveKit, cached 2s). `enabled: false` when LiveKit isn't configured |
 | `/api/voice/token` | POST | any | body `{channel}`: where LiveKit is and a 10-minute token for that channel's room, in the caller's name |
 | `/api/posts/changes` | GET | any | the newest commits to klabnet's repos on Gitea (`CHANGES_REPOS`), for Home's "What's new"; kept 5 minutes. Under `/api/posts/` so it rides a prefix Caddy already forwards; `/api/changes` answers too |
@@ -155,16 +160,70 @@ populated before the first push — it's not something the hook bootstraps.
 klabnet's own YouTube (`app/routers/videos.py`, klabnet-web's Videos page).
 An upload is kept on the media share as it came (`videos/<id[:2]>/<id>/source.<ext>`)
 and queued for ffmpeg, which the Docker image installs. One video is made at a
-time, on one thread: an HLS ladder of fMP4 rungs (1080p 5000k, 720p 2800k, 480p
-1200k, 360p 700k, measured on the short side so portrait phone videos count as
-the same), H.264 High at `VIDEO_PRESET` and AAC 128k, 4-second segments with
-keyframes aligned across rungs, two posters at 10% in and a storyboard of
-160px frames for the seek bar. Rotation from phones is respected. A job a
-restart cut short starts again at the next startup (ffmpeg dies with the
-server, so two never write the same folder).
+time, on one thread (which also looks every 20s for videos another process
+queued, such as the importer below).
 
-It's CPU-heavy (every rung is encoded at once). `VIDEO_PRESET` trades CPU for
-file size: `faster` or `medium` make smaller files if the box has room.
+**The ladder.** HLS fMP4 rungs at 2160p, 1440p, 1080p, 720p, 480p and 360p,
+each only when the source is that big, measured on the short side so portrait
+phone videos count the same. x264 High at constant quality (`VIDEO_CRF`, 18)
+and `VIDEO_PRESET` (`medium`; `slow` is better still if the CPU keeps up), each
+rung with a bitrate ceiling (`-maxrate`, `-bufsize` twice that), so a simple
+picture stays small and a busy one gets bits: 2160p 30/45 Mbps (up to 30 fps /
+above), 1440p 16/24, 1080p 10/15, 720p 5/7.5, 480p 2.5/3.5, 360p 1.2/1.8.
+The frame rate is the source's on every rung (60 fps stays 60; above 60 is
+brought to 60; a variable-rate phone video comes out constant at its nominal
+rate), and the master playlist carries `FRAME-RATE`, so players say "1080p60".
+Keyframes every 4s, aligned across rungs. HDR (PQ or HLG) is tone-mapped to SDR
+BT.709 for the ladder (zscale + hable; Debian's ffmpeg has zimg). Audio is
+copied when it's already AAC stereo at 256k or less, otherwise AAC
+`VIDEO_AUDIO_KBPS` (192k) stereo. Then two posters at 10% in (or from a
+`thumb.*` beside the upload: the importer's YouTube thumbnail) and a
+storyboard for the seek bar. Rotation from phones is respected. A job a
+restart cut short starts again at the next startup.
+
+Encoding is CPU-heavy: every rung at once. Measured on a 12-thread desktop at
+`medium`: a minute of 1080p60 (fast motion and noise, the worst case) took
+about 3 minutes; a minute of 4K30 about 5. Real footage is usually quicker.
+GPU encoders (VAAPI, QSV, NVENC) aren't wired up yet.
+
+**Original.** When the upload's codecs are ones browsers play (video H.264,
+HEVC, AV1 or VP9; audio AAC, Opus, MP3 or none), it's also remuxed without
+re-encoding into `original.mp4` (moov first, HDR kept), and the player offers
+it as the "Original" quality. It's the upload's own bitrate straight off the
+media share: on the LAN, the real thing; over the internet, as heavy as the
+file. It costs disk (a second copy of the upload). Anything else (ProRes, a
+lossless file) has no Original; the top rung is the best on offer.
+
+**Published.** `videos.published` is when a video came out (settable on
+upload and edit, the YouTube date when imported) and what every list orders
+by; `posts.created` stays when it arrived. Videos are never Feed posts. One
+that came out more than two days before it arrived (an import) is left out of
+the recap's and This week's "new videos", so an import doesn't flood them.
+
+**Tools** (run beside the API, on its database and media share; in Docker:
+`docker compose exec api python -m app.tools.<name> …`):
+
+- `import_youtube <folder> --user <username> [--dry-run] [--limit N]
+  [--include-private] [--feature-public]` brings YouTube videos in with their
+  dates, titles, descriptions and thumbnails, and their playlists. The folder
+  can hold yt-dlp downloads (`yt-dlp --write-info-json --write-thumbnail`:
+  `<name>.mp4` beside `<name>.info.json` and `<name>.jpg`; a playlist's own
+  `.info.json` becomes a playlist) and/or a Google Takeout (`YouTube and
+  YouTube Music/videos/*.mp4`, `video metadata/videos.csv`, `playlists/*.csv`).
+  Put it somewhere the container sees, e.g. under the media share:
+  `docker compose exec api python -m app.tools.import_youtube /media/import --user evan --dry-run`.
+  It's idempotent (each video keeps its YouTube id in `videos.source_id`,
+  each playlist its id), so a re-run skips what's done. Private videos are
+  skipped unless `--include-private`; unlisted ones come in unlisted.
+  Playlists come in private; public ones featured with `--feature-public`.
+  The videos are queued, not made: the API's worker makes them one at a time
+  (a big import takes a while), each showing its progress in Videos.
+- `reencode_videos --all | --id N…` makes ladders again from the kept uploads
+  (after encoder changes), each in a new folder while the old one keeps
+  playing, then swapped in.
+- `originals [--dry-run]` gives videos from before Original theirs (a quick
+  stream copy).
+
 The site plays it with hls.js (Safari natively). A video can be shared to the
 Feed (`POST /api/posts` with `video: {id, start?}`).
 
@@ -235,5 +294,7 @@ machine's LAN address, so people at home connect straight to it.
 | `PLAYLIST_COVER_MAX_MB` | `20` | largest cover upload |
 | `VIDEO_MAX_MB` | `4096` | largest video upload. Caddy's request body limit (if it has one) has to allow it too |
 | `VIDEO_TITLE_MAX_CHARS` / `VIDEO_DESC_MAX_CHARS` | `100` / `5000` | video title and description lengths |
-| `VIDEO_PRESET` | `veryfast` | x264's preset for the ladder |
+| `VIDEO_PRESET` | `medium` | x264's preset for the ladder (`slow` is better if the CPU keeps up) |
+| `VIDEO_CRF` | `18` | x264's constant quality for the ladder (lower is better and bigger); each rung also has a bitrate ceiling |
+| `VIDEO_AUDIO_KBPS` | `192` | the ladder's AAC bitrate when the source's audio isn't already AAC stereo |
 | `CORS_ORIGINS` | `https://user.klab.gg,https://staging.klab.gg` | comma-separated; only matters for a browser hitting this API cross-origin, which the current frontend doesn't do (it calls relative `/api/...` paths, proxied same-origin through Caddy) |

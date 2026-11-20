@@ -109,6 +109,9 @@ def recap(request: Request, since: float = 0):
             """SELECT id, username, text, song_json, kind, created FROM posts
                WHERE username != ? AND created > ?
                  AND id NOT IN (SELECT post_id FROM videos WHERE unlisted = 1)
+                 -- Back-dated videos (an import of old YouTube uploads) aren't news.
+                 AND id NOT IN (SELECT v.post_id FROM videos v JOIN posts q ON q.id = v.post_id
+                                WHERE v.published < datetime(q.created, '-2 days'))
                ORDER BY id DESC LIMIT 500""", (me, at)).fetchall()
         photo_ids = [p["id"] for p in posts if p["kind"] == "photo"]
         photos = 0

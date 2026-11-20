@@ -26,35 +26,51 @@ import shutil
 import subprocess
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, File, Form, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 
 from ..auth import get_groups, get_username, is_admin
-from ..config import MEDIA_DIR, VIDEO_DESC_MAX_CHARS, VIDEO_MAX_MB, VIDEO_PRESET, VIDEO_TITLE_MAX_CHARS
+from ..config import (MEDIA_DIR, VIDEO_AUDIO_KBPS, VIDEO_CRF, VIDEO_DESC_MAX_CHARS, VIDEO_MAX_MB, VIDEO_PRESET,
+                      VIDEO_TITLE_MAX_CHARS)
 from ..db import get_db
 from ..media import media_ready
 from .posts import _reactions_and_reply_counts
 
 router = APIRouter()
 BASE = "/api/posts/videos"
+# Playlists first: their paths must win over /{post_id} (routers/video_playlists.py).
+from .video_playlists import router as _playlists_router  # noqa: E402
+router.include_router(_playlists_router)
 
 _EXTS = {"mp4", "mov", "mkv", "webm", "avi", "m4v"}
 _MAX_BYTES = VIDEO_MAX_MB * 1024 * 1024
 _FILE_ID_RE = re.compile(r"[A-Za-z0-9_-]{8,40}")
-# Everything a video's folder serves; source.* is never among them.
-_SERVED_RE = re.compile(r"master\.m3u8|v\d{1,2}/(?:index\.m3u8|init(?:_\d{1,2})?\.mp4|seg\d{1,6}\.m4s)|poster[A-Za-z0-9_-]{0,24}-[ls]\.jpg|storyboard\.jpg")
+# Everything a video's folder serves; source.* and thumb.* never are.
+_SERVED_RE = re.compile(r"master\.m3u8|v\d{1,2}/(?:index\.m3u8|init(?:_\d{1,2})?\.mp4|seg\d{1,6}\.m4s)|poster[A-Za-z0-9_-]{0,24}-[ls]\.jpg|storyboard\.jpg|original\.mp4")
 _TYPES = {"m3u8": "application/vnd.apple.mpegurl", "m4s": "video/iso.segment", "mp4": "video/mp4", "jpg": "image/jpeg"}
-# The ladder: (rung, video bitrate). A rung is the picture's short side, so
-# a portrait 1080x1920 phone video is "1080p" as it is everywhere else.
-_LADDER = [(1080, 5000), (720, 2800), (480, 1200), (360, 700)]
-SEGMENT = 4  # seconds, and the keyframe interval
+# The ladder: (rung, ceiling kbps at <=30fps, at >30fps). A rung is the
+# picture's short side, so a portrait 1080x1920 phone video is "1080p" as
+# it is everywhere else. x264 aims for a look (VIDEO_CRF), not a bitrate:
+# simple pictures stay small, and busy ones get bits up to the ceiling.
+_LADDER = [(2160, 30000, 45000), (1440, 16000, 24000), (1080, 10000, 15000),
+           (720, 5000, 7500), (480, 2500, 3500), (360, 1200, 1800)]
+SEGMENT = 4  # seconds, and the keyframe interval (time-based, so any frame rate)
+MAX_FPS = 60
+# What a browser plays straight from an mp4 (the Original quality).
+_DIRECT_VIDEO = {"h264", "hevc", "av1", "vp9"}
+_DIRECT_AUDIO = {"aac", "opus", "mp3"}
+_HDR_TRANSFERS = {"smpte2084", "arib-std-b67"}
 _upload_slots = threading.BoundedSemaphore(1)
 _jobs: "queue.Queue[int]" = queue.Queue()
+_queued: set[int] = set()  # in _jobs or being made now
 _worker_lock = threading.Lock()
 _worker: threading.Thread | None = None
+_POLL = 20  # seconds: the worker looks for videos queued by another process (the importer)
 _VIEW_EVERY = 6 * 3600  # one view a person per 6h
 DONE_AT = 0.95          # watched this far, a video is finished
+_BACKDATED = "-2 days"  # published this long before it arrived: imported, not news
 
 
 def _error(status: int, message: str) -> JSONResponse:
@@ -79,11 +95,51 @@ def _even(n: float) -> int:
     return max(2, int(round(n / 2)) * 2)
 
 
+# ── When it came out ──
+
+def parse_published(raw) -> str | None:
+    """A published date as the site or the importer sends it (2019-03-03,
+    2019-03-03T14:05[:00][Z|+01:00], yt-dlp's 20190303, or unix seconds) as
+    the database keeps times ('YYYY-MM-DD HH:MM:SS', UTC); None when blank.
+    A bare date is noon UTC, so it's that day almost anywhere. Raises
+    ValueError with a message for the uploader."""
+    s = str(raw if raw is not None else "").strip()
+    if not s:
+        return None
+    try:
+        if re.fullmatch(r"\d{8}", s):
+            dt = datetime.strptime(s + "12", "%Y%m%d%H").replace(tzinfo=timezone.utc)
+        elif re.fullmatch(r"\d{9,11}(?:\.\d+)?", s):
+            dt = datetime.fromtimestamp(float(s), timezone.utc)
+        elif re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
+            dt = datetime.fromisoformat(s + "T12:00:00+00:00")
+        else:
+            dt = datetime.fromisoformat(s.replace(" ", "T").replace("z", "Z").replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+    except (ValueError, OverflowError, OSError):
+        raise ValueError("that isn't a date")
+    dt = dt.astimezone(timezone.utc)
+    if dt > datetime.now(timezone.utc) + timedelta(minutes=1):
+        raise ValueError("a video can't come out in the future")
+    if dt.year < 1970:
+        raise ValueError("that date's too long ago")
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+
 # ── Reading a file: ffprobe ──
 
+def _rate(s) -> float:
+    try:
+        n, _, d = str(s or "0").partition("/")
+        return float(n) / float(d or 1) if float(d or 1) else 0.0
+    except (TypeError, ValueError, ZeroDivisionError):
+        return 0.0
+
+
 def probe(path: str) -> dict | None:
-    """The first video stream's shown size (after rotation), the length and
-    whether there's sound; None when there's no video in it."""
+    """The first video stream's shown size (after rotation), the length,
+    frame rate, codecs, colour and the sound; None when there's no video."""
     try:
         out = subprocess.run(
             ["ffprobe", "-v", "error", "-print_format", "json", "-show_streams", "-show_format", path],
@@ -111,8 +167,9 @@ def probe(path: str) -> dict | None:
                 pass
     if abs(rotation) % 180 == 90:
         w, h = h, w
+    fmt = info.get("format") or {}
     duration = None
-    for src in (info.get("format") or {}, video):
+    for src in (fmt, video):
         try:
             d = float(src.get("duration") or 0)
         except (TypeError, ValueError):
@@ -120,20 +177,57 @@ def probe(path: str) -> dict | None:
         if d > 0:
             duration = d
             break
-    return {"width": w, "height": h, "duration": duration,
-            "audio": any(s.get("codec_type") == "audio" for s in streams)}
+    # The average rate is the honest one for variable-rate phone video
+    # (r_frame_rate is the container's tick, often 90000 or 120).
+    avg, real = _rate(video.get("avg_frame_rate")), _rate(video.get("r_frame_rate"))
+    fps = avg if 1 <= avg <= 1000 else (real if 1 <= real <= 1000 else 30.0)
+    audio = next((s for s in streams if s.get("codec_type") == "audio"), None)
+    try:
+        abr = int(audio.get("bit_rate") or 0) if audio else 0
+    except (TypeError, ValueError):
+        abr = 0
+    try:
+        bitrate = int(fmt.get("bit_rate") or 0)
+    except (TypeError, ValueError):
+        bitrate = 0
+    return {"width": w, "height": h, "duration": duration, "fps": round(fps, 3),
+            "fps_raw": video.get("avg_frame_rate") or "", "fps_nominal": round(real, 3),
+            "fps_nominal_raw": video.get("r_frame_rate") or "", "vfr": bool(avg and real and abs(avg - real) > 0.5),
+            "vcodec": video.get("codec_name") or "", "pix_fmt": video.get("pix_fmt") or "",
+            "hdr": (video.get("color_transfer") or "") in _HDR_TRANSFERS,
+            "bitrate": bitrate, "audio": audio is not None,
+            "acodec": (audio or {}).get("codec_name") or "", "achannels": int((audio or {}).get("channels") or 0),
+            "abitrate": abr}
 
 
-def _rungs(w: int, h: int) -> list[dict]:
-    """The ladder for a w x h picture: each rung's size and bitrates."""
+def _out_fps(info: dict) -> tuple[str, float]:
+    """The ladder's frame rate: the source's own (as ffmpeg's rational, so
+    29.97 stays 30000/1001), capped at 60."""
+    fps = info["fps"]
+    if info.get("vfr") and 1 <= info.get("fps_nominal", 0) <= MAX_FPS + 0.5:
+        # A variable-rate phone video: its nominal rate (30, 60), so motion
+        # keeps its timing; slow stretches repeat frames.
+        return info["fps_nominal_raw"], info["fps_nominal"]
+    if fps > MAX_FPS + 0.5:
+        return str(MAX_FPS), float(MAX_FPS)
+    raw = info.get("fps_raw") or ""
+    if re.fullmatch(r"\d{1,7}/\d{1,7}", raw) and abs(_rate(raw) - fps) < 0.01:
+        return raw, fps
+    return f"{fps:.3f}", fps
+
+
+def _rungs(w: int, h: int, fps: float = 30.0) -> list[dict]:
+    """The ladder for a w x h picture: each rung's size, frame rate and
+    bitrate ceiling."""
     short = min(w, h)
-    picked = [(p, kbps) for p, kbps in _LADDER if p <= short]
+    high = fps > 30.5
+    picked = [(p, hi if high else lo) for p, lo, hi in _LADDER if p <= short]
     if not picked:
-        picked = [(short, 500)]
+        picked = [(_even(short), 800)]
     out = []
     for p, kbps in picked:
         scale = p / short
-        out.append({"p": p, "w": _even(w * scale), "h": _even(h * scale), "kbps": kbps})
+        out.append({"p": p, "w": _even(w * scale), "h": _even(h * scale), "kbps": kbps, "fps": round(fps, 3)})
     return out
 
 
@@ -157,9 +251,9 @@ def _die_with_us() -> None:
         pass
 
 
-def _run(cmd: list[str], post_id: int, duration: float | None, lo: float, hi: float) -> None:
-    """ffmpeg, writing how far it's got into the row (lo..hi of the whole
-    job) at most every 2s. Raises RuntimeError with its last words."""
+def _run(cmd: list[str], duration: float | None, lo: float, hi: float, report=None) -> None:
+    """ffmpeg, telling report() how far it's got (lo..hi of the whole job)
+    at most every 2s. Raises RuntimeError with its last words."""
     proc = subprocess.Popen(cmd + ["-progress", "pipe:1", "-nostats"], stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, text=True, preexec_fn=_die_with_us)
     tail: list[str] = []
@@ -173,34 +267,64 @@ def _run(cmd: list[str], post_id: int, duration: float | None, lo: float, hi: fl
     last = 0.0
     for line in proc.stdout:
         key, _, value = line.strip().partition("=")
-        if key == "out_time_us" and duration and value.isdigit():
+        if report and key == "out_time_us" and duration and value.isdigit():
             now = time.monotonic()
             if now - last >= 2:
                 last = now
-                done = min(1.0, int(value) / 1e6 / duration)
-                _set(post_id, progress=round(lo + (hi - lo) * done, 3))
+                report(round(lo + (hi - lo) * min(1.0, int(value) / 1e6 / duration), 3))
     proc.wait()
     t.join(timeout=5)
     if proc.returncode != 0:
         raise RuntimeError(" / ".join(l for l in tail[-3:] if l) or f"ffmpeg exited {proc.returncode}")
 
 
-def _ladder_cmd(src: str, out: str, rungs: list[dict], audio: bool) -> list[str]:
+_zscale: bool | None = None
+
+
+def _has_zscale() -> bool:
+    global _zscale
+    if _zscale is None:
+        try:
+            out = subprocess.run(["ffmpeg", "-hide_banner", "-filters"], capture_output=True, text=True, timeout=30).stdout
+            _zscale = bool(re.search(r"\szscale\s", out)) and bool(re.search(r"\stonemap\s", out))
+        except (subprocess.SubprocessError, OSError):
+            _zscale = False
+    return _zscale
+
+
+def _ladder_cmd(src: str, out: str, rungs: list[dict], info: dict) -> list[str]:
     n = len(rungs)
-    split = f"[0:v]split={n}" + "".join(f"[s{i}]" for i in range(n))
-    chains = [split] + [f"[s{i}]scale={r['w']}:{r['h']}:flags=lanczos,format=yuv420p[v{i}]" for i, r in enumerate(rungs)]
+    rate, _ = _out_fps(info)
+    # One frame rate for every rung (the source's, or 60 above that; a
+    # variable-rate phone video comes out constant at its average), and
+    # HDR brought to SDR once, before the split, so it isn't washed out.
+    pre = [f"fps={rate}"]
+    if info.get("hdr"):
+        if _has_zscale():
+            pre += ["zscale=t=linear:npl=100", "format=gbrpf32le", "zscale=p=bt709",
+                    "tonemap=tonemap=hable:desat=0", "zscale=t=bt709:m=bt709:r=tv"]
+        else:
+            print("videos: an HDR source, and this ffmpeg has no zscale: the ladder will look washed out")
+    chains = [f"[0:v]{','.join(pre)},split={n}" + "".join(f"[s{i}]" for i in range(n))]
+    chains += [f"[s{i}]scale={r['w']}:{r['h']}:flags=lanczos,format=yuv420p[v{i}]" for i, r in enumerate(rungs)]
     cmd = ["ffmpeg", "-hide_banner", "-y", "-i", src, "-filter_complex", ";".join(chains)]
-    for i, r in enumerate(rungs):
+    audio = info["audio"]
+    for i in range(n):
         cmd += ["-map", f"[v{i}]"]
         if audio:
             cmd += ["-map", "0:a:0"]
-    cmd += ["-c:v", "libx264", "-preset", VIDEO_PRESET, "-profile:v", "high",
+    cmd += ["-c:v", "libx264", "-preset", VIDEO_PRESET, "-crf", str(VIDEO_CRF), "-profile:v", "high",
             "-force_key_frames", f"expr:gte(t,n_forced*{SEGMENT})", "-sc_threshold", "0"]
+    if info.get("hdr"):
+        cmd += ["-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709"]
     for i, r in enumerate(rungs):
-        cmd += [f"-b:v:{i}", f"{r['kbps']}k", f"-maxrate:v:{i}", f"{int(r['kbps'] * 1.5)}k",
-                f"-bufsize:v:{i}", f"{r['kbps'] * 2}k"]
+        cmd += [f"-maxrate:v:{i}", f"{r['kbps']}k", f"-bufsize:v:{i}", f"{r['kbps'] * 2}k"]
     if audio:
-        cmd += ["-c:a", "aac", "-b:a", "128k", "-ac", "2", "-ar", "48000"]
+        # Already AAC stereo at a sane rate: kept as it is.
+        if info["acodec"] == "aac" and info["achannels"] in (1, 2) and 0 < info["abitrate"] <= 256000:
+            cmd += ["-c:a", "copy"]
+        else:
+            cmd += ["-c:a", "aac", "-b:a", f"{VIDEO_AUDIO_KBPS}k", "-ac", "2", "-ar", "48000"]
     stream_map = " ".join(f"v:{i},a:{i}" if audio else f"v:{i}" for i in range(n))
     cmd += ["-f", "hls", "-hls_time", str(SEGMENT), "-hls_playlist_type", "vod",
             "-hls_segment_type", "fmp4", "-hls_fmp4_init_filename", "init.mp4",
@@ -211,13 +335,56 @@ def _ladder_cmd(src: str, out: str, rungs: list[dict], audio: bool) -> list[str]
     return cmd
 
 
-def _stills(src: str, out: str, post_id: int, duration: float | None, w: int, h: int) -> dict:
-    """The posters (1280 and 480 wide, at 10% in) and the storyboard."""
+def _fix_master(out: str, rungs: list[dict]) -> None:
+    """ffmpeg's master playlist leaves FRAME-RATE out (and RESOLUTION, with
+    some versions): put them in, so players can say 1080p60."""
+    path = os.path.join(out, "master.m3u8")
+    try:
+        lines = open(path, encoding="utf-8").read().splitlines()
+    except OSError:
+        return
+    fixed, k = [], 0
+    for line in lines:
+        if line.startswith("#EXT-X-STREAM-INF:") and k < len(rungs):
+            r = rungs[k]
+            k += 1
+            if "RESOLUTION=" not in line:
+                line += f",RESOLUTION={r['w']}x{r['h']}"
+            if "FRAME-RATE=" not in line:
+                line += f",FRAME-RATE={r['fps']:.3f}"
+        fixed.append(line)
+    tmp = path + ".partial"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write("\n".join(fixed) + "\n")
+    os.replace(tmp, path)
+
+
+def _poster_files(img, folder: str, stem: str) -> None:
+    """A picture as the two poster files (1280 and 480 wide)."""
+    from PIL import Image
+    for size, width in (("l", 1280), ("s", 480)):
+        im = img.copy()
+        if im.width > width:
+            im = im.resize((width, max(1, round(im.height * width / im.width))), Image.LANCZOS)
+        im.save(os.path.join(folder, f"{stem}-{size}.jpg"), "JPEG", quality=85, optimize=True, progressive=True)
+
+
+def _stills(src: str, out: str, duration: float | None, w: int, h: int, report=None) -> dict:
+    """The posters (1280 and 480 wide, at 10% in, or from thumb.* when the
+    video came with one: the importer's YouTube thumbnail) and the
+    storyboard."""
     at = (duration or 0) * 0.1
     for name, width in (("poster-l.jpg", 1280), ("poster-s.jpg", 480)):
         subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-ss", f"{at:.2f}", "-i", src,
                         "-frames:v", "1", "-vf", f"scale={min(width, _even(w))}:-2", "-q:v", "3",
                         os.path.join(out, name)], check=True, timeout=300)
+    thumb = next((n for n in os.listdir(out) if n.startswith("thumb.")), None)
+    if thumb:
+        try:
+            from PIL import Image, ImageOps
+            _poster_files(ImageOps.exif_transpose(Image.open(os.path.join(out, thumb))).convert("RGB"), out, "poster")
+        except Exception as e:  # noqa: BLE001 — the frame at 10% will do
+            print(f"videos: couldn't use {thumb} as the poster: {e}")
     if not duration:
         return {}
     interval = max(2.0, duration / 100)
@@ -227,8 +394,76 @@ def _stills(src: str, out: str, post_id: int, duration: float | None, w: int, h:
     tw, th = 160, _even(160 * h / w)
     _run(["ffmpeg", "-hide_banner", "-y", "-i", src, "-vf",
           f"fps=1/{interval:.4f},scale={tw}:{th},tile={cols}x{rows}", "-frames:v", "1", "-q:v", "5",
-          os.path.join(out, "storyboard.jpg")], post_id, duration, 0.9, 1.0)
+          os.path.join(out, "storyboard.jpg")], duration, 0.9, 1.0, report)
     return {"cols": cols, "rows": rows, "w": tw, "h": th, "interval": round(interval, 3), "count": count}
+
+
+def make_original(src: str, out: str, info: dict) -> dict | None:
+    """The Original quality: the upload remuxed into an mp4 a browser plays
+    straight (original.mp4, moov first), with no re-encode, when its
+    codecs are ones browsers know; None otherwise (the ladder's top rung is
+    then the best on offer, rather than transcoding a huge lossless file).
+    HDR stays HDR."""
+    if info["vcodec"] not in _DIRECT_VIDEO or (info["audio"] and info["acodec"] not in _DIRECT_AUDIO):
+        return None
+    dest = os.path.join(out, "original.mp4")
+    tmp = dest + ".partial"
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", src, "-map", "0:v:0"]
+    if info["audio"]:
+        cmd += ["-map", "0:a:0"]
+    cmd += ["-c", "copy", "-movflags", "+faststart", "-map_metadata", "-1"]
+    if info["vcodec"] == "hevc":
+        cmd += ["-tag:v", "hvc1"]  # Safari's name for it
+    cmd += ["-f", "mp4", tmp]
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, timeout=3600, preexec_fn=_die_with_us)
+        os.replace(tmp, dest)
+    except (subprocess.SubprocessError, OSError) as e:
+        print(f"videos: no Original for {src}: {e}")
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return None
+    size = os.path.getsize(dest)
+    rate = info["bitrate"] or (round(size * 8 / info["duration"]) if info["duration"] else 0)
+    return {"width": info["width"], "height": info["height"], "fps": info["fps"], "codec": info["vcodec"],
+            "bitrate": rate, "size": size, "hdr": bool(info.get("hdr"))}
+
+
+def _keep(name: str, ext: str) -> bool:
+    """What a fresh build of a folder leaves: the upload and its thumbnail."""
+    return name == f"source.{ext}" or name.startswith("thumb.")
+
+
+def build(post_id: int, folder: str, ext: str, report=None) -> dict:
+    """The whole job in a folder holding source.<ext> (and maybe thumb.*):
+    the ladder, the posters, the storyboard and the Original. Returns the
+    video row's new columns; raises on failure."""
+    src = os.path.join(folder, f"source.{ext}")
+    info = probe(src)
+    if info is None:
+        raise RuntimeError("couldn't find a video in that file")
+    rungs = _rungs(info["width"], info["height"], _out_fps(info)[1])
+    # A restart mid-job leaves half a ladder: start it clean.
+    for name in os.listdir(folder):
+        if not _keep(name, ext):
+            p = os.path.join(folder, name)
+            if os.path.isdir(p):
+                shutil.rmtree(p)
+            else:
+                os.remove(p)
+    for i in range(len(rungs)):
+        os.makedirs(os.path.join(folder, f"v{i}"), exist_ok=True)
+    if report:
+        report(0.0)
+    _run(_ladder_cmd(src, folder, rungs, info), info["duration"], 0.0, 0.85, report)
+    _fix_master(folder, rungs)
+    original = make_original(src, folder, info)
+    board = _stills(src, folder, info["duration"], info["width"], info["height"], report)
+    return {"width": info["width"], "height": info["height"], "duration": info["duration"],
+            "rungs": json.dumps(rungs), "storyboard": json.dumps(board) if board else "",
+            "original": json.dumps(original) if original else ""}
 
 
 def _transcode(post_id: int) -> None:
@@ -236,28 +471,9 @@ def _transcode(post_id: int) -> None:
         row = db.execute("SELECT * FROM videos WHERE post_id=?", (post_id,)).fetchone()
     if row is None or row["status"] != "processing":
         return
-    folder = _folder(row["file_id"])
-    src = os.path.join(folder, f"source.{row['ext']}")
     try:
-        info = probe(src)
-        if info is None:
-            raise RuntimeError("couldn't find a video in that file")
-        rungs = _rungs(info["width"], info["height"])
-        # A restart mid-job leaves half a ladder: start it clean.
-        for name in os.listdir(folder):
-            if name != f"source.{row['ext']}":
-                p = os.path.join(folder, name)
-                if os.path.isdir(p):
-                    shutil.rmtree(p)
-                else:
-                    os.remove(p)
-        for i in range(len(rungs)):
-            os.makedirs(os.path.join(folder, f"v{i}"), exist_ok=True)
-        _set(post_id, progress=0, width=info["width"], height=info["height"], duration=info["duration"])
-        _run(_ladder_cmd(src, folder, rungs, info["audio"]), post_id, info["duration"], 0.0, 0.9)
-        board = _stills(src, folder, post_id, info["duration"], info["width"], info["height"])
-        _set(post_id, status="ready", progress=1, error="", rungs=json.dumps(rungs),
-             storyboard=json.dumps(board) if board else "", poster=row["poster"] or "poster")
+        cols = build(post_id, _folder(row["file_id"]), row["ext"], lambda f: _set(post_id, progress=f))
+        _set(post_id, status="ready", progress=1, error="", poster=row["poster"] or "poster", **cols)
     except Exception as e:  # noqa: BLE001 — anything at all fails the video, not the worker
         msg = str(e) or e.__class__.__name__
         print(f"video {post_id}: {msg}")
@@ -265,38 +481,120 @@ def _transcode(post_id: int) -> None:
             _set(post_id, status="failed", error=msg[:300])
 
 
+def rebuild(post_id: int, log=print) -> bool:
+    """Makes a ready video's ladder again from its kept upload (a better
+    encoder, a new rung), in a new folder under a new file id while the old
+    one keeps playing, then swaps the row over and drops the old folder.
+    File URLs are immutable, so a new folder is the only safe swap."""
+    with get_db() as db:
+        row = db.execute("SELECT * FROM videos WHERE post_id=?", (post_id,)).fetchone()
+    if row is None:
+        log(f"video {post_id}: not found")
+        return False
+    old = _folder(row["file_id"])
+    src = os.path.join(old, f"source.{row['ext']}")
+    if not os.path.isfile(src):
+        log(f"video {post_id}: its upload isn't there any more ({src})")
+        return False
+    new_id = secrets.token_urlsafe(12)
+    new = _folder(new_id)
+    os.makedirs(new, exist_ok=True)
+    try:
+        # The upload, its thumbnail and a custom poster come along (hard
+        # links where the share allows, so nothing big is copied).
+        stem = row["poster"] or "poster"
+        for name in os.listdir(old):
+            if _keep(name, row["ext"]) or (stem != "poster" and name.startswith(stem + "-")):
+                try:
+                    os.link(os.path.join(old, name), os.path.join(new, name))
+                except OSError:
+                    shutil.copy2(os.path.join(old, name), os.path.join(new, name))
+        started = time.monotonic()
+        cols = build(post_id, new, row["ext"])
+        # build() cleared everything but the upload: the custom poster again.
+        if stem != "poster":
+            for size in ("l", "s"):
+                p = os.path.join(old, f"{stem}-{size}.jpg")
+                if os.path.isfile(p):
+                    shutil.copy2(p, os.path.join(new, f"{stem}-{size}.jpg"))
+    except Exception as e:  # noqa: BLE001
+        shutil.rmtree(new, ignore_errors=True)
+        log(f"video {post_id}: {e}")
+        return False
+    with get_db() as db:
+        cur = db.execute("SELECT file_id FROM videos WHERE post_id=?", (post_id,)).fetchone()
+        if cur is None or cur["file_id"] != row["file_id"]:
+            db.rollback()
+            shutil.rmtree(new, ignore_errors=True)
+            log(f"video {post_id}: changed while it was being made; left as it was")
+            return False
+        keys = ", ".join(f"{k}=?" for k in cols)
+        db.execute(f"UPDATE videos SET file_id=?, status='ready', progress=1, error='', {keys}, updated=datetime('now') WHERE post_id=?",
+                   (new_id, *cols.values(), post_id))
+        db.commit()
+    _remove_folder(row["file_id"])
+    rungs = ", ".join(f"{r['p']}p{round(r['fps']) if r['fps'] > 30.5 else ''}" for r in json.loads(cols["rungs"]))
+    log(f"video {post_id}: rebuilt in {time.monotonic() - started:.0f}s ({rungs}{', Original' if cols['original'] else ''})")
+    return True
+
+
 def _exists(post_id: int) -> bool:
     with get_db() as db:
         return db.execute("SELECT 1 FROM videos WHERE post_id=?", (post_id,)).fetchone() is not None
 
 
+def _waiting() -> list[int]:
+    with get_db() as db:
+        return [r[0] for r in db.execute("SELECT post_id FROM videos WHERE status='processing' ORDER BY post_id")]
+
+
 def _work() -> None:
     while True:
-        post_id = _jobs.get()
+        try:
+            post_id = _jobs.get(timeout=_POLL)
+        except queue.Empty:
+            # Videos queued by another process (the importer writes rows and
+            # leaves the making to this one).
+            try:
+                for pid in _waiting():
+                    _enqueue(pid)
+            except Exception as e:  # noqa: BLE001
+                print(f"videos: couldn't look for queued videos: {e}")
+            continue
         try:
             _transcode(post_id)
         finally:
+            with _worker_lock:
+                _queued.discard(post_id)
             _jobs.task_done()
 
 
-def _enqueue(post_id: int) -> None:
+def _start_worker() -> None:
     global _worker
     with _worker_lock:
         if _worker is None or not _worker.is_alive():
             _worker = threading.Thread(target=_work, name="video-transcode", daemon=True)
             _worker.start()
+
+
+def _enqueue(post_id: int) -> None:
+    _start_worker()
+    with _worker_lock:
+        if post_id in _queued:
+            return
+        _queued.add(post_id)
     _jobs.put(post_id)
 
 
 def resume_jobs() -> None:
-    """At startup: videos a restart interrupted (or that were still queued)."""
+    """At startup: videos a restart interrupted (or that were still queued),
+    and the worker that keeps an eye out for more."""
     if not shutil.which("ffmpeg"):
         print("videos: ffmpeg isn't installed; uploads will wait")
         return
-    with get_db() as db:
-        ids = [r[0] for r in db.execute("SELECT post_id FROM videos WHERE status='processing' ORDER BY post_id")]
-    for post_id in ids:
+    for post_id in _waiting():
         _enqueue(post_id)
+    _start_worker()
 
 
 # ── The JSON ──
@@ -319,8 +617,16 @@ def _urls(r) -> dict:
             board = {"url": f"{base}/storyboard.jpg", **json.loads(r["storyboard"])}
         except ValueError:
             board = None
+    original = None
+    # Rows that don't select it (other routers' own queries) just have none.
+    if ready and "original" in r.keys() and r["original"]:
+        try:
+            original = {"url": f"{base}/original.mp4", **json.loads(r["original"])}
+        except ValueError:
+            original = None
     return {
         "hls": f"{base}/master.m3u8" if ready else None,
+        "original": original,
         "poster": f"{base}/{stem}-l.jpg" if ready else None,
         "posterSmall": f"{base}/{stem}-s.jpg" if ready else None,
         "storyboard": board,
@@ -338,7 +644,7 @@ def _json_many(db, rows, request: Request, username: str) -> list[dict]:
     admin = is_admin(get_groups(request))
     return [{
         "id": r["post_id"], "title": r["title"], "description": r["text"], "username": r["username"],
-        "created": r["created"], "duration": r["duration"], "width": r["width"], "height": r["height"],
+        "created": r["created"], "published": r["published"] or r["created"], "duration": r["duration"], "width": r["width"], "height": r["height"],
         "status": r["status"], "progress": r["progress"], "error": r["error"] or None,
         **_urls(r),
         "views": r["views"], "reactions": reactions.get(r["post_id"], {}), "reply_count": replies.get(r["post_id"], 0),
@@ -355,13 +661,14 @@ def _one(db, post_id: int, request: Request, username: str) -> dict | None:
 
 def card(db, post_id: int) -> dict | None:
     """A video as a feed post shows it (routers/posts.py), or None if it's gone."""
-    r = db.execute("""SELECT v.post_id, v.title, v.file_id, v.status, v.poster, v.storyboard, v.duration, p.username
+    r = db.execute("""SELECT v.post_id, v.title, v.file_id, v.status, v.poster, v.storyboard, v.original, v.duration,
+                             v.published, p.username
                       FROM videos v JOIN posts p ON p.id = v.post_id WHERE v.post_id=?""", (post_id,)).fetchone()
     if r is None:
         return None
     u = _urls(r)
     return {"id": r["post_id"], "title": r["title"], "poster": u["poster"], "posterSmall": u["posterSmall"],
-            "duration": r["duration"], "username": r["username"], "status": r["status"]}
+            "duration": r["duration"], "username": r["username"], "status": r["status"], "published": r["published"]}
 
 
 # ── Routes ──
@@ -396,10 +703,21 @@ def _save_upload(file: UploadFile) -> tuple[str, str, int] | JSONResponse:
     return file_id, ext, size
 
 
-def create(request: Request, username: str, file: UploadFile, title: str, description: str, unlisted: bool = False) -> int | JSONResponse:
+def create(request: Request | None, username: str, file, title: str, description: str, unlisted: bool = False,
+           published: str | None = None, source_id: str = "", thumb: str | None = None,
+           queue_it: bool = True) -> int | JSONResponse:
     """An upload made into a video and queued for ffmpeg: its post id. An
     unlisted one (uploaded straight into a TV channel, routers/tv.py) is
-    left out of Videos' lists."""
+    left out of Videos' lists. file is an UploadFile, or anything with
+    .filename and .file (the importer's own files). published: when it
+    came out (parse_published; blank is now). source_id: the YouTube id it
+    was imported from. thumb: a picture file to make the poster from. With
+    queue_it False (the importer, another process) the row is left
+    processing for this server's worker to find."""
+    try:
+        published = parse_published(published)
+    except ValueError as e:
+        return _error(400, str(e))
     if not media_ready():
         return _error(503, "storage is offline")
     if not shutil.which("ffmpeg"):
@@ -415,23 +733,33 @@ def create(request: Request, username: str, file: UploadFile, title: str, descri
     if info is None:
         _remove_folder(file_id)
         return _error(400, "couldn't find a video in that file")
+    if thumb:
+        t_ext = os.path.splitext(thumb)[1][1:].lower()
+        if t_ext in ("jpg", "jpeg", "png", "webp"):
+            try:
+                shutil.copyfile(thumb, os.path.join(_folder(file_id), f"thumb.{t_ext}"))
+            except OSError as e:
+                print(f"videos: couldn't keep the thumbnail {thumb}: {e}")
     with get_db() as db:
         cur = db.execute("INSERT INTO posts(username, text, kind) VALUES (?, ?, 'video')", (username, description.strip()))
         post_id = cur.lastrowid
-        db.execute("""INSERT INTO videos(post_id, title, file_id, ext, duration, width, height, size, unlisted)
-                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                   (post_id, title, file_id, ext, info["duration"], info["width"], info["height"], size, 1 if unlisted else 0))
+        db.execute("""INSERT INTO videos(post_id, title, file_id, ext, duration, width, height, size, unlisted, published, source_id)
+                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, datetime('now')), ?)""",
+                   (post_id, title, file_id, ext, info["duration"], info["width"], info["height"], size, 1 if unlisted else 0,
+                    published, source_id))
         db.commit()
-    _enqueue(post_id)
+    if queue_it:
+        _enqueue(post_id)
     return post_id
 
 
 @router.post(BASE)
-def upload(request: Request, file: UploadFile = File(...), title: str = Form(""), description: str = Form("")):
+def upload(request: Request, file: UploadFile = File(...), title: str = Form(""), description: str = Form(""),
+           published: str = Form("")):
     username = _signed_in(request)
     if not username:
         return _error(401, "not authenticated")
-    post_id = create(request, username, file, title, description)
+    post_id = create(request, username, file, title, description, published=published)
     if isinstance(post_id, JSONResponse):
         return post_id
     with get_db() as db:
@@ -441,9 +769,10 @@ def upload(request: Request, file: UploadFile = File(...), title: str = Form("")
 @router.get(BASE)
 def list_videos(request: Request, limit: int = 24, before_id: int | None = None, offset: int = 0,
                 user: str = "", sort: str = "new", q: str = ""):
-    """Newest first (before_id pages back), or the most watched (offset
-    pages). Other people's only once they're ready; yours always, so you
-    can see yours being made."""
+    """Newest first by when each came out (published; before_id pages back
+    from that video), oldest first (sort=old, before_id pages on), or the
+    most watched (offset pages). Other people's only once they're ready;
+    yours always, so you can see yours being made."""
     username = _signed_in(request)
     if not username:
         return _error(401, "not authenticated")
@@ -461,10 +790,20 @@ def list_videos(request: Request, limit: int = 24, before_id: int | None = None,
             rows = db.execute(f"""SELECT {_COLS} FROM videos v JOIN posts p ON p.id = v.post_id WHERE {cond}
                                   ORDER BY views DESC, v.post_id DESC LIMIT ? OFFSET ?""", (*args, limit, max(0, offset))).fetchall()
         else:
-            page = cond + (" AND v.post_id < ?" if before_id is not None else "")
+            old = sort == "old"
+            page, more = cond, []
+            if before_id is not None:
+                at = db.execute("SELECT published FROM videos WHERE post_id=?", (before_id,)).fetchone()
+                if at is not None:
+                    page += f" AND (v.published, v.post_id) {'>' if old else '<'} (?, ?)"
+                    more = [at["published"], before_id]
+                elif not old:
+                    page += " AND v.post_id < ?"
+                    more = [before_id]
+            way = "ASC" if old else "DESC"
             rows = db.execute(f"""SELECT {_COLS} FROM videos v JOIN posts p ON p.id = v.post_id WHERE {page}
-                                  ORDER BY v.post_id DESC LIMIT ?""",
-                              (*args, *([before_id] if before_id is not None else []), limit)).fetchall()
+                                  ORDER BY v.published {way}, v.post_id {way} LIMIT ? OFFSET ?""",
+                              (*args, *more, limit, max(0, offset) if before_id is None else 0)).fetchall()
         return {"videos": _json_many(db, rows, request, username), "total": total}
 
 
@@ -527,6 +866,13 @@ async def edit_video(post_id: int, request: Request):
             if len(desc) > VIDEO_DESC_MAX_CHARS:
                 return _error(400, f"a description can be up to {VIDEO_DESC_MAX_CHARS:,} characters")
             db.execute("UPDATE posts SET text=? WHERE id=?", (desc, post_id))
+        if "published" in body:
+            try:
+                published = parse_published(body["published"])
+            except ValueError as e:
+                return _error(400, str(e))
+            if published:
+                db.execute("UPDATE videos SET published=?, updated=datetime('now') WHERE post_id=?", (published, post_id))
         db.commit()
         return _one(db, post_id, request, username)
 
@@ -555,11 +901,7 @@ def upload_poster(post_id: int, request: Request, file: UploadFile = File(...)):
         return _error(400, "that isn't an image")
     stem = "poster" + secrets.token_hex(4)
     folder = _folder(row["file_id"])
-    for size, width in (("l", 1280), ("s", 480)):
-        im = img.copy()
-        if im.width > width:
-            im = im.resize((width, max(1, round(im.height * width / im.width))), Image.LANCZOS)
-        im.save(os.path.join(folder, f"{stem}-{size}.jpg"), "JPEG", quality=85, optimize=True, progressive=True)
+    _poster_files(img, folder, stem)
     old = row["poster"]
     _set(post_id, poster=stem)
     if old and old != "poster":
@@ -580,6 +922,7 @@ def delete_files_for(post_id: int, db) -> str | None:
     db.execute("DELETE FROM video_progress WHERE post_id=?", (post_id,))
     db.execute("DELETE FROM video_views WHERE post_id=?", (post_id,))
     db.execute("DELETE FROM tv_items WHERE video_id=?", (post_id,))
+    db.execute("DELETE FROM video_playlist_items WHERE video_id=?", (post_id,))
     return r["file_id"] if r else None
 
 

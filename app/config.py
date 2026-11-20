@@ -86,8 +86,14 @@ PLAYLIST_COVER_MAX_MB   = int(os.environ.get("PLAYLIST_COVER_MAX_MB", "20"))
 VIDEO_MAX_MB          = int(os.environ.get("VIDEO_MAX_MB", "4096"))
 VIDEO_TITLE_MAX_CHARS = int(os.environ.get("VIDEO_TITLE_MAX_CHARS", "100"))
 VIDEO_DESC_MAX_CHARS  = int(os.environ.get("VIDEO_DESC_MAX_CHARS", "5000"))
-# x264's preset: slower is smaller files for the same look, and more CPU.
-VIDEO_PRESET          = os.environ.get("VIDEO_PRESET", "veryfast").strip() or "veryfast"
+# x264's preset: slower is smaller files for the same look, and more CPU
+# (`slow` is better still if the CPU keeps up with the uploads).
+VIDEO_PRESET          = os.environ.get("VIDEO_PRESET", "medium").strip() or "medium"
+# x264's constant quality (lower is better and bigger; 18 looks like the
+# source to most eyes). Each rung also has a bitrate ceiling (videos.py).
+VIDEO_CRF             = int(os.environ.get("VIDEO_CRF", "18"))
+# The ladder's audio when the source's isn't already AAC stereo.
+VIDEO_AUDIO_KBPS      = int(os.environ.get("VIDEO_AUDIO_KBPS", "192"))
 
 # ── Voice (drop-in channels on a self-hosted LiveKit server) ──
 # LIVEKIT_URL is what browsers connect to (wss://voice.klab.gg, through
