@@ -9,7 +9,7 @@ from fastapi.responses import JSONResponse
 from ..auth import get_username
 from ..config import AWAY_AFTER, PRESENCE_TTL
 from ..db import get_db
-from . import listens, session
+from . import listens, rooms, session
 
 router = APIRouter()
 
@@ -284,6 +284,9 @@ def get_presence(request: Request):
             # The TV channel they're watching (routers/tv.py), from the
             # device they used last.
             "tv":        latest[r["username"]].get("tv") or None,
+            # The watch party they're in ({id, title}, routers/rooms.py):
+            # the room knows its members, so no beat needs to say it.
+            "room":      rooms.room_of(r["username"]),
             # Where in klabnet (the page of the device they used last) and
             # the status they set.
             "where":     latest[r["username"]].get("where") or None,

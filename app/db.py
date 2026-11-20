@@ -391,6 +391,32 @@ CREATE TABLE IF NOT EXISTS lyrics_cache (
     body    TEXT NOT NULL DEFAULT '',
     checked TEXT NOT NULL DEFAULT (datetime('now'))
 );
+-- This week on klabnet (routers/week.py): reactions to a line of a week
+-- and replies under it. week is that week's Monday (YYYY-MM-DD), line the
+-- line's key ("song", "found", "videos"...). about: the people the line
+-- was about when this was added (",alice,bob,"), and label what the line
+-- is ("most played song"), for the recap.
+CREATE TABLE IF NOT EXISTS week_reactions (
+    week     TEXT NOT NULL,
+    line     TEXT NOT NULL,
+    username TEXT NOT NULL,
+    emoji    TEXT NOT NULL,
+    about    TEXT NOT NULL DEFAULT '',
+    label    TEXT NOT NULL DEFAULT '',
+    created  TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (week, line, username, emoji)
+);
+CREATE TABLE IF NOT EXISTS week_replies (
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    week     TEXT NOT NULL,
+    line     TEXT NOT NULL,
+    username TEXT NOT NULL,
+    text     TEXT NOT NULL,
+    about    TEXT NOT NULL DEFAULT '',
+    label    TEXT NOT NULL DEFAULT '',
+    created  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS week_replies_by_line ON week_replies(week, line, id);
 """
 
 

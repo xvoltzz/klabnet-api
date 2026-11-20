@@ -21,6 +21,7 @@ from fastapi.responses import JSONResponse
 
 from ..auth import get_username
 from ..db import get_db
+from . import week
 
 router = APIRouter()
 
@@ -139,6 +140,8 @@ def recap(request: Request, since: float = 0):
         stations = [{"id": r["id"], "name": r["name"], "who": r["author"] or r["owner"], "frequency": r["frequency"]} for r in db.execute(
             """SELECT id, name, owner, author, frequency FROM radio_stations WHERE owner != ? AND created > ?
                ORDER BY created DESC LIMIT 5""", (me, at))]
+        # Reactions and replies on This week's lines about you (routers/week.py).
+        items.extend(week.recap_items(db, me, at))
     items.sort(key=lambda i: i["at"], reverse=True)
     return {
         "since": since,
