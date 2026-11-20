@@ -234,6 +234,28 @@ the recap's and This week's "new videos", so an import doesn't flood them.
 The site plays it with hls.js (Safari natively). A video can be shared to the
 Feed (`POST /api/posts` with `video: {id, start?}`).
 
+
+### The studio
+
+`app/routers/studio.py`, for a video's owner or an admin (klabnet-web's
+js/43-studio.js). Nothing it does touches the upload.
+
+- **Edits** (`PUT /api/posts/videos/{id}/studio/edit`, `{edit}` or `{edit: null}`
+  to revert): what to keep, muted ranges, gain, crop and rotate, in the
+  upload's time. One edit renders at a time, on its own thread: the upload is
+  cut and filtered into an intermediate `original.mp4` (x264 CRF 14 at the
+  source's size and frame rate; HEVC 10-bit CRF 16 when the source is HDR and
+  the ffmpeg has libx265), then the normal ladder and stills, in a new folder
+  that's swapped in when it's done. The unedited ladder is kept in `base/` for
+  the editor's preview, with a waveform (`studio-wave.png`). An edit a restart
+  caught halfway is started again; `reencode_videos` makes an edited video
+  from its edit.
+- **Annotations, cards and the end screen** (`GET/PUT …/annotations`,
+  `…/cards`, `…/endscreen`; viewers read all three with `GET …/overlays`;
+  `POST …/cards/{card}/vote {option}` for polls), in the edited video's time.
+  Tables `video_annotations`, `video_cards`, `video_card_votes`,
+  `video_endscreen`, deleted with the video.
+
 ## Voice
 
 Drop-in voice channels (klabnet-web's `js/22-voice.js`). The audio runs

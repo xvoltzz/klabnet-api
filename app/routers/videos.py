@@ -501,6 +501,12 @@ def rebuild(post_id: int, log=print) -> bool:
     if row is None:
         log(f"video {post_id}: not found")
         return False
+    if "edit_live" in row.keys() and row["edit_live"]:
+        # An edited video is made from its edit (routers/studio.py), never
+        # from the upload alone.
+        from .studio import make
+        _set(post_id, render="queued")
+        return make(post_id, log)
     old = _folder(row["file_id"])
     src = os.path.join(old, f"source.{row['ext']}")
     if not os.path.isfile(src):
@@ -967,6 +973,8 @@ def delete_files_for(post_id: int, db) -> str | None:
     db.execute("DELETE FROM video_views WHERE post_id=?", (post_id,))
     db.execute("DELETE FROM tv_items WHERE video_id=?", (post_id,))
     db.execute("DELETE FROM video_playlist_items WHERE video_id=?", (post_id,))
+    from .studio import delete_for
+    delete_for(post_id, db)
     return r["file_id"] if r else None
 
 

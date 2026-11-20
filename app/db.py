@@ -468,6 +468,47 @@ CREATE TABLE IF NOT EXISTS week_replies (
     created  TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS week_replies_by_line ON week_replies(week, line, id);
+-- The video studio (routers/studio.py): annotations, cards and end
+-- screens, all in the edited timeline (seconds), positions as % of the
+-- frame. style/link/body/elements are JSON. A poll is a card (body:
+-- question, options); its votes are one row a person.
+CREATE TABLE IF NOT EXISTS video_annotations (
+    video_id INTEGER NOT NULL,
+    id       TEXT NOT NULL,
+    type     TEXT NOT NULL,
+    start    REAL NOT NULL,
+    "end"    REAL NOT NULL,
+    x        REAL NOT NULL,
+    y        REAL NOT NULL,
+    w        REAL NOT NULL,
+    h        REAL NOT NULL,
+    text     TEXT NOT NULL DEFAULT '',
+    style    TEXT NOT NULL DEFAULT '',
+    link     TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (video_id, id)
+);
+CREATE TABLE IF NOT EXISTS video_cards (
+    video_id INTEGER NOT NULL,
+    id       TEXT NOT NULL,
+    kind     TEXT NOT NULL,
+    at       REAL NOT NULL,
+    teaser   TEXT NOT NULL DEFAULT '',
+    body     TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (video_id, id)
+);
+CREATE TABLE IF NOT EXISTS video_card_votes (
+    video_id INTEGER NOT NULL,
+    card_id  TEXT NOT NULL,
+    username TEXT NOT NULL,
+    option   INTEGER NOT NULL,
+    at       TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (video_id, card_id, username)
+);
+CREATE TABLE IF NOT EXISTS video_endscreen (
+    video_id     INTEGER PRIMARY KEY,
+    start_offset REAL NOT NULL,
+    elements     TEXT NOT NULL DEFAULT '[]'
+);
 """
 
 
@@ -561,6 +602,15 @@ def init_db() -> None:
             conn.execute("ALTER TABLE videos ADD COLUMN source_id TEXT NOT NULL DEFAULT ''")
         if "original" not in video_cols:
             conn.execute("ALTER TABLE videos ADD COLUMN original TEXT NOT NULL DEFAULT ''")
+        # The studio's editor (routers/studio.py): edit is the edit list
+        # wanted (JSON, '' none), edit_live the one the files are made from,
+        # render ''/queued/rendering/failed with its progress and error, and
+        # base what the unedited ladder kept in base/ is (JSON).
+        for col, kind in (("edit", "TEXT NOT NULL DEFAULT ''"), ("edit_live", "TEXT NOT NULL DEFAULT ''"),
+                          ("render", "TEXT NOT NULL DEFAULT ''"), ("render_progress", "REAL NOT NULL DEFAULT 0"),
+                          ("render_error", "TEXT NOT NULL DEFAULT ''"), ("base", "TEXT NOT NULL DEFAULT ''")):
+            if col not in video_cols:
+                conn.execute(f"ALTER TABLE videos ADD COLUMN {col} {kind}")
         conn.execute("CREATE INDEX IF NOT EXISTS videos_published ON videos(published, post_id)")
         # Clips (routers/clips.py): kind '' is a video, 'clip' a clip (kept
         # out of Videos' own lists). game: free text, merged by case. A clip

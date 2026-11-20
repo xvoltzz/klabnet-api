@@ -10,7 +10,7 @@ from .config import APP_VERSION, CORS_ORIGINS
 from .db import init_db
 from .media import media_ready
 from .photos_store import backfill_derivatives
-from .routers import changes, live, emoji, feedback, people, gifs, health, recap, identity, listens, lyrics, music_requests, notes, photos, playlists, posts, prefs, presence, profiles, radio, rooms, session, stars, tv, videos, voice, week
+from .routers import changes, live, emoji, feedback, people, gifs, health, recap, identity, listens, lyrics, music_requests, notes, photos, playlists, posts, prefs, presence, profiles, radio, rooms, session, stars, studio, tv, videos, voice, week
 
 
 @asynccontextmanager
@@ -22,6 +22,8 @@ async def lifespan(app: FastAPI):
         threading.Thread(target=backfill_derivatives, name="photo-backfill", daemon=True).start()
         # Videos a restart caught halfway through being made.
         videos.resume_jobs()
+        # Studio edits a restart caught halfway through rendering.
+        studio.resume_renders()
     yield
 
 
@@ -35,7 +37,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# photos, videos, tv, rooms, week, changes, people, recap and live before posts: their /api/posts/... paths must win over /api/posts/{post_id}.
+# photos, videos, studio, tv, rooms, week, changes, people, recap and live before posts: their /api/posts/... paths must win over /api/posts/{post_id}.
 # playlists, session, listens, lyrics and radio before music_requests, for the same reason (/api/music-requests/playlists/..., /activity, /radio).
-for router in (health.router, identity.router, prefs.router, presence.router, listens.router, notes.router, photos.router, videos.router, tv.router, rooms.router, week.router, stars.router, changes.router, people.router, recap.router, live.router, emoji.router, posts.router, profiles.router, playlists.router, session.router, radio.router, lyrics.router, music_requests.router, feedback.router, gifs.router, voice.router):
+for router in (health.router, identity.router, prefs.router, presence.router, listens.router, notes.router, photos.router, videos.router, studio.router, tv.router, rooms.router, week.router, stars.router, changes.router, people.router, recap.router, live.router, emoji.router, posts.router, profiles.router, playlists.router, session.router, radio.router, lyrics.router, music_requests.router, feedback.router, gifs.router, voice.router):
     app.include_router(router)
