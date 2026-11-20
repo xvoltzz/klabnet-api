@@ -216,7 +216,7 @@ later edit doesn't change it. The studio sends `timeline: "upload"` (owner or
 admin only) with its editor's `edit`, since it works in the upload's time.
 
 **Tools** (run beside the API, on its database and media share; in Docker:
-`docker compose exec api python -m app.tools.<name> …`):
+`docker compose exec klabnet-api python -m app.tools.<name> …`):
 
 - `import_youtube <folder> --user <username> [--dry-run] [--limit N]
   [--include-private] [--feature-public]` brings YouTube videos in with their
@@ -226,7 +226,7 @@ admin only) with its editor's `edit`, since it works in the upload's time.
   `.info.json` becomes a playlist) and/or a Google Takeout (`YouTube and
   YouTube Music/videos/*.mp4`, `video metadata/videos.csv`, `playlists/*.csv`).
   Put it somewhere the container sees, e.g. under the media share:
-  `docker compose exec api python -m app.tools.import_youtube /media/import --user evan --dry-run`.
+  `docker compose exec klabnet-api python -m app.tools.import_youtube /media/import --user evan --dry-run`.
   It's idempotent (each video keeps its YouTube id in `videos.source_id`,
   each playlist its id), so a re-run skips what's done. Private videos are
   skipped unless `--include-private`; unlisted ones come in unlisted.
