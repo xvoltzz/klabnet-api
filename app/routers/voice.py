@@ -97,12 +97,16 @@ def _member(p: dict) -> dict:
     # push-to-talk microphone is muted between words without its owner
     # being muted.
     attrs = p.get("attributes") or {}
-    mic = [t for t in p.get("tracks") or [] if t.get("source") == "MICROPHONE"]
+    tracks = p.get("tracks") or []
+    mic = [t for t in tracks if t.get("source") == "MICROPHONE"]
     return {
         "username": p.get("identity", ""),
         # No microphone at all (it was blocked) reads as muted too.
         "muted": not mic or attrs.get("mute") == "1",
         "deafened": attrs.get("deaf") == "1",
+        # Sharing their screen: the track itself, or the site's `share`
+        # attribute (set alongside mute/deaf, there a moment sooner).
+        "sharing": attrs.get("share") == "1" or any(t.get("source") == "SCREEN_SHARE" for t in tracks),
         "joined": int(p.get("joined_at") or p.get("joinedAt") or 0),
     }
 
@@ -202,8 +206,8 @@ async def voice_token(request: Request):
                 "roomJoin": True,
                 "canSubscribe": True,
                 "canPublish": True,
-                # Voice only: a microphone, nothing else.
-                "canPublishSources": ["microphone"],
+                # A microphone and a shared screen (with its sound); no camera.
+                "canPublishSources": ["microphone", "screen_share", "screen_share_audio"],
                 "canPublishData": True,
                 # For the muted/deafened flags others see (participant attributes).
                 "canUpdateOwnMetadata": True,

@@ -232,7 +232,11 @@ def _voice() -> list:
     for c in chans:
         members = rooms.get(f"{voice.ROOM_PREFIX}{c['id']}", [])
         if members:
-            out.append({"id": c["id"], "name": c["name"], "people": [m["username"] for m in members]})
+            out.append({
+                "id": c["id"], "name": c["name"], "people": [m["username"] for m in members],
+                # Who's sharing their screen (only people in the channel can watch).
+                "sharing": [m["username"] for m in members if m.get("sharing")],
+            })
     return out
 
 
