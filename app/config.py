@@ -112,6 +112,12 @@ LIVEKIT_API_URL    = (os.environ.get("LIVEKIT_API_URL", "").strip()
                       or LIVEKIT_URL.replace("wss://", "https://", 1).replace("ws://", "http://", 1)).rstrip("/")
 VOICE_CHANNEL_NAME_MAX_CHARS = int(os.environ.get("VOICE_CHANNEL_NAME_MAX_CHARS", "32"))
 VOICE_MAX_CHANNELS = int(os.environ.get("VOICE_MAX_CHANNELS", "20"))
+# Live streaming (routers/live.py): LiveKit Ingress next to the LiveKit above
+# (compose.yml's "live" profile). Off unless LIVE_INGRESS=1 and voice's
+# LIVEKIT_* are set. LIVE_RTMP_KBPS is the top rung RTMP is re-encoded to
+# (WHIP isn't re-encoded at all).
+LIVE_INGRESS   = os.environ.get("LIVE_INGRESS", "").strip().lower() in ("1", "true", "yes", "on")
+LIVE_RTMP_KBPS = int(os.environ.get("LIVE_RTMP_KBPS", "9000"))
 
 CORS_ORIGINS = [
     origin.strip()

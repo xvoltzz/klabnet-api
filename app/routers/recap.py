@@ -5,7 +5,7 @@ bell. Two parts:
             posts and replies), reactions to your posts (one item per post),
             and photos you were tagged in.
   around    the rest, counted: new posts, photos, videos, clips, songs shared, playlists
-            featured and radio stations made, by other people.
+            featured, radio stations made and streams started, by other people.
 
 `since` is a Unix time from the client (when it last opened the recap),
 held to the last 7 days. Chat isn't here: unread messages are Matrix's,
@@ -21,7 +21,7 @@ from fastapi.responses import JSONResponse
 
 from ..auth import get_username
 from ..db import get_db
-from . import week
+from . import live, week
 
 router = APIRouter()
 
@@ -160,5 +160,7 @@ def recap(request: Request, since: float = 0):
             "clips": len(clip_posts), "clipPeople": people(clip_posts),
             "songs": songs[:5], "songCount": len(songs),
             "playlists": playlists, "stations": stations,
+            # Streams other people started (routers/live.py).
+            "live": live.started_since(since, me),
         },
     }

@@ -78,6 +78,13 @@ anything else. Admin-only writes (`POST`/`PUT`/`DELETE` on `/api/apps` and
 | `/api/posts/changes` | GET | any | the newest commits to klabnet's repos on Gitea (`CHANGES_REPOS`), for Home's "What's new"; kept 5 minutes. Under `/api/posts/` so it rides a prefix Caddy already forwards; `/api/changes` answers too |
 | `/api/voice/channels` | POST | admin | create a channel (body `{name}`) |
 | `/api/voice/channels/{id}` | PATCH, DELETE | admin | rename, or delete (which disconnects whoever's in it; the last channel can't be deleted) |
+| `/api/posts/live` | GET | any | who's live (`live`: username, title, game, started, via, video, viewers, people) and the streams before (`recent`). `enabled: false` when streaming isn't set up |
+| `/api/posts/live/me` | GET, PATCH | any | your WHIP and RTMP keys (made on first GET), title/game/description, and whether you're live now; PATCH title/game/description |
+| `/api/posts/live/me/rotate` | POST | any | body `{which}` (`whip`, `rtmp` or `both`): new keys; the old ones stop at once |
+| `/api/posts/live/{user}` | GET | any | that person's stream now (or `null`), their last one, and the next one's title |
+| `/api/posts/live/{user}/token` | POST | any | a 10-minute subscribe-only LiveKit token for their stream's room |
+| `/api/posts/live/{user}/chat` | GET, POST | any | the stream's chat (`after=` the last id); posting only while they're live |
+| `/api/posts/live/chat/{id}` | DELETE | writer, streamer or admin | delete a chat message |
 
 ## Repository layout
 
@@ -274,6 +281,67 @@ reaches it), 7881/tcp and 7882/udp audio (forwarded from the internet).
 LiveKit finds the public address by itself (STUN) and also hands out the
 machine's LAN address, so people at home connect straight to it.
 
+## Live streaming
+
+People stream from OBS and everyone else watches in klabnet (klabnet-web's
+`js/44-live.js`, Videos → Live; this side is `app/routers/live.py`). It
+rides on Voice's LiveKit: [LiveKit Ingress](https://docs.livekit.io/home/ingress/overview/)
+takes the stream in and publishes it to a LiveKit room of its own
+(`live-<username>`), which viewers join subscribe-only.
+
+- **WHIP** (OBS 30+: Settings → Stream, Service "WHIP"). Passed straight
+  through, not re-encoded: what OBS sends (bitrate, 60fps) is what people
+  get, under a second behind. OBS must send no B-frames (WebRTC can't carry
+  them); Settings → Streaming says so.
+- **RTMP**, for anything without WHIP. Re-encoded by Ingress (CPU) to a
+  1080p60 / 720p / 360p simulcast ladder, the top rung `LIVE_RTMP_KBPS`
+  (9000), a couple of seconds behind.
+
+Each person gets one key of each, made the first time they open Settings →
+Streaming (`POST …/me/rotate` replaces them). Who's live is LiveKit's word
+(`ListIngress`, asked every 4s by a thread here), and each stream gets a
+row in `live_streams` (title, game, start, end, peak viewers) and its own
+chat (`live_chat`). The three tables are made by `live.py` on first use.
+
+It's off until Voice works and `.env` also has:
+
+```sh
+COMPOSE_PROFILES=voice,live            # starts the ingress and redis services too
+LIVEKIT_REDIS_HOST=127.0.0.1:6379      # LiveKit and Ingress talk through Redis
+LIVE_INGRESS=1                         # the API's switch
+```
+
+and, outside this repo:
+
+1. **DNS:** `live.klab.gg` pointing where `user.klab.gg` does.
+2. **Caddy** (the owner's to change): a site for the WHIP endpoint, with no
+   `forward_auth` (the bearer token is the key). `/api/posts/live` rides
+   the `/api/posts` prefix already forwarded. Long-lived requests aren't
+   needed: WHIP is one POST, then WebRTC goes straight to LiveKit.
+
+   ```
+   live.klab.gg {
+       reverse_proxy 192.168.0.37:8085
+   }
+   ```
+3. **Router:** TCP 1935 forwarded to 192.168.0.37 for RTMP. WHIP's media
+   uses LiveKit's own 7881/tcp and 7882/udp, forwarded already for voice.
+
+`livekit.yaml`'s `ingress:` block holds the addresses shown in Settings
+(`rtmp://live.klab.gg:1935/x`, `https://live.klab.gg/w`): change them there
+if the names differ. Ports, all on the host's own network: 1935 RTMP
+(forwarded), 8085 WHIP (Caddy), 9090 Ingress's internal relay, 8086 its
+health check, 6379 Redis (127.0.0.1 only), 7885/udp only for a WHIP that's
+re-encoded (klabnet never asks for that).
+
+`docker compose up -d` and then Settings → Streaming shows the keys;
+streaming from OBS makes the Status line say Live with the resolution and
+bitrate klabnet sees. "LiveKit Ingress isn't answering" means the ingress
+container isn't up or can't reach Redis.
+
+Desktop streaming straight from klabnet-desktop (no OBS) isn't built: it's
+planned with the desktop recorder, publishing over WHIP the same way.
+
 ## Environment variables
 
 | Var | Default | Notes |
@@ -288,6 +356,9 @@ machine's LAN address, so people at home connect straight to it.
 | `LIVEKIT_API_KEY` / `LIVEKIT_API_SECRET` | *(unset)* | voice: LiveKit's key pair (the same values `compose.yml` hands LiveKit as `LIVEKIT_KEYS`) |
 | `LIVEKIT_API_URL` | `http://host.docker.internal:7880` in compose | voice: how this service reaches LiveKit to ask who's in a room |
 | `VOICE_MAX_CHANNELS` | `20` | most voice channels there can be |
+| `LIVE_INGRESS` | *(unset)* | live streaming: `1` turns it on (with voice's `LIVEKIT_*` set and the `live` compose profile running) |
+| `LIVE_RTMP_KBPS` | `9000` | live streaming: the top rung RTMP streams are re-encoded to (1080p60) |
+| `LIVEKIT_REDIS_HOST` | *(unset)* | compose only: handed to LiveKit as `REDIS_HOST`; `127.0.0.1:6379` for live streaming |
 | `PLAYLIST_MAX_SONGS` | `2000` | most songs in one playlist |
 | `PLAYLISTS_PER_USER` | `200` | most playlists one person can have |
 | `PLAYLIST_NAME_MAX_CHARS` / `PLAYLIST_DESC_MAX_CHARS` | `80` / `600` | playlist name and description lengths |

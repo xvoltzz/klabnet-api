@@ -15,3 +15,11 @@ rtc:
   # to it directly whether or not the router can loop back on itself.
   use_external_ip: true
   advertise_internal_ip: true
+
+# Live streaming (README: Live streaming): the addresses Settings → Streaming
+# shows for OBS. They only matter once Ingress runs (compose's "live"
+# profile, with LIVEKIT_REDIS_HOST=127.0.0.1:6379 in .env); without it this
+# is ignored.
+ingress:
+  rtmp_base_url: rtmp://live.klab.gg:1935/x
+  whip_base_url: https://live.klab.gg/w

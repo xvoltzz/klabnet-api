@@ -44,3 +44,45 @@ services:
       - ./livekit.yaml:/etc/livekit.yaml:ro
     environment:
       LIVEKIT_KEYS: "${LIVEKIT_API_KEY:-}: ${LIVEKIT_API_SECRET:-}"
+      # Live streaming (the "live" profile below): LiveKit and Ingress talk
+      # through Redis. Empty (the default) means no Redis and no Ingress.
+      REDIS_HOST: "${LIVEKIT_REDIS_HOST:-}"
+
+  # Live streaming (app/routers/live.py): OBS streams in here, over WHIP
+  # (passed straight through) or RTMP (re-encoded), and it comes out as a
+  # LiveKit room people watch. Off unless .env has COMPOSE_PROFILES=voice,live
+  # and LIVE_INGRESS=1 (README: Live streaming). Host networking like
+  # LiveKit: RTMP 1935 is forwarded from the router, WHIP 8085 sits behind
+  # Caddy (live.klab.gg), and both reach LiveKit and Redis on 127.0.0.1.
+  ingress:
+    image: livekit/ingress:v1.6
+    container_name: klabnet-ingress
+    restart: unless-stopped
+    profiles: ["live"]
+    network_mode: host
+    depends_on: [redis]
+    environment:
+      INGRESS_CONFIG_BODY: |
+        api_key: ${LIVEKIT_API_KEY:-}
+        api_secret: ${LIVEKIT_API_SECRET:-}
+        ws_url: ws://127.0.0.1:7880
+        redis:
+          address: 127.0.0.1:6379
+        rtmp_port: 1935
+        whip_port: 8085
+        http_relay_port: 9090
+        health_port: 8086
+        logging:
+          level: info
+        rtc_config:
+          udp_port: 7885
+          use_external_ip: true
+
+  # What LiveKit and Ingress pass messages through. Nothing is kept.
+  redis:
+    image: redis:7-alpine
+    container_name: klabnet-redis
+    restart: unless-stopped
+    profiles: ["live"]
+    network_mode: host
+    command: ["redis-server", "--bind", "127.0.0.1", "--port", "6379", "--save", "", "--appendonly", "no"]

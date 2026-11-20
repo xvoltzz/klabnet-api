@@ -240,6 +240,11 @@ def _voice() -> list:
     return out
 
 
+def _live() -> list:
+    from . import live
+    return live.now_live()
+
+
 @router.get(BASE)
 def together(request: Request):
     me = _signed_in(request)
@@ -258,6 +263,7 @@ def together(request: Request):
         "tv": _tv(),
         "radio": _radio(),
         "voice": _voice(),
+        "live": _live(),
         "listening": listening,
     }
 

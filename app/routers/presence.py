@@ -10,6 +10,7 @@ from ..auth import get_username
 from ..config import AWAY_AFTER, PRESENCE_TTL
 from ..db import get_db
 from . import listens, rooms, session
+from . import live as live_stream
 
 router = APIRouter()
 
@@ -287,6 +288,8 @@ def get_presence(request: Request):
             # The watch party they're in ({id, title}, routers/rooms.py):
             # the room knows its members, so no beat needs to say it.
             "room":      rooms.room_of(r["username"]),
+            # Streaming ({title, game, started}, routers/live.py), from LiveKit Ingress.
+            "live":      live_stream.live_of(r["username"]),
             # Where in klabnet (the page of the device they used last) and
             # the status they set.
             "where":     latest[r["username"]].get("where") or None,
