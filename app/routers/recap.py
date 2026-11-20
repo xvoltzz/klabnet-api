@@ -4,7 +4,7 @@ bell. Two parts:
   for_you   things about you: replies to your posts, @mentions of you (in
             posts and replies), reactions to your posts (one item per post),
             and photos you were tagged in.
-  around    the rest, counted: new posts, photos, videos, songs shared, playlists
+  around    the rest, counted: new posts, photos, videos, clips, songs shared, playlists
             featured and radio stations made, by other people.
 
 `since` is a Unix time from the client (when it last opened the recap),
@@ -134,7 +134,10 @@ def recap(request: Request, since: float = 0):
                     seen.append(p["username"])
             return seen
         words = [p for p in posts if p["kind"] == ""]
-        video_posts = [p for p in posts if p["kind"] == "video"]
+        clip_ids = {r[0] for r in db.execute("SELECT post_id FROM videos WHERE kind = 'clip' AND post_id IN (%s)"
+                                             % ",".join("?" * len(posts)), [p["id"] for p in posts])} if posts else set()
+        video_posts = [p for p in posts if p["kind"] == "video" and p["id"] not in clip_ids]
+        clip_posts = [p for p in posts if p["id"] in clip_ids]
         latest = [{"postId": p["id"], "who": p["username"], "text": _snip(p["text"]), "at": _iso(p["created"]),
                    "song": bool(p["song_json"])} for p in words[:3]]
         playlists = [{"id": r["id"], "name": r["name"], "who": r["username"]} for r in db.execute(
@@ -154,6 +157,7 @@ def recap(request: Request, since: float = 0):
             "posts": len(words), "postPeople": people(words), "latest": latest,
             "photos": photos, "photoPosts": len(photo_ids), "photoPeople": people([p for p in posts if p["kind"] == "photo"]),
             "videos": len(video_posts), "videoPeople": people(video_posts),
+            "clips": len(clip_posts), "clipPeople": people(clip_posts),
             "songs": songs[:5], "songCount": len(songs),
             "playlists": playlists, "stations": stations,
         },

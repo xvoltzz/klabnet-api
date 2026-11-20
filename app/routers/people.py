@@ -96,7 +96,9 @@ def person(username: str, request: Request):
             "listened": round(n("SELECT SUM(seconds) FROM listens WHERE username = ?", username)),
             "plays": n("SELECT COUNT(*) FROM listens WHERE username = ? AND seconds >= ?", username, LISTEN_MIN),
             "videos": n("""SELECT COUNT(*) FROM videos v JOIN posts p ON p.id = v.post_id
-                           WHERE p.username = ? AND v.status = 'ready' AND v.unlisted = 0""", username),
+                           WHERE p.username = ? AND v.status = 'ready' AND v.unlisted = 0 AND v.kind = ''""", username),
+            "clips": n("""SELECT COUNT(*) FROM videos v JOIN posts p ON p.id = v.post_id
+                          WHERE p.username = ? AND v.status = 'ready' AND v.unlisted = 0 AND v.kind = 'clip'""", username),
         }
         artists = [
             {"name": r["artist"], "seconds": round(r["s"])}

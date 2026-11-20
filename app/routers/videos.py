@@ -32,7 +32,7 @@ from fastapi import APIRouter, File, Form, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 
 from ..auth import get_groups, get_username, is_admin
-from ..config import (MEDIA_DIR, VIDEO_AUDIO_KBPS, VIDEO_CRF, VIDEO_DESC_MAX_CHARS, VIDEO_MAX_MB, VIDEO_PRESET,
+from ..config import (CLIP_MAX_SECONDS, MEDIA_DIR, VIDEO_AUDIO_KBPS, VIDEO_CRF, VIDEO_DESC_MAX_CHARS, VIDEO_MAX_MB, VIDEO_PRESET,
                       VIDEO_TITLE_MAX_CHARS)
 from ..db import get_db
 from ..media import media_ready
@@ -43,6 +43,9 @@ BASE = "/api/posts/videos"
 # Playlists first: their paths must win over /{post_id} (routers/video_playlists.py).
 from .video_playlists import router as _playlists_router  # noqa: E402
 router.include_router(_playlists_router)
+# Clips' too (/clips, /clips/games; routers/clips.py).
+from .clips import router as _clips_router  # noqa: E402
+router.include_router(_clips_router)
 
 _EXTS = {"mp4", "mov", "mkv", "webm", "avi", "m4v"}
 _MAX_BYTES = VIDEO_MAX_MB * 1024 * 1024
@@ -472,7 +475,14 @@ def _transcode(post_id: int) -> None:
     if row is None or row["status"] != "processing":
         return
     try:
-        cols = build(post_id, _folder(row["file_id"]), row["ext"], lambda f: _set(post_id, progress=f))
+        report = lambda f: _set(post_id, progress=f)
+        # A clip made from a range of another video: that range is cut from
+        # its upload first (routers/clips.py), then made like any upload.
+        if row["clip_of"] and not os.path.isfile(os.path.join(_folder(row["file_id"]), f"source.{row['ext']}")):
+            from .clips import cut
+            cut(row, lambda f: _set(post_id, progress=round(f * 0.2, 3)))
+            report = lambda f: _set(post_id, progress=round(0.2 + f * 0.8, 3))
+        cols = build(post_id, _folder(row["file_id"]), row["ext"], report)
         _set(post_id, status="ready", progress=1, error="", poster=row["poster"] or "poster", **cols)
     except Exception as e:  # noqa: BLE001 — anything at all fails the video, not the worker
         msg = str(e) or e.__class__.__name__
@@ -642,6 +652,7 @@ def _json_many(db, rows, request: Request, username: str) -> list[dict]:
         watched = {w["post_id"]: w["position"] for w in db.execute(
             f"SELECT post_id, position FROM video_progress WHERE username=? AND post_id IN ({marks})", (username, *ids))}
     admin = is_admin(get_groups(request))
+    clipped = _clipped_from(db, rows)
     return [{
         "id": r["post_id"], "title": r["title"], "description": r["text"], "username": r["username"],
         "created": r["created"], "published": r["published"] or r["created"], "duration": r["duration"], "width": r["width"], "height": r["height"],
@@ -651,7 +662,21 @@ def _json_many(db, rows, request: Request, username: str) -> list[dict]:
         "watched": watched.get(r["post_id"]),
         "canEdit": admin or r["username"] == username,
         **({"unlisted": True} if r["unlisted"] else {}),
+        **({"kind": "clip", "game": r["game"] or "", "clipOf": clipped.get(r["post_id"])} if r["kind"] == "clip" else {}),
     } for r in rows]
+
+
+def _clipped_from(db, rows) -> dict:
+    """A clip made from a range of a video: that video ({id, title, start,
+    end}, title None once it's gone), by the clip's id."""
+    made = [r for r in rows if r["kind"] == "clip" and r["clip_of"]]
+    if not made:
+        return {}
+    ids = sorted({r["clip_of"] for r in made})
+    marks = ",".join("?" * len(ids))
+    titles = {t["post_id"]: t["title"] for t in db.execute(f"SELECT post_id, title FROM videos WHERE post_id IN ({marks})", ids)}
+    return {r["post_id"]: {"id": r["clip_of"], "title": titles.get(r["clip_of"]), "start": r["clip_start"], "end": r["clip_end"]}
+            for r in made}
 
 
 def _one(db, post_id: int, request: Request, username: str) -> dict | None:
@@ -672,6 +697,11 @@ def card(db, post_id: int) -> dict | None:
 
 
 # ── Routes ──
+
+def _clock(s: float) -> str:
+    s = int(round(s or 0))
+    return f"{s // 3600}:{s // 60 % 60:02d}:{s % 60:02d}" if s >= 3600 else f"{s // 60}:{s % 60:02d}"
+
 
 def _save_upload(file: UploadFile) -> tuple[str, str, int] | JSONResponse:
     ext = (os.path.splitext(file.filename or "")[1][1:] or "").lower()
@@ -705,7 +735,7 @@ def _save_upload(file: UploadFile) -> tuple[str, str, int] | JSONResponse:
 
 def create(request: Request | None, username: str, file, title: str, description: str, unlisted: bool = False,
            published: str | None = None, source_id: str = "", thumb: str | None = None,
-           queue_it: bool = True) -> int | JSONResponse:
+           queue_it: bool = True, kind: str = "", game: str = "") -> int | JSONResponse:
     """An upload made into a video and queued for ffmpeg: its post id. An
     unlisted one (uploaded straight into a TV channel, routers/tv.py) is
     left out of Videos' lists. file is an UploadFile, or anything with
@@ -713,7 +743,8 @@ def create(request: Request | None, username: str, file, title: str, description
     came out (parse_published; blank is now). source_id: the YouTube id it
     was imported from. thumb: a picture file to make the poster from. With
     queue_it False (the importer, another process) the row is left
-    processing for this server's worker to find."""
+    processing for this server's worker to find. kind 'clip': a clip
+    (routers/clips.py), up to CLIP_MAX_SECONDS long, with its game."""
     try:
         published = parse_published(published)
     except ValueError as e:
@@ -733,6 +764,10 @@ def create(request: Request | None, username: str, file, title: str, description
     if info is None:
         _remove_folder(file_id)
         return _error(400, "couldn't find a video in that file")
+    kind = "clip" if kind == "clip" else ""
+    if kind and (info["duration"] or 0) > CLIP_MAX_SECONDS + 0.5:
+        _remove_folder(file_id)
+        return _error(400, f"a clip can be up to {_clock(CLIP_MAX_SECONDS)} long, and this is {_clock(info['duration'])}. Upload it as a video instead")
     if thumb:
         t_ext = os.path.splitext(thumb)[1][1:].lower()
         if t_ext in ("jpg", "jpeg", "png", "webp"):
@@ -741,12 +776,14 @@ def create(request: Request | None, username: str, file, title: str, description
             except OSError as e:
                 print(f"videos: couldn't keep the thumbnail {thumb}: {e}")
     with get_db() as db:
+        from .clips import game_name
+        game = game_name(db, game) if kind else ""
         cur = db.execute("INSERT INTO posts(username, text, kind) VALUES (?, ?, 'video')", (username, description.strip()))
         post_id = cur.lastrowid
-        db.execute("""INSERT INTO videos(post_id, title, file_id, ext, duration, width, height, size, unlisted, published, source_id)
-                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, datetime('now')), ?)""",
+        db.execute("""INSERT INTO videos(post_id, title, file_id, ext, duration, width, height, size, unlisted, published, source_id, kind, game)
+                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, datetime('now')), ?, ?, ?)""",
                    (post_id, title, file_id, ext, info["duration"], info["width"], info["height"], size, 1 if unlisted else 0,
-                    published, source_id))
+                    published, source_id, kind, game))
         db.commit()
     if queue_it:
         _enqueue(post_id)
@@ -755,11 +792,12 @@ def create(request: Request | None, username: str, file, title: str, description
 
 @router.post(BASE)
 def upload(request: Request, file: UploadFile = File(...), title: str = Form(""), description: str = Form(""),
-           published: str = Form("")):
+           published: str = Form(""), kind: str = Form(""), game: str = Form("")):
+    """kind=clip (and a game) uploads a clip (routers/clips.py)."""
     username = _signed_in(request)
     if not username:
         return _error(401, "not authenticated")
-    post_id = create(request, username, file, title, description, published=published)
+    post_id = create(request, username, file, title, description, published=published, kind=kind, game=game)
     if isinstance(post_id, JSONResponse):
         return post_id
     with get_db() as db:
@@ -768,16 +806,19 @@ def upload(request: Request, file: UploadFile = File(...), title: str = Form("")
 
 @router.get(BASE)
 def list_videos(request: Request, limit: int = 24, before_id: int | None = None, offset: int = 0,
-                user: str = "", sort: str = "new", q: str = ""):
+                user: str = "", sort: str = "new", q: str = "", kind: str = ""):
     """Newest first by when each came out (published; before_id pages back
     from that video), oldest first (sort=old, before_id pages on), or the
     most watched (offset pages). Other people's only once they're ready;
-    yours always, so you can see yours being made."""
+    yours always, so you can see yours being made. Videos only: kind=clip
+    is clips instead (search's filter), kind=all both."""
     username = _signed_in(request)
     if not username:
         return _error(401, "not authenticated")
     limit = max(1, min(limit, 100))
     where, args = ["(v.status='ready' OR p.username=?)", "v.unlisted=0"], [username]
+    if kind != "all":
+        where.append("v.kind=?"); args.append("clip" if kind == "clip" else "")
     if user:
         where.append("p.username=?"); args.append(user.strip().lower())
     for word in q.split()[:8]:
@@ -815,7 +856,7 @@ def continue_watching(request: Request):
     with get_db() as db:
         rows = db.execute(f"""SELECT {_COLS} FROM video_progress g JOIN videos v ON v.post_id = g.post_id
                               JOIN posts p ON p.id = v.post_id
-                              WHERE g.username=? AND v.status='ready' AND v.unlisted=0 AND g.position > 5
+                              WHERE g.username=? AND v.status='ready' AND v.unlisted=0 AND v.kind='' AND g.position > 5
                                 AND (v.duration IS NULL OR g.position < v.duration * ?)
                               ORDER BY g.updated DESC LIMIT 20""", (username, DONE_AT)).fetchall()
         return {"videos": _json_many(db, rows, request, username)}
@@ -873,6 +914,9 @@ async def edit_video(post_id: int, request: Request):
                 return _error(400, str(e))
             if published:
                 db.execute("UPDATE videos SET published=?, updated=datetime('now') WHERE post_id=?", (published, post_id))
+        if "game" in body and row["kind"] == "clip":
+            from .clips import game_name
+            db.execute("UPDATE videos SET game=?, updated=datetime('now') WHERE post_id=?", (game_name(db, body["game"]), post_id))
         db.commit()
         return _one(db, post_id, request, username)
 

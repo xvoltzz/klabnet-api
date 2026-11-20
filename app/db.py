@@ -562,6 +562,20 @@ def init_db() -> None:
         if "original" not in video_cols:
             conn.execute("ALTER TABLE videos ADD COLUMN original TEXT NOT NULL DEFAULT ''")
         conn.execute("CREATE INDEX IF NOT EXISTS videos_published ON videos(published, post_id)")
+        # Clips (routers/clips.py): kind '' is a video, 'clip' a clip (kept
+        # out of Videos' own lists). game: free text, merged by case. A clip
+        # made from a range of another video: clip_of (that video's id) and
+        # clip_start/clip_end (seconds in it); its source.mkv is cut from
+        # that video's upload by the worker before the ladder is made.
+        if "kind" not in video_cols:
+            conn.execute("ALTER TABLE videos ADD COLUMN kind TEXT NOT NULL DEFAULT ''")
+        if "game" not in video_cols:
+            conn.execute("ALTER TABLE videos ADD COLUMN game TEXT NOT NULL DEFAULT ''")
+        if "clip_of" not in video_cols:
+            conn.execute("ALTER TABLE videos ADD COLUMN clip_of INTEGER NOT NULL DEFAULT 0")
+            conn.execute("ALTER TABLE videos ADD COLUMN clip_start REAL NOT NULL DEFAULT 0")
+            conn.execute("ALTER TABLE videos ADD COLUMN clip_end REAL NOT NULL DEFAULT 0")
+        conn.execute("CREATE INDEX IF NOT EXISTS videos_kind ON videos(kind, published, post_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS videos_source ON videos(source_id) WHERE source_id != ''")
         # art_cache.id (which file on the media share an album's art is)
         # came after the table did; same migration, and rows from before

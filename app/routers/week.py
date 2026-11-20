@@ -194,7 +194,7 @@ def _build(start: date, tz: int) -> dict:
         # New on klabnet.
         vids = db.execute(
             """SELECT v.*, p.username, p.created FROM videos v JOIN posts p ON p.id = v.post_id
-               WHERE p.created >= ? AND p.created < ? AND v.unlisted = 0 AND v.status = 'ready'
+               WHERE p.created >= ? AND p.created < ? AND v.unlisted = 0 AND v.status = 'ready' AND v.kind = ''
                  AND v.published >= datetime(p.created, '-2 days')
                ORDER BY p.created DESC""", (a, b)).fetchall()
         if vids:

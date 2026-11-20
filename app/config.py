@@ -94,6 +94,10 @@ VIDEO_PRESET          = os.environ.get("VIDEO_PRESET", "medium").strip() or "med
 VIDEO_CRF             = int(os.environ.get("VIDEO_CRF", "18"))
 # The ladder's audio when the source's isn't already AAC stereo.
 VIDEO_AUDIO_KBPS      = int(os.environ.get("VIDEO_AUDIO_KBPS", "192"))
+# Clips (routers/clips.py): short videos, mostly gameplay. Longer uploads to
+# Clips are refused (upload them as a video instead), and so is a longer
+# range clipped from a video.
+CLIP_MAX_SECONDS      = int(os.environ.get("CLIP_MAX_SECONDS", "180"))
 
 # ── Voice (drop-in channels on a self-hosted LiveKit server) ──
 # LIVEKIT_URL is what browsers connect to (wss://voice.klab.gg, through
