@@ -293,20 +293,26 @@ async def stream(request: Request, device: str = "", name: str = "", platform: s
     s = _sessions.setdefault(username, _Session())
     if device not in s.devices and len(s.devices) >= MAX_DEVICES:
         return _error(429, "too many devices")
+    s.touched = time.monotonic()  # so _forget_old can't drop it before events() registers
 
     me = _Device(device, " ".join(name.split())[:40], re.sub(r"[^a-z:]", "", platform.lower())[:40])
-    old = s.devices.get(device)
-    if old:
-        _end(old)  # the same page reconnecting: its old stream ends
-    s.devices[device] = me
-    s.gone.pop(device, None)
-    s.touched = time.monotonic()
-    if s.active == device:
-        s.dropped_at = 0.0
-    _send(s, skip=device)
     loop = asyncio.get_running_loop()
 
     async def events():
+        # Registered here, not before the response: a client that goes
+        # before the body is first read never starts this generator, so its
+        # `finally` would never run and the device stayed in s.devices for
+        # good (a ghost that counted towards MAX_DEVICES and could stay
+        # "active"). Nothing awaits between here and the try.
+        old = s.devices.get(device)
+        if old:
+            _end(old)  # the same page reconnecting: its old stream ends
+        s.devices[device] = me
+        s.gone.pop(device, None)
+        s.touched = time.monotonic()
+        if s.active == device:
+            s.dropped_at = 0.0
+        _send(s, skip=device)
         try:
             yield _event("hello", dict(_snapshot(s), you=device))
             quiet = 0

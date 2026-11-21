@@ -31,6 +31,7 @@ ones and the timeline doesn't move when a late one finishes. Programs are
 kept for two days after their start, then dropped. The channel's JSON
 carries the programs on now and coming (with everything a player needs),
 so a page switches at the boundary on its own."""
+import math
 import re
 import secrets
 import time
@@ -91,10 +92,11 @@ def _video_ids(raw) -> list[int] | JSONResponse:
     if not isinstance(raw, list):
         return _error(400, "videos is a list of video ids")
     try:
-        ids = [int(v) for v in raw][:LINEUP_MAX]
-    except (TypeError, ValueError):
+        ids = [int(v) for v in raw[:LINEUP_MAX]]
+    except (TypeError, ValueError, OverflowError):
         return _error(400, "videos is a list of video ids")
-    return ids
+    # (An id SQLite can't bind is a 500 in the queries that look them up.)
+    return [i for i in ids if 0 < i < 2 ** 63]
 
 
 def _set_lineup(db, channel_id: str, ids: list[int]) -> None:
@@ -416,7 +418,11 @@ def _float(value) -> float:
 def _start(value, now: float) -> float | JSONResponse:
     try:
         start = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        return _error(400, "a program needs a start time")
+    if not math.isfinite(start):
+        # NaN passed both checks below and was stored as NULL: a program
+        # that 500'd its own answer and every later edit of it.
         return _error(400, "a program needs a start time")
     if start < now - 60:
         return _error(400, "that time has gone")
@@ -729,7 +735,9 @@ async def add_item(channel_id: str, request: Request):
         return body
     try:
         vid = int(body.get("video"))
-    except (TypeError, ValueError):
+        if not 0 < vid < 2 ** 63:
+            raise ValueError
+    except (TypeError, ValueError, OverflowError):
         return _error(400, "video (an id) required")
     with get_db() as db:
         if db.execute("SELECT 1 FROM videos WHERE post_id=?", (vid,)).fetchone() is None:

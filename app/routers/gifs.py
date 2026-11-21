@@ -227,7 +227,7 @@ async def add_gif_link(request: Request):
     username = get_username(request)
     if username == "anonymous":
         return _unauthenticated()
-    if not media_ready():
+    if not await asyncio.to_thread(media_ready):  # a stat over SMB: not on the event loop
         return JSONResponse(status_code=503, content={"error": "storage is offline"})
     try:
         body = await request.json()
@@ -245,7 +245,9 @@ async def add_gif_link(request: Request):
         return await asyncio.to_thread(_store, data, username, _clean_name(str(body.get("name") or "") or guess))
     except GifError as e:
         return JSONResponse(status_code=400, content={"error": str(e)})
-    except httpx.HTTPError:
+    except (httpx.HTTPError, httpx.InvalidURL, ValueError):
+        # ValueError: urlparse on "https://[x" or a bad port, and IDNA
+        # (UnicodeError) on an odd host name, all on what was pasted.
         return JSONResponse(status_code=400, content={"error": "couldn't fetch that link"})
 
 

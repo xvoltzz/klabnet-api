@@ -17,6 +17,7 @@ from urllib.parse import urljoin, urlparse
 
 import httpx
 from fastapi import APIRouter, Request
+from starlette.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, JSONResponse
 
 from ..auth import get_groups, get_username, is_admin
@@ -175,30 +176,33 @@ async def create_request(request: Request):
         return JSONResponse(status_code=400, content={"error": "invalid JSON"})
 
     req_type = "song" if body.get("req_type") == "song" else "album"
-    title = str(body.get("title", "")).strip()[:REQUEST_FIELD_MAX_CHARS]
-    artist = str(body.get("artist", "")).strip()[:REQUEST_FIELD_MAX_CHARS]
-    mbid = str(body.get("mbid", "")).strip()[:64]
-    cover_art_url = str(body.get("cover_art_url", "")).strip()[:500]
+    title = str(body.get("title") or "").strip()[:REQUEST_FIELD_MAX_CHARS]
+    artist = str(body.get("artist") or "").strip()[:REQUEST_FIELD_MAX_CHARS]
+    mbid = str(body.get("mbid") or "").strip()[:64]
+    cover_art_url = str(body.get("cover_art_url") or "").strip()[:500]
     # Shown to everyone as an <img>: only the Cover Art Archive (what the
     # search hands out), not any address someone cares to log visits on.
-    if cover_art_url and not (_art_host_ok(cover_art_url) and "coverartarchive.org" in urlparse(cover_art_url).hostname):
+    if cover_art_url and not (_art_host_ok(cover_art_url) and "coverartarchive.org" in (urlparse(cover_art_url).hostname or "")):
         cover_art_url = ""
     if not title:
         return JSONResponse(status_code=400, content={"error": "title required"})
 
-    with get_db() as db:
-        cur = db.execute(
-            """INSERT INTO music_requests(username, req_type, title, artist, mbid, cover_art_url)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (username, req_type, title, artist, mbid, cover_art_url),
-        )
-        db.commit()
-        row = db.execute(
-            """SELECT id, username, req_type, title, artist, mbid, cover_art_url, status, created
-               FROM music_requests WHERE id=?""",
-            (cur.lastrowid,),
-        ).fetchone()
-    return dict(row)
+    def _work():
+        with get_db() as db:
+            cur = db.execute(
+                """INSERT INTO music_requests(username, req_type, title, artist, mbid, cover_art_url)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (username, req_type, title, artist, mbid, cover_art_url),
+            )
+            db.commit()
+            row = db.execute(
+                """SELECT id, username, req_type, title, artist, mbid, cover_art_url, status, created
+                   FROM music_requests WHERE id=?""",
+                (cur.lastrowid,),
+            ).fetchone()
+        return dict(row)
+
+    return await run_in_threadpool(_work)
 
 
 @router.put("/api/music-requests/{request_id}")
@@ -220,17 +224,20 @@ async def update_request_status(request_id: int, request: Request):
     status = str(body.get("status", "")).strip()
     if status not in ("pending", "fulfilled", "dismissed"):
         return JSONResponse(status_code=400, content={"error": "invalid status"})
-    with get_db() as db:
-        if db.execute("SELECT 1 FROM music_requests WHERE id=?", (request_id,)).fetchone() is None:
-            return JSONResponse(status_code=404, content={"error": "not found"})
-        db.execute("UPDATE music_requests SET status=? WHERE id=?", (status, request_id))
-        db.commit()
-        row = db.execute(
-            """SELECT id, username, req_type, title, artist, mbid, cover_art_url, status, created
-               FROM music_requests WHERE id=?""",
-            (request_id,),
-        ).fetchone()
-    return dict(row)
+    def _work():
+        with get_db() as db:
+            if db.execute("SELECT 1 FROM music_requests WHERE id=?", (request_id,)).fetchone() is None:
+                return JSONResponse(status_code=404, content={"error": "not found"})
+            db.execute("UPDATE music_requests SET status=? WHERE id=?", (status, request_id))
+            db.commit()
+            row = db.execute(
+                """SELECT id, username, req_type, title, artist, mbid, cover_art_url, status, created
+                   FROM music_requests WHERE id=?""",
+                (request_id,),
+            ).fetchone()
+        return dict(row)
+
+    return await run_in_threadpool(_work)
 
 
 @router.delete("/api/music-requests/{request_id}")
@@ -368,7 +375,11 @@ async def _art_lookup(artist: str, album: str, mbid: str):
                 continue
             try:
                 found = await fn(*args)
-            except (httpx.HTTPError, ValueError, _Unavailable):
+            except Exception:
+                # Not only HTTP errors: a catalogue answering in a shape it
+                # doesn't document (a string where an object goes) raised an
+                # AttributeError out of the shared task, a 500 for everyone
+                # waiting on that album.
                 unavailable = True
     return found, unavailable
 
@@ -504,8 +515,11 @@ def _art_type(head: bytes):
 
 
 def _art_host_ok(url: str) -> bool:
-    u = urlparse(url)
-    host = (u.hostname or "").lower()
+    try:
+        u = urlparse(url)
+        host = (u.hostname or "").lower()
+    except ValueError:  # "https://[oops" (a request's cover, a redirect's Location): not a 500
+        return False
     return u.scheme == "https" and any(host == h or host.endswith("." + h) for h in _ART_HOSTS)
 
 

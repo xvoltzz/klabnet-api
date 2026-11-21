@@ -76,8 +76,10 @@ def _ids(raw) -> list[int] | None:
     for x in raw[:MAX_VIDEOS]:
         try:
             i = int(x)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return None
+        if not 0 < i < 2 ** 63:
+            continue  # SQLite can't bind it (a 500 in _shown); no such video anyway
         if i not in seen:
             seen.add(i)
             out.append(i)

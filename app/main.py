@@ -34,6 +34,47 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="klabnet-api", version=APP_VERSION, lifespan=lifespan)
 
+# Every JSON route reads its whole body into memory (request.json() /
+# request.body()) before looking at it, and nothing capped that: one
+# request could send gigabytes. Uploads (multipart, and Videos' parts,
+# which check their own size) are left alone; everything else gets 8MB,
+# four times the largest legitimate body (prefs, 2MB).
+_BODY_MAX = 8 * 1024 * 1024
+
+
+class _BodyLimit:
+    def __init__(self, inner):
+        self.inner = inner
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or scope["method"] in ("GET", "HEAD", "OPTIONS"):
+            return await self.inner(scope, receive, send)
+        headers = dict(scope.get("headers") or [])
+        ctype = headers.get(b"content-type", b"").lower()
+        if ctype.startswith(b"multipart/form-data") or (
+                scope["method"] == "PUT" and scope["path"].startswith("/api/posts/videos/uploads/")):
+            return await self.inner(scope, receive, send)
+        try:
+            length = int(headers.get(b"content-length") or 0)
+        except ValueError:
+            length = 0
+        if length > _BODY_MAX:
+            from starlette.responses import JSONResponse as _J
+            return await _J({"error": "request body too large"}, status_code=413)(scope, receive, send)
+        seen = 0
+
+        async def counted():
+            nonlocal seen
+            msg = await receive()
+            if msg.get("type") == "http.request":
+                seen += len(msg.get("body") or b"")
+                if seen > _BODY_MAX:
+                    # A chunked body with no length that keeps going.
+                    raise RuntimeError("request body too large")
+            return msg
+
+        return await self.inner(scope, counted, send)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
@@ -41,6 +82,7 @@ app.add_middleware(
     allow_methods=["GET", "PUT", "PATCH", "POST", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
+app.add_middleware(_BodyLimit)
 
 # photos, videos, studio, tv, rooms, week, changes, people, recap, calls and live before posts: their /api/posts/... paths must win over /api/posts/{post_id}.
 # playlists, session, listens, lyrics and radio before music_requests, for the same reason (/api/music-requests/playlists/..., /activity, /radio).

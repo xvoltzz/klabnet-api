@@ -126,7 +126,8 @@ async def lyrics(request: Request, title: str = "", artist: str = "", album: str
     title, artist, album = title.strip()[:300], artist.strip()[:300], album.strip()[:300]
     if not title:
         return {"lyrics": None}
-    dur = int(round(duration or 0))
+    # ?duration=inf / nan parse as floats, and int() of them raised (a 500).
+    dur = int(round(duration)) if 0 < duration < 100_000 else 0
     key = _key(title, artist, album, dur)
     row = await asyncio.to_thread(_cached, key)
     if row and (row["body"] or row["age"] < MISS_DAYS):

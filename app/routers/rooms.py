@@ -25,7 +25,9 @@ Rooms live in this process's memory only, like the session
 (routers/session.py): one uvicorn process. After a restart they're gone
 and each page finds its room missing and says so. Under /api/posts/
 because Caddy only forwards a fixed list of /api prefixes."""
+import asyncio
 import secrets
+import threading
 import time
 
 from fastapi import APIRouter, Request
@@ -46,6 +48,11 @@ MAX_MEMBERS = 30
 _rooms: dict[str, dict] = {}
 # username -> the room they're in.
 _member_of: dict[str, str] = {}
+# The sync routes run in worker threads, the async ones on the event loop,
+# and presence reads room_of() from its own threads: every look at or change
+# to the two dicts above holds this (sweeping a room's members while another
+# request adds one raised "dictionary changed size during iteration").
+_lock = threading.RLock()
 
 
 def _error(status: int, message: str) -> JSONResponse:
@@ -127,9 +134,10 @@ def _json(room: dict, now: float | None = None) -> dict:
 
 def room_of(username: str) -> dict | None:
     """The watch party someone's in ({id, title}), for presence."""
-    rid = _member_of.get(username)
-    room = _rooms.get(rid) if rid else None
-    return {"id": room["id"], "title": room["video"]["title"]} if room else None
+    with _lock:
+        rid = _member_of.get(username)
+        room = _rooms.get(rid) if rid else None
+        return {"id": room["id"], "title": room["video"]["title"]} if room else None
 
 
 async def _body(request: Request) -> dict:
@@ -250,14 +258,16 @@ def together(request: Request):
     me = _signed_in(request)
     if not me:
         return _error(401, "not authenticated")
-    _sweep()
     now = time.time()
+    with _lock:
+        _sweep()
+        watch = [_json(r, now) for r in _rooms.values()]
+        mine = _member_of.get(me)
     parties, listening = _listen_parties_and_listeners()
-    watch = [_json(r, now) for r in _rooms.values()]
     watch.sort(key=lambda r: (-len(r["people"]), -r["created"]))
     return {
         "now": now,
-        "mine": _member_of.get(me),
+        "mine": mine,
         "watch": watch,
         "listen": parties,
         "tv": _tv(),
@@ -279,23 +289,24 @@ async def create_room(request: Request):
     body = await _body(request)
     try:
         vid = int(body.get("video"))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return _error(400, "which video?")
-    v = _video(vid)
+    v = await asyncio.to_thread(_video, vid)  # SQLite: off the event loop
     if not v:
         return _error(404, "that video isn't ready to watch")
-    _sweep()
-    _leave_any(me)
-    if len(_rooms) >= MAX_ROOMS:
-        return _error(429, "too many watch parties at once")
-    now = time.time()
-    rid = secrets.token_urlsafe(6)
-    room = {"id": rid, "video": v, "host": me, "members": {me: now},
-            "playing": bool(body.get("playing", False)), "position": _secs(body.get("position")),
-            "at": now, "by": me, "seq": 1, "created": now}
-    _rooms[rid] = room
-    _member_of[me] = rid
-    return dict(_json(room, now), now=now)
+    with _lock:
+        _sweep()
+        _leave_any(me)
+        if len(_rooms) >= MAX_ROOMS:
+            return _error(429, "too many watch parties at once")
+        now = time.time()
+        rid = secrets.token_urlsafe(6)
+        room = {"id": rid, "video": v, "host": me, "members": {me: now},
+                "playing": bool(body.get("playing", False)), "position": _secs(body.get("position")),
+                "at": now, "by": me, "seq": 1, "created": now}
+        _rooms[rid] = room
+        _member_of[me] = rid
+        return dict(_json(room, now), now=now)
 
 
 def _room_or_404(rid: str):
@@ -310,13 +321,14 @@ def get_room(rid: str, request: Request):
     me = _signed_in(request)
     if not me:
         return _error(401, "not authenticated")
-    room, err = _room_or_404(rid)
-    if err:
-        return err
-    now = time.time()
-    if me in room["members"]:
-        room["members"][me] = now
-    return dict(_json(room, now), now=now, member=me in room["members"])
+    with _lock:
+        room, err = _room_or_404(rid)
+        if err:
+            return err
+        now = time.time()
+        if me in room["members"]:
+            room["members"][me] = now
+        return dict(_json(room, now), now=now, member=me in room["members"])
 
 
 @router.post(f"{BASE}/{{rid}}/join")
@@ -324,17 +336,18 @@ def join_room(rid: str, request: Request):
     me = _signed_in(request)
     if not me:
         return _error(401, "not authenticated")
-    room, err = _room_or_404(rid)
-    if err:
-        return err
-    if me not in room["members"]:
-        if len(room["members"]) >= MAX_MEMBERS:
-            return _error(429, "that watch party is full")
-        _leave_any(me)
-    room["members"][me] = time.time()
-    _member_of[me] = rid
-    now = time.time()
-    return dict(_json(room, now), now=now, member=True)
+    with _lock:
+        room, err = _room_or_404(rid)
+        if err:
+            return err
+        if me not in room["members"]:
+            if len(room["members"]) >= MAX_MEMBERS:
+                return _error(429, "that watch party is full")
+            _leave_any(me)
+        room["members"][me] = time.time()
+        _member_of[me] = rid
+        now = time.time()
+        return dict(_json(room, now), now=now, member=True)
 
 
 @router.post(f"{BASE}/{{rid}}/state")
@@ -344,28 +357,39 @@ async def set_state(rid: str, request: Request):
     me = _signed_in(request)
     if not me:
         return _error(401, "not authenticated")
-    room, err = _room_or_404(rid)
-    if err:
-        return err
-    if me not in room["members"]:
-        return _error(403, "you're not in this watch party")
+    with _lock:
+        room, err = _room_or_404(rid)
+        if err:
+            return err
+        if me not in room["members"]:
+            return _error(403, "you're not in this watch party")
     body = await _body(request)
-    now = time.time()
+    v = None
     if body.get("video") is not None:
         try:
-            v = _video(int(body["video"]))
-        except (TypeError, ValueError):
+            v = await asyncio.to_thread(_video, int(body["video"]))  # SQLite: off the event loop
+        except (TypeError, ValueError, OverflowError):
             v = None
         if not v:
             return _error(404, "that video isn't ready to watch")
-        room["video"] = v
-    room["playing"] = bool(body.get("playing", room["playing"]))
-    room["position"] = _secs(body.get("position"), _position(room, now))
-    room["at"] = now
-    room["by"] = me
-    room["seq"] += 1
-    room["members"][me] = now
-    return dict(_json(room, now), now=now, member=True)
+    with _lock:
+        # Looked up again: it may have ended, or they may have been swept,
+        # while the body and the video were read.
+        room, err = _room_or_404(rid)
+        if err:
+            return err
+        if me not in room["members"]:
+            return _error(403, "you're not in this watch party")
+        now = time.time()
+        if v:
+            room["video"] = v
+        room["playing"] = bool(body.get("playing", room["playing"]))
+        room["position"] = _secs(body.get("position"), _position(room, now))
+        room["at"] = now
+        room["by"] = me
+        room["seq"] += 1
+        room["members"][me] = now
+        return dict(_json(room, now), now=now, member=True)
 
 
 @router.post(f"{BASE}/{{rid}}/leave")
@@ -373,9 +397,10 @@ def leave_room(rid: str, request: Request):
     me = _signed_in(request)
     if not me:
         return _error(401, "not authenticated")
-    room = _rooms.get(rid)
-    if room and me in room["members"]:
-        _drop(room, me)
-        if not room["members"]:
-            _end(rid)
+    with _lock:
+        room = _rooms.get(rid)
+        if room and me in room["members"]:
+            _drop(room, me)
+            if not room["members"]:
+                _end(rid)
     return {"ok": True}

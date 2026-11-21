@@ -12,6 +12,7 @@ held to the last 7 days. Chat isn't here: unread messages are Matrix's,
 and the site has them already. Under /api/posts/ because Caddy only
 forwards a fixed list of /api prefixes."""
 import json
+import math
 import re
 import time
 from datetime import datetime, timezone
@@ -54,6 +55,9 @@ def recap(request: Request, since: float = 0):
     if me == "anonymous":
         return JSONResponse(status_code=401, content={"error": "not authenticated"})
     now = time.time()
+    if not math.isfinite(since):
+        # ?since=nan or inf: datetime.fromtimestamp raised, a 500.
+        since = 0
     since = min(now, max(since or now - 86400, now - MAX_BACK))
     at = _sql_time(since)
     items: list[dict] = []
@@ -92,7 +96,8 @@ def recap(request: Request, since: float = 0):
         for r in rows:
             it = by_post.setdefault(r["post_id"], {"kind": "react", "at": _iso(r["created"]), "who": [], "emoji": [],
                                                    "postId": r["post_id"], "on": _snip(r["vtitle"] or r["ptext"]),
-                                                   "photo": r["kind"] == "photo", "video": r["kind"] == "video"})
+                                                   "photo": r["kind"] in ("photo", "screenshot"),
+                                                   "screenshot": r["kind"] == "screenshot", "video": r["kind"] == "video"})
             if r["username"] not in it["who"]:
                 it["who"].append(r["username"])
             if r["emoji"] not in it["emoji"]:
@@ -124,6 +129,8 @@ def recap(request: Request, since: float = 0):
                 try:
                     s = json.loads(p["song_json"])
                 except ValueError:
+                    continue
+                if not isinstance(s, dict):
                     continue
                 songs.append({"postId": p["id"], "who": p["username"], "title": s.get("title", ""), "artist": s.get("artist", ""),
                               "coverArt": s.get("cover_art", "")})

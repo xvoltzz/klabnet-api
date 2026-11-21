@@ -27,6 +27,7 @@ import threading
 
 from fastapi import APIRouter, File, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
+from starlette.concurrency import run_in_threadpool
 from PIL import Image, ImageOps
 
 from .. import photos_store  # noqa: F401  (registers the HEIC opener and Pillow's pixel limit)
@@ -274,13 +275,16 @@ async def create_playlist(request: Request):
     if isinstance(fields, JSONResponse):
         return fields
     songs = _clean_songs(body.get("songs"), PLAYLIST_MAX_SONGS)
-    with get_db() as db:
-        db.execute("BEGIN IMMEDIATE")
-        if db.execute("SELECT COUNT(*) FROM playlists WHERE username=?", (username,)).fetchone()[0] >= PLAYLISTS_PER_USER:
-            return _error(400, f"that's the most playlists one person can have ({PLAYLISTS_PER_USER})")
-        playlist_id = _create(db, username, fields, songs)
-        db.commit()
-        return _summary(db, playlist_id, username)
+    def _work():
+        with get_db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if db.execute("SELECT COUNT(*) FROM playlists WHERE username=?", (username,)).fetchone()[0] >= PLAYLISTS_PER_USER:
+                return _error(400, f"that's the most playlists one person can have ({PLAYLISTS_PER_USER})")
+            playlist_id = _create(db, username, fields, songs)
+            db.commit()
+            return _summary(db, playlist_id, username)
+
+    return await run_in_threadpool(_work)
 
 
 @router.post(f"{BASE}/import")
@@ -295,27 +299,30 @@ async def import_playlists(request: Request):
     body = await _json_body(request)
     if body is None or not isinstance(body.get("playlists"), list):
         return _error(400, "invalid JSON")
-    imported = 0
-    with get_db() as db:
-        db.execute("BEGIN IMMEDIATE")
-        have = db.execute("SELECT COUNT(*) FROM playlists WHERE username=?", (username,)).fetchone()[0]
-        for raw in body["playlists"][:PLAYLISTS_PER_USER]:
-            if not isinstance(raw, dict):
-                continue
-            legacy_id = str(raw.get("id") or "").strip()[:64]
-            name = " ".join(str(raw.get("name") or "").split())[:PLAYLIST_NAME_MAX_CHARS]
-            if not legacy_id or not name or have >= PLAYLISTS_PER_USER:
-                continue
-            cur = db.execute(
-                "INSERT OR IGNORE INTO playlist_imports(username, legacy_id) VALUES (?, ?)", (username, legacy_id)
-            )
-            if not cur.rowcount:
-                continue
-            _create(db, username, _NEW | {"name": name}, _clean_songs(raw.get("songs"), PLAYLIST_MAX_SONGS), legacy_id)
-            have += 1
-            imported += 1
-        db.commit()
-    return {"imported": imported}
+    def _work():
+        imported = 0
+        with get_db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            have = db.execute("SELECT COUNT(*) FROM playlists WHERE username=?", (username,)).fetchone()[0]
+            for raw in body["playlists"][:PLAYLISTS_PER_USER]:
+                if not isinstance(raw, dict):
+                    continue
+                legacy_id = str(raw.get("id") or "").strip()[:64]
+                name = " ".join(str(raw.get("name") or "").split())[:PLAYLIST_NAME_MAX_CHARS]
+                if not legacy_id or not name or have >= PLAYLISTS_PER_USER:
+                    continue
+                cur = db.execute(
+                    "INSERT OR IGNORE INTO playlist_imports(username, legacy_id) VALUES (?, ?)", (username, legacy_id)
+                )
+                if not cur.rowcount:
+                    continue
+                _create(db, username, _NEW | {"name": name}, _clean_songs(raw.get("songs"), PLAYLIST_MAX_SONGS), legacy_id)
+                have += 1
+                imported += 1
+            db.commit()
+        return {"imported": imported}
+
+    return await run_in_threadpool(_work)
 
 
 # ── One playlist ──
@@ -354,26 +361,29 @@ async def edit_playlist(playlist_id: str, request: Request):
     body = await _json_body(request)
     if body is None:
         return _error(400, "invalid JSON")
-    with get_db() as db:
-        row = db.execute(f"{_SELECT} WHERE id=?", (playlist_id,)).fetchone()
-        if not _visible(row, username):
-            return _error(404, "not found")
-        if not _can_edit(row, request, username):
-            return _error(403, "not your playlist")
-        fields = _fields(body, {k: row[k] for k in _NEW})
-        if isinstance(fields, JSONResponse):
-            return fields
-        if not fields["featured"]:
-            fields["collab"] = 0
-        db.execute(
-            "UPDATE playlists SET name=?, description=?, color=?, featured=?, collab=?, updated=datetime('now') WHERE id=?",
-            (fields["name"], fields["description"], fields["color"], fields["featured"], fields["collab"], playlist_id),
-        )
-        # No longer featured: it leaves the sidebars of the people who saved it.
-        if not fields["featured"]:
-            db.execute("DELETE FROM playlist_saves WHERE playlist_id=?", (playlist_id,))
-        db.commit()
-        return _summary(db, playlist_id, username)
+    def _work():
+        with get_db() as db:
+            row = db.execute(f"{_SELECT} WHERE id=?", (playlist_id,)).fetchone()
+            if not _visible(row, username):
+                return _error(404, "not found")
+            if not _can_edit(row, request, username):
+                return _error(403, "not your playlist")
+            fields = _fields(body, {k: row[k] for k in _NEW})
+            if isinstance(fields, JSONResponse):
+                return fields
+            if not fields["featured"]:
+                fields["collab"] = 0
+            db.execute(
+                "UPDATE playlists SET name=?, description=?, color=?, featured=?, collab=?, updated=datetime('now') WHERE id=?",
+                (fields["name"], fields["description"], fields["color"], fields["featured"], fields["collab"], playlist_id),
+            )
+            # No longer featured: it leaves the sidebars of the people who saved it.
+            if not fields["featured"]:
+                db.execute("DELETE FROM playlist_saves WHERE playlist_id=?", (playlist_id,))
+            db.commit()
+            return _summary(db, playlist_id, username)
+
+    return await run_in_threadpool(_work)
 
 
 @router.delete(f"{BASE}/{{playlist_id}}")
@@ -410,19 +420,22 @@ async def add_songs(playlist_id: str, request: Request):
     songs = _clean_songs(body.get("songs"), PLAYLIST_MAX_SONGS)
     if not songs:
         return _error(400, "no songs to add")
-    with get_db() as db:
-        db.execute("BEGIN IMMEDIATE")
-        row = db.execute(f"{_SELECT} WHERE id=?", (playlist_id,)).fetchone()
-        if not _visible(row, username):
-            return _error(404, "not found")
-        if not (_can_edit(row, request, username) or (row["featured"] and row["collab"])):
-            return _error(403, "this playlist isn't open to additions")
-        added = _insert_songs(db, playlist_id, songs, username)
-        if added:
-            _touch(db, playlist_id)
-        db.commit()
-        count = db.execute("SELECT COUNT(*) FROM playlist_songs WHERE playlist_id=?", (playlist_id,)).fetchone()[0]
-    return {"added": added, "skipped": len(songs) - added, "count": count, "full": count >= PLAYLIST_MAX_SONGS}
+    def _work():
+        with get_db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(f"{_SELECT} WHERE id=?", (playlist_id,)).fetchone()
+            if not _visible(row, username):
+                return _error(404, "not found")
+            if not (_can_edit(row, request, username) or (row["featured"] and row["collab"])):
+                return _error(403, "this playlist isn't open to additions")
+            added = _insert_songs(db, playlist_id, songs, username)
+            if added:
+                _touch(db, playlist_id)
+            db.commit()
+            count = db.execute("SELECT COUNT(*) FROM playlist_songs WHERE playlist_id=?", (playlist_id,)).fetchone()[0]
+        return {"added": added, "skipped": len(songs) - added, "count": count, "full": count >= PLAYLIST_MAX_SONGS}
+
+    return await run_in_threadpool(_work)
 
 
 @router.delete(f"{BASE}/{{playlist_id}}/songs/{{song_id}}")
@@ -460,26 +473,29 @@ async def reorder_songs(playlist_id: str, request: Request):
     if body is None or not isinstance(body.get("ids"), list):
         return _error(400, "invalid JSON")
     wanted = list(dict.fromkeys(str(i) for i in body["ids"]))
-    with get_db() as db:
-        db.execute("BEGIN IMMEDIATE")
-        row = db.execute(f"{_SELECT} WHERE id=?", (playlist_id,)).fetchone()
-        if not _visible(row, username):
-            return _error(404, "not found")
-        if not _can_edit(row, request, username):
-            return _error(403, "not your playlist")
-        current = [r["song_id"] for r in db.execute(
-            "SELECT song_id FROM playlist_songs WHERE playlist_id=? ORDER BY position", (playlist_id,)).fetchall()]
-        have = set(current)
-        named = [i for i in wanted if i in have]
-        named_set = set(named)
-        order = named + [i for i in current if i not in named_set]
-        db.executemany(
-            "UPDATE playlist_songs SET position=? WHERE playlist_id=? AND song_id=?",
-            [(position, playlist_id, song_id) for position, song_id in enumerate(order)],
-        )
-        _touch(db, playlist_id)
-        db.commit()
-    return {"ok": True, "ids": order}
+    def _work():
+        with get_db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(f"{_SELECT} WHERE id=?", (playlist_id,)).fetchone()
+            if not _visible(row, username):
+                return _error(404, "not found")
+            if not _can_edit(row, request, username):
+                return _error(403, "not your playlist")
+            current = [r["song_id"] for r in db.execute(
+                "SELECT song_id FROM playlist_songs WHERE playlist_id=? ORDER BY position", (playlist_id,)).fetchall()]
+            have = set(current)
+            named = [i for i in wanted if i in have]
+            named_set = set(named)
+            order = named + [i for i in current if i not in named_set]
+            db.executemany(
+                "UPDATE playlist_songs SET position=? WHERE playlist_id=? AND song_id=?",
+                [(position, playlist_id, song_id) for position, song_id in enumerate(order)],
+            )
+            _touch(db, playlist_id)
+            db.commit()
+        return {"ok": True, "ids": order}
+
+    return await run_in_threadpool(_work)
 
 
 # ── Saving someone else's to your own sidebar ──
@@ -493,18 +509,21 @@ async def save_playlist(playlist_id: str, request: Request):
     body = await _json_body(request)
     if body is None:
         return _error(400, "invalid JSON")
-    with get_db() as db:
-        row = db.execute(f"{_SELECT} WHERE id=?", (playlist_id,)).fetchone()
-        if not _visible(row, username):
-            return _error(404, "not found")
-        if row["username"] == username:
-            return _error(400, "that one's already yours")
-        if body.get("saved"):
-            db.execute("INSERT OR IGNORE INTO playlist_saves(playlist_id, username) VALUES (?, ?)", (playlist_id, username))
-        else:
-            db.execute("DELETE FROM playlist_saves WHERE playlist_id=? AND username=?", (playlist_id, username))
-        db.commit()
-        return _summary(db, playlist_id, username)
+    def _work():
+        with get_db() as db:
+            row = db.execute(f"{_SELECT} WHERE id=?", (playlist_id,)).fetchone()
+            if not _visible(row, username):
+                return _error(404, "not found")
+            if row["username"] == username:
+                return _error(400, "that one's already yours")
+            if body.get("saved"):
+                db.execute("INSERT OR IGNORE INTO playlist_saves(playlist_id, username) VALUES (?, ?)", (playlist_id, username))
+            else:
+                db.execute("DELETE FROM playlist_saves WHERE playlist_id=? AND username=?", (playlist_id, username))
+            db.commit()
+            return _summary(db, playlist_id, username)
+
+    return await run_in_threadpool(_work)
 
 
 # ── Covers ──
@@ -538,7 +557,20 @@ def _write_cover(data: bytes) -> str:
         raise ValueError("that image is too large")
     except Exception:
         raise ValueError("that file isn't an image we can read")
-    img = ImageOps.exif_transpose(img)
+    try:
+        img = ImageOps.exif_transpose(img)
+    except Exception:  # a broken Orientation tag: keep it as stored, not a 500
+        pass
+    try:
+        img = _flatten(img)
+    except Exception:
+        raise ValueError("that kind of image isn't supported")
+    img.info = {}  # no metadata (a phone photo's location) rides along
+    img = ImageOps.fit(img, (COVER_SIZES["l"], COVER_SIZES["l"]), Image.LANCZOS)
+    return _save_cover(img)
+
+
+def _flatten(img):
     if "A" in img.getbands() or img.mode == "P":
         img = img.convert("RGBA")
         flat = Image.new("RGB", img.size, (16, 16, 16))
@@ -546,8 +578,10 @@ def _write_cover(data: bytes) -> str:
         img = flat
     elif img.mode != "RGB":
         img = img.convert("RGB")
-    img.info = {}  # no metadata (a phone photo's location) rides along
-    img = ImageOps.fit(img, (COVER_SIZES["l"], COVER_SIZES["l"]), Image.LANCZOS)
+    return img
+
+
+def _save_cover(img) -> str:
     cover_id = secrets.token_urlsafe(12)  # 16 url-safe chars
     os.makedirs(os.path.dirname(_cover_path(cover_id, "l")), exist_ok=True)
     try:

@@ -293,16 +293,32 @@ def _run(cmd: list[str], duration: float | None, lo: float, hi: float, report=No
             time.sleep(5)
     threading.Thread(target=watch, daemon=True).start()
     last = 0.0
-    for line in proc.stdout:
-        heard[0] = time.monotonic()
-        key, _, value = line.strip().partition("=")
-        if report and key == "out_time_us" and duration and value.isdigit():
-            now = time.monotonic()
-            if now - last >= 2:
-                last = now
-                report(round(lo + (hi - lo) * min(1.0, int(value) / 1e6 / duration), 3))
-    proc.wait()
-    t.join(timeout=5)
+    try:
+        for line in proc.stdout:
+            heard[0] = time.monotonic()
+            key, _, value = line.strip().partition("=")
+            if report and key == "out_time_us" and duration and value.isdigit():
+                now = time.monotonic()
+                if now - last >= 2:
+                    last = now
+                    try:
+                        report(round(lo + (hi - lo) * min(1.0, int(value) / 1e6 / duration), 3))
+                    except Exception as e:  # noqa: BLE001 — progress is cosmetic (a busy database), the encode goes on
+                        print(f"videos: couldn't save progress: {e}")
+        proc.wait()
+    except BaseException:
+        # Anything that stops us reading must not leave ffmpeg writing into
+        # a folder that's about to be failed or removed.
+        proc.kill()
+        proc.wait()
+        raise
+    finally:
+        t.join(timeout=5)
+        for pipe in (proc.stdout, proc.stderr):
+            try:
+                pipe.close()
+            except Exception:  # noqa: BLE001
+                pass
     if stalled.is_set():
         raise RuntimeError(f"ffmpeg stopped responding for {FFMPEG_STALL_SECONDS // 60} minutes")
     if proc.returncode != 0:
@@ -627,12 +643,20 @@ def rebuild(post_id: int, log=print) -> bool:
         log(f"video {post_id}: {e}")
         return False
     with get_db() as db:
-        cur = db.execute("SELECT file_id FROM videos WHERE post_id=?", (post_id,)).fetchone()
+        cur = db.execute("SELECT file_id, poster FROM videos WHERE post_id=?", (post_id,)).fetchone()
         if cur is None or cur["file_id"] != row["file_id"]:
             db.rollback()
             shutil.rmtree(new, ignore_errors=True)
             log(f"video {post_id}: changed while it was being made; left as it was")
             return False
+        # A thumbnail picked while it was rebuilt went into the old folder,
+        # which is about to go (studio._swap does the same).
+        now_stem = cur["poster"] or "poster"
+        if now_stem != "poster" and now_stem != stem:
+            for size in ("l", "s"):
+                p = os.path.join(old, f"{now_stem}-{size}.jpg")
+                if os.path.isfile(p):
+                    shutil.copy2(p, os.path.join(new, f"{now_stem}-{size}.jpg"))
         keys = ", ".join(f"{k}=?" for k in cols)
         db.execute(f"UPDATE videos SET file_id=?, status='ready', progress=1, error='', {keys}, updated=datetime('now') WHERE post_id=?",
                    (new_id, *cols.values(), post_id))
@@ -997,7 +1021,10 @@ def sweep_uploads(force: bool = False) -> None:
 
 
 def _fields(body: dict) -> dict:
-    return {k: str(body.get(k) or "") for k in ("title", "description", "published", "kind", "game")}
+    # Capped as create() would keep them, so a session's meta.json stays small
+    # (the description is refused past its limit, so a little over is kept).
+    caps = {"title": 1000, "description": VIDEO_DESC_MAX_CHARS + 1, "published": 64, "kind": 16, "game": 200}
+    return {k: str(body.get(k) or "")[:n] for k, n in caps.items()}
 
 
 @router.post(f"{BASE}/uploads")
@@ -1013,7 +1040,7 @@ def start_upload(request: Request, body: dict):
         return _error(400, "a video is an mp4, mov, mkv, webm, avi or m4v file")
     try:
         size = int(body.get("size"))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return _error(400, "size (bytes) required")
     if size <= 0:
         return _error(400, "that file is empty")
@@ -1227,8 +1254,11 @@ def list_videos(request: Request, limit: int = 24, before_id: int | None = None,
                 if at is not None:
                     page += f" AND (v.published, v.post_id) {'>' if old else '<'} (?, ?)"
                     more = [at["published"], before_id]
-                elif not old:
-                    page += " AND v.post_id < ?"
+                else:
+                    # That video's gone since the last page: page by id
+                    # rather than starting over (sort=old used to repeat
+                    # its first page for good).
+                    page += f" AND v.post_id {'>' if old else '<'} ?"
                     more = [before_id]
             way = "ASC" if old else "DESC"
             rows = db.execute(f"""SELECT {_COLS} FROM videos v JOIN posts p ON p.id = v.post_id WHERE {page}

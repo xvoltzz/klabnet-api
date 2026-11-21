@@ -1,5 +1,6 @@
 import asyncio
 import re
+import threading
 import time
 from datetime import datetime, timedelta
 
@@ -18,6 +19,13 @@ router = APIRouter()
 # beat), for choosing which one their card shows. Only this process's
 # memory: a beat is stale in PRESENCE_TTL seconds anyway.
 _beats: dict[str, dict[str, dict]] = {}
+# POST adds beats on the event loop while GET /api/presence, Together and
+# Activity prune them in worker threads: a prune that found someone's
+# devices empty could drop the beat that had just arrived. Held only for
+# dict work, never across IO.
+_beats_lock = threading.RLock()
+# Device ids are the client's own: one person can't grow this without end.
+_MAX_DEVICES = 16
 
 
 def _shown(username: str, device: str, beat: dict) -> dict:
@@ -34,12 +42,23 @@ def _shown(username: str, device: str, beat: dict) -> dict:
 
     The phone apps aren't in the session and send no device id: together
     they're one device, "", ranked like any other by what it's playing."""
-    _beats.setdefault(username, {})[device] = beat
-    return _best(username, device)
+    with _beats_lock:
+        devices = _beats.setdefault(username, {})
+        devices[device] = beat
+        if len(devices) > _MAX_DEVICES:
+            for d, _ in sorted(devices.items(), key=lambda kv: kv[1]["at"])[:len(devices) - _MAX_DEVICES]:
+                if d != device:
+                    devices.pop(d, None)
+        return _best(username, device)
 
 
 def _best(username: str, keep: str = "") -> dict | None:
     """The beat to show of those still current (`keep`: one just heard from)."""
+    with _beats_lock:
+        return _best_locked(username, keep)
+
+
+def _best_locked(username: str, keep: str) -> dict | None:
     now = time.time()
     devices = _beats.get(username, {})
     # Stale ones go, and so do ones whose page is known to have closed: a
@@ -107,7 +126,7 @@ async def post_presence(request: Request):
     try:
         active_ago = body.get("activeAgo")
         active_ago = None if active_ago is None else max(0, min(int(active_ago), 30 * 86400))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):  # OverflowError: Infinity is valid JSON here
         active_ago = None
     idle_known = bool(body.get("idleKnown", False)) and active_ago is not None
     # lockedFor: the screen's been locked this many seconds. Away at once,
@@ -115,7 +134,7 @@ async def post_presence(request: Request):
     try:
         locked_for = body.get("lockedFor")
         locked_for = None if locked_for is None else max(0, min(int(locked_for), 30 * 86400))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         locked_for = None
 
     # Where it's got to (seconds), for the Activity page's live bar, and
@@ -189,10 +208,8 @@ def _latest(username: str) -> dict:
     """The beat of the device they used last: where they are and the
     status they set (every device sends the same, from synced settings;
     the newest wins while one catches up)."""
-    devices = _beats.get(username) or {}
-    if not devices:
-        return {}
-    beats = list(devices.values())
+    with _beats_lock:
+        beats = list((_beats.get(username) or {}).values())
     return max(beats, key=lambda b: (b.get("used") or 0, b["at"])) if beats else {}
 
 
@@ -345,7 +362,8 @@ def clear_presence(request: Request, device: str = ""):
     username = get_username(request)
     if username == "anonymous":
         return _unauthenticated()
-    _beats.get(username, {}).pop(re.sub(r"[^A-Za-z0-9_-]", "", device)[:40], None)
+    with _beats_lock:
+        _beats.get(username, {}).pop(re.sub(r"[^A-Za-z0-9_-]", "", device)[:40], None)
     shown = _best(username)
     if shown:
         _save_presence(username, shown["song"], shown["artist"], shown["song_id"], shown["playing"],

@@ -22,6 +22,7 @@ import threading
 import time
 
 from fastapi import APIRouter, File, Form, Request, UploadFile
+from starlette.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, JSONResponse
 
 from ..auth import get_groups, get_username, is_admin
@@ -68,7 +69,8 @@ def _author(value) -> str:
 
 
 def _can_edit(r, request: Request, username: str) -> bool:
-    return username in (r["owner"], r["author"]) or is_admin(get_groups(request))
+    # Usernames are lower case; "By" is kept as typed ("Alice").
+    return username in (r["owner"], (r["author"] or "").lower()) or is_admin(get_groups(request))
 
 
 def _error(status: int, message: str) -> JSONResponse:
@@ -268,8 +270,10 @@ def create_station(request: Request, file: UploadFile = File(...), name: str = F
     file_id, ext, length, size = saved
     station_id = secrets.token_urlsafe(9)
     with get_db() as db:
+        db.execute("BEGIN IMMEDIATE")  # the check and the insert as one: no two stations on one spot
         freq = _frequency(frequency, db)
         if isinstance(freq, JSONResponse):
+            db.rollback()
             _remove_audio(file_id, ext)
             return freq
         pos = db.execute("SELECT COALESCE(MAX(position), 0) + 1 AS p FROM radio_stations").fetchone()["p"]
@@ -300,26 +304,32 @@ async def edit_station(station_id: str, request: Request):
     username = _signed_in(request)
     if not username:
         return _error(401, "not authenticated")
-    row, err = _editable(station_id, request, username)
-    if err:
-        return err
     try:
         body = await request.json()
         if not isinstance(body, dict):
             raise ValueError
     except Exception:
         return _error(400, "invalid JSON")
+    # SQLite (and the frequency check's write lock) off the event loop.
+    return await run_in_threadpool(_edit_station, station_id, request, username, body)
+
+
+def _edit_station(station_id: str, request: Request, username: str, body: dict):
+    row, err = _editable(station_id, request, username)
+    if err:
+        return err
     sets, args = [], []
     if "name" in body:
-        name = str(body["name"]).strip()[:60]
+        name = str(body["name"] or "").strip()[:60]
         if not name:
             return _error(400, "a station needs a name")
         sets.append("name=?"); args.append(name)
     if "description" in body:
-        sets.append("description=?"); args.append(str(body["description"]).strip()[:300])
+        sets.append("description=?"); args.append(str(body["description"] or "").strip()[:300])
     if "color" in body:
         c = str(body["color"] or "")
         sets.append("color=?"); args.append(c if _COLOR_RE.fullmatch(c) else "")
+    freq = None
     if "frequency" in body:
         with get_db() as db:
             freq = _frequency(body["frequency"], db, station_id)
@@ -333,10 +343,19 @@ async def edit_station(station_id: str, request: Request):
         sets.append("tracklist=?"); args.append(json.dumps(_tracklist(str(body["tracklist"] or ""))))
     if sets:
         with get_db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            # Again under the write lock: two stations moved onto the same
+            # spot at once both passed the check above.
+            if freq is not None:
+                again = _frequency(freq, db, station_id)
+                if isinstance(again, JSONResponse):
+                    return again
             db.execute(f"UPDATE radio_stations SET {', '.join(sets)}, updated=datetime('now') WHERE id=?", (*args, station_id))
             db.commit()
     with get_db() as db:
         row = db.execute("SELECT * FROM radio_stations WHERE id=?", (station_id,)).fetchone()
+    if row is None:
+        return _error(404, "not found")
     return _json(row, request, username, _listeners())
 
 
@@ -357,11 +376,20 @@ def replace_audio(station_id: str, request: Request, file: UploadFile = File(...
         return saved
     file_id, ext, length, size = saved
     with get_db() as db:
+        # Whatever file it has by now, not what it had before the (long)
+        # upload: two replaces at once left the loser's mix on the share for
+        # good, and one deleted meanwhile was a 500 with the new file kept.
+        db.execute("BEGIN IMMEDIATE")
+        cur = db.execute("SELECT file_id, ext FROM radio_stations WHERE id=?", (station_id,)).fetchone()
+        if cur is None:
+            db.rollback()
+            _remove_audio(file_id, ext)
+            return _error(404, "not found")
         db.execute("UPDATE radio_stations SET file_id=?, ext=?, duration=?, size=?, updated=datetime('now') WHERE id=?",
                    (file_id, ext, length, size, station_id))
         db.commit()
         new = db.execute("SELECT * FROM radio_stations WHERE id=?", (station_id,)).fetchone()
-    _remove_audio(row["file_id"], row["ext"])
+    _remove_audio(cur["file_id"], cur["ext"])
     return _json(new, request, username, _listeners())
 
 
@@ -384,10 +412,18 @@ def upload_cover(station_id: str, request: Request, file: UploadFile = File(...)
     except ValueError as e:
         return _error(400, str(e))
     with get_db() as db:
+        # As playlists' covers: the cover it has now, so two uploads at once
+        # don't leave the loser's files behind (or a deleted station's).
+        db.execute("BEGIN IMMEDIATE")
+        cur = db.execute("SELECT cover FROM radio_stations WHERE id=?", (station_id,)).fetchone()
+        if cur is None:
+            db.rollback()
+            _delete_cover_files(cover_id)
+            return _error(404, "not found")
         db.execute("UPDATE radio_stations SET cover=?, updated=datetime('now') WHERE id=?", (cover_id, station_id))
         db.commit()
         new = db.execute("SELECT * FROM radio_stations WHERE id=?", (station_id,)).fetchone()
-    _delete_cover_files(row["cover"])
+    _delete_cover_files(cur["cover"])
     return _json(new, request, username, _listeners())
 
 
@@ -461,19 +497,22 @@ async def post_chat(station_id: str, request: Request):
     body = str(data.get("body") or "").strip()[:_CHAT_MAX]
     if not body:
         return _error(400, "say something")
-    with get_db() as db:
-        if db.execute("SELECT 1 FROM radio_stations WHERE id=?", (station_id,)).fetchone() is None:
-            return _error(404, "no such station")
-        cur = db.execute("INSERT INTO radio_chat (station, username, body, ts) VALUES (?,?,?,?)",
-                         (station_id, username, body, time.time()))
-        # The newest _CHAT_KEEP of this station's own: ids are shared by every
-        # station, so "lastrowid - 300" kept fewer the busier the others were.
-        db.execute("""DELETE FROM radio_chat WHERE station=? AND id < (
-                        SELECT MIN(id) FROM (SELECT id FROM radio_chat WHERE station=? ORDER BY id DESC LIMIT ?))""",
-                   (station_id, station_id, _CHAT_KEEP))
-        db.commit()
-        row = db.execute("SELECT * FROM radio_chat WHERE id=?", (cur.lastrowid,)).fetchone()
-    return _chat_json(row)
+    def _work():
+        with get_db() as db:
+            if db.execute("SELECT 1 FROM radio_stations WHERE id=?", (station_id,)).fetchone() is None:
+                return _error(404, "no such station")
+            cur = db.execute("INSERT INTO radio_chat (station, username, body, ts) VALUES (?,?,?,?)",
+                             (station_id, username, body, time.time()))
+            # The newest _CHAT_KEEP of this station's own: ids are shared by every
+            # station, so "lastrowid - 300" kept fewer the busier the others were.
+            db.execute("""DELETE FROM radio_chat WHERE station=? AND id < (
+                            SELECT MIN(id) FROM (SELECT id FROM radio_chat WHERE station=? ORDER BY id DESC LIMIT ?))""",
+                       (station_id, station_id, _CHAT_KEEP))
+            db.commit()
+            row = db.execute("SELECT * FROM radio_chat WHERE id=?", (cur.lastrowid,)).fetchone()
+        return _chat_json(row)
+
+    return await run_in_threadpool(_work)
 
 
 @router.delete(f"{BASE}/{{station_id}}/chat/{{msg_id}}")

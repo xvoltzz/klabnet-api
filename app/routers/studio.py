@@ -156,7 +156,7 @@ def clean_edit(raw, duration: float) -> dict | None:
     crop = raw.get("crop") if raw.get("crop") in ("16:9", "9:16", "1:1") else None
     try:
         rotate = int(raw.get("rotate") or 0) % 360
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         rotate = 0
     if rotate not in (0, 90, 180, 270):
         rotate = 0
@@ -433,7 +433,12 @@ def make(post_id: int, log=print) -> bool:
     came) in a new folder, then swaps it in. The old one plays meanwhile."""
     with get_db() as db:
         row = db.execute("SELECT * FROM videos WHERE post_id=?", (post_id,)).fetchone()
-    if row is None or row["status"] != "ready":
+    if row is None:
+        return False
+    if row["status"] != "ready":
+        # Left "queued", _work would put it straight back on the queue, for good.
+        if row["render"] in ("queued", "rendering"):
+            _set(post_id, render="failed", render_error="the video isn't ready")
         return False
     want = row["edit"] or ""
     if want == (row["edit_live"] or "") and not row["render"]:
@@ -645,7 +650,10 @@ def clean_link(raw) -> dict | None:
     if k == "video":
         try:
             vid = int(raw.get("id"))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
+            return None
+        # An id SQLite can't bind would 500 every viewer's GET …/overlays (_expand).
+        if not 0 < vid < 2 ** 63:
             return None
         t = _f(raw.get("t"), 0, 86400, 0) or 0
         return {"kind": k, "id": vid, **({"t": round(t, 2)} if t else {})}
@@ -955,6 +963,14 @@ def get_studio(post_id: int, request: Request):
 async def save_edit(post_id: int, request: Request):
     """{edit: {...} | null}: saves the edit and queues its render (null,
     or an edit that changes nothing, goes back to the upload as it came)."""
+    from starlette.concurrency import run_in_threadpool
+    body = await _body(request)
+    # The rest off the event loop: _studio_json can ffprobe a huge upload
+    # (and make a waveform), which used to stall every request meanwhile.
+    return await run_in_threadpool(_save_edit, post_id, request, body)
+
+
+def _save_edit(post_id: int, request: Request, body):
     username, row, err = _owner(post_id, request)
     if err:
         return err
@@ -964,7 +980,6 @@ async def save_edit(post_id: int, request: Request):
         return _error(503, "storage is offline")
     if not shutil.which("ffmpeg"):
         return _error(503, "this server can't make videos (no ffmpeg)")
-    body = await _body(request)
     if not isinstance(body, dict):
         return _error(400, "invalid JSON")
     source_len = (_loads(row["base"], {}) or {}).get("duration") if row["edit_live"] else row["duration"]
@@ -1104,7 +1119,7 @@ async def vote(post_id: int, card_id: str, request: Request):
     body = await _body(request)
     try:
         option = int((body or {}).get("option"))
-    except (TypeError, ValueError, AttributeError):
+    except (TypeError, ValueError, AttributeError, OverflowError):
         return _error(400, "option (a number) required")
     with get_db() as db:
         row = _row(db, post_id)

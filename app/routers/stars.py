@@ -10,6 +10,7 @@ import re
 import sqlite3
 
 from fastapi import APIRouter, Request
+from starlette.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 
 from ..auth import get_username
@@ -69,17 +70,20 @@ async def toggle_star(request: Request):
     kind, item_id = str(body.get("kind", "")), str(body.get("id", ""))
     if kind not in KINDS or not _ID_RE.fullmatch(item_id):
         return JSONResponse(status_code=400, content={"error": "kind and id required"})
-    with get_db() as db:
-        mine = db.execute(
-            "SELECT 1 FROM stars WHERE kind=? AND item_id=? AND username=?", (kind, item_id, username)
-        ).fetchone()
-        if mine:
-            db.execute("DELETE FROM stars WHERE kind=? AND item_id=? AND username=?", (kind, item_id, username))
-        else:
-            try:
-                db.execute("INSERT INTO stars(kind, item_id, username) VALUES (?, ?, ?)", (kind, item_id, username))
-            except sqlite3.IntegrityError:
-                pass  # a racing duplicate: starred either way
-        db.commit()
-        entry = _counts(db, kind, [item_id], username).get(item_id, {"count": 0, "mine": False})
-    return entry
+    def _work():
+        with get_db() as db:
+            mine = db.execute(
+                "SELECT 1 FROM stars WHERE kind=? AND item_id=? AND username=?", (kind, item_id, username)
+            ).fetchone()
+            if mine:
+                db.execute("DELETE FROM stars WHERE kind=? AND item_id=? AND username=?", (kind, item_id, username))
+            else:
+                try:
+                    db.execute("INSERT INTO stars(kind, item_id, username) VALUES (?, ?, ?)", (kind, item_id, username))
+                except sqlite3.IntegrityError:
+                    pass  # a racing duplicate: starred either way
+            db.commit()
+            entry = _counts(db, kind, [item_id], username).get(item_id, {"count": 0, "mine": False})
+        return entry
+
+    return await run_in_threadpool(_work)

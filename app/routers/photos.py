@@ -21,6 +21,7 @@ from datetime import datetime, timedelta
 
 from fastapi import APIRouter, File, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
+from starlette.concurrency import run_in_threadpool
 
 from ..auth import get_groups, get_username, is_admin
 from ..config import PHOTO_MAX_UPLOAD_MB, PHOTOS_PER_POST, POST_MAX_CHARS
@@ -313,7 +314,7 @@ async def create_photo_post(request: Request):
     photo_ids = [str(p.get("id", "")) if isinstance(p, dict) else "" for p in items]
     if len(set(photo_ids)) != len(photo_ids):
         return JSONResponse(status_code=400, content={"error": "the same photo is in there twice"})
-    caption = str(body.get("caption", "")).strip()[:POST_MAX_CHARS]
+    caption = str(body.get("caption") or "").strip()[:POST_MAX_CHARS]
     song_json = _sanitize_song(body.get("song"))
     shot_at = _clean_shot_at(body.get("shot_at"))
     if shot_at is None:
@@ -323,53 +324,57 @@ async def create_photo_post(request: Request):
     wanted = list(dict.fromkeys(str(t).strip().lower() for t in raw_tags if str(t).strip()))[:MAX_TAGS]
     wanted = [t for t in wanted if t != username]
 
-    with get_db() as db:
-        # One transaction from the check to the last photo claimed: a double
-        # click on Post made two posts, the second taking the photos and the
-        # first left empty (and answering with an error).
-        db.execute("BEGIN IMMEDIATE")
-        marks = ",".join("?" for _ in photo_ids)
-        owned = db.execute(
-            f"SELECT COUNT(*) FROM photos WHERE id IN ({marks}) AND username=? AND post_id IS NULL",
-            (*photo_ids, username),
-        ).fetchone()[0]
-        if owned != len(photo_ids):
-            return JSONResponse(status_code=400, content={"error": "some of those photos aren't available"})
-        # Only people this site actually knows can be tagged.
-        tags = []
-        if wanted:
-            tmarks = ",".join("?" for _ in wanted)
-            known = {r["username"] for r in db.execute(
-                f"SELECT username FROM users WHERE username IN ({tmarks})", wanted).fetchall()}
-            tags = [t for t in wanted if t in known]
-        if not shot_at and not body.get("shot_at_cleared"):
-            shot_at = _earliest_taken(db, photo_ids)
-        from .clips import game_name
-        game = game_name(db, body.get("game")) if kind == "screenshot" else ""
-        cur = db.execute(
-            "INSERT INTO posts(username, text, song_json, kind, shot_at, game) VALUES (?, ?, ?, ?, ?, ?)",
-            (username, caption, song_json, kind, shot_at, game),
-        )
-        post_id = cur.lastrowid
-        for position, (photo_id, item) in enumerate(zip(photo_ids, items)):
-            if isinstance(item.get("exif"), dict):
-                cur = db.execute(
-                    "UPDATE photos SET post_id=?, position=?, exif_json=? WHERE id=? AND username=? AND post_id IS NULL",
-                    (post_id, position, json.dumps(sanitize_exif(item["exif"])), photo_id, username),
-                )
-            else:
-                cur = db.execute(
-                    "UPDATE photos SET post_id=?, position=? WHERE id=? AND username=? AND post_id IS NULL",
-                    (post_id, position, photo_id, username),
-                )
-            if cur.rowcount != 1:
-                db.rollback()
+    def _work():
+        nonlocal shot_at
+        with get_db() as db:
+            # One transaction from the check to the last photo claimed: a double
+            # click on Post made two posts, the second taking the photos and the
+            # first left empty (and answering with an error).
+            db.execute("BEGIN IMMEDIATE")
+            marks = ",".join("?" for _ in photo_ids)
+            owned = db.execute(
+                f"SELECT COUNT(*) FROM photos WHERE id IN ({marks}) AND username=? AND post_id IS NULL",
+                (*photo_ids, username),
+            ).fetchone()[0]
+            if owned != len(photo_ids):
                 return JSONResponse(status_code=400, content={"error": "some of those photos aren't available"})
-        db.executemany("INSERT INTO post_tags(post_id, username) VALUES (?, ?)", [(post_id, t) for t in tags])
-        db.commit()
-        row = db.execute(f"SELECT {_COLS} FROM posts WHERE id=?", (post_id,)).fetchone()
-        post = _attach(db, [row], username)[0]
-    return post
+            # Only people this site actually knows can be tagged.
+            tags = []
+            if wanted:
+                tmarks = ",".join("?" for _ in wanted)
+                known = {r["username"] for r in db.execute(
+                    f"SELECT username FROM users WHERE username IN ({tmarks})", wanted).fetchall()}
+                tags = [t for t in wanted if t in known]
+            if not shot_at and not body.get("shot_at_cleared"):
+                shot_at = _earliest_taken(db, photo_ids)
+            from .clips import game_name
+            game = game_name(db, body.get("game")) if kind == "screenshot" else ""
+            cur = db.execute(
+                "INSERT INTO posts(username, text, song_json, kind, shot_at, game) VALUES (?, ?, ?, ?, ?, ?)",
+                (username, caption, song_json, kind, shot_at, game),
+            )
+            post_id = cur.lastrowid
+            for position, (photo_id, item) in enumerate(zip(photo_ids, items)):
+                if isinstance(item.get("exif"), dict):
+                    cur = db.execute(
+                        "UPDATE photos SET post_id=?, position=?, exif_json=? WHERE id=? AND username=? AND post_id IS NULL",
+                        (post_id, position, json.dumps(sanitize_exif(item["exif"])), photo_id, username),
+                    )
+                else:
+                    cur = db.execute(
+                        "UPDATE photos SET post_id=?, position=? WHERE id=? AND username=? AND post_id IS NULL",
+                        (post_id, position, photo_id, username),
+                    )
+                if cur.rowcount != 1:
+                    db.rollback()
+                    return JSONResponse(status_code=400, content={"error": "some of those photos aren't available"})
+            db.executemany("INSERT INTO post_tags(post_id, username) VALUES (?, ?)", [(post_id, t) for t in tags])
+            db.commit()
+            row = db.execute(f"SELECT {_COLS} FROM posts WHERE id=?", (post_id,)).fetchone()
+            post = _attach(db, [row], username)[0]
+        return post
+
+    return await run_in_threadpool(_work)
 
 
 @router.put("/api/posts/photos/{post_id}")
@@ -386,42 +391,45 @@ async def edit_photo_post(post_id: int, request: Request):
             raise ValueError("body must be a JSON object")
     except Exception:
         return JSONResponse(status_code=400, content={"error": "invalid JSON"})
-    with get_db() as db:
-        row = db.execute("SELECT username, kind FROM posts WHERE id=? AND kind IN ('photo', 'screenshot')", (post_id,)).fetchone()
-        if row is None:
-            return JSONResponse(status_code=404, content={"error": "not found"})
-        if row["username"] != username and not is_admin(get_groups(request)):
-            return JSONResponse(status_code=403, content={"error": "not your post"})
-        owner = row["username"]
-        if "game" in body and row["kind"] == "screenshot":
-            from .clips import game_name
-            db.execute("UPDATE posts SET game=? WHERE id=?", (game_name(db, body.get("game")), post_id))
-        if "caption" in body:
-            db.execute("UPDATE posts SET text=? WHERE id=?", (str(body.get("caption") or "").strip()[:POST_MAX_CHARS], post_id))
-        if "shot_at" in body:
-            shot_at = _clean_shot_at(body.get("shot_at"))
-            if shot_at is None:
-                return JSONResponse(status_code=400, content={"error": "that shooting date isn't a real date"})
-            if not shot_at:
-                ids = [r["id"] for r in db.execute("SELECT id FROM photos WHERE post_id=?", (post_id,)).fetchall()]
-                shot_at = _earliest_taken(db, ids) if ids else ""
-            db.execute("UPDATE posts SET shot_at=? WHERE id=?", (shot_at, post_id))
-        if "tags" in body:
-            raw = body.get("tags") if isinstance(body.get("tags"), list) else []
-            wanted = list(dict.fromkeys(str(t).strip().lower() for t in raw if str(t).strip()))[:MAX_TAGS]
-            wanted = [t for t in wanted if t != owner]
-            tags = []
-            if wanted:
-                marks = ",".join("?" for _ in wanted)
-                known = {r["username"] for r in db.execute(f"SELECT username FROM users WHERE username IN ({marks})", wanted).fetchall()}
-                tags = [t for t in wanted if t in known]
-            db.execute("DELETE FROM post_tags WHERE post_id=?", (post_id,))
-            db.executemany("INSERT INTO post_tags(post_id, username) VALUES (?, ?)", [(post_id, t) for t in tags])
-        db.commit()
-        row = db.execute(f"SELECT {_COLS} FROM posts WHERE id=?", (post_id,)).fetchone()
-        # _attach drops a post with no photos left: saved, but nothing to show.
-        attached = _attach(db, [row], username) if row else []
-        if not attached:
-            return JSONResponse(status_code=404, content={"error": "that post has no photos any more"})
-        post = attached[0]
-    return post
+    def _work():
+        with get_db() as db:
+            row = db.execute("SELECT username, kind FROM posts WHERE id=? AND kind IN ('photo', 'screenshot')", (post_id,)).fetchone()
+            if row is None:
+                return JSONResponse(status_code=404, content={"error": "not found"})
+            if row["username"] != username and not is_admin(get_groups(request)):
+                return JSONResponse(status_code=403, content={"error": "not your post"})
+            owner = row["username"]
+            if "game" in body and row["kind"] == "screenshot":
+                from .clips import game_name
+                db.execute("UPDATE posts SET game=? WHERE id=?", (game_name(db, body.get("game")), post_id))
+            if "caption" in body:
+                db.execute("UPDATE posts SET text=? WHERE id=?", (str(body.get("caption") or "").strip()[:POST_MAX_CHARS], post_id))
+            if "shot_at" in body:
+                shot_at = _clean_shot_at(body.get("shot_at"))
+                if shot_at is None:
+                    return JSONResponse(status_code=400, content={"error": "that shooting date isn't a real date"})
+                if not shot_at:
+                    ids = [r["id"] for r in db.execute("SELECT id FROM photos WHERE post_id=?", (post_id,)).fetchall()]
+                    shot_at = _earliest_taken(db, ids) if ids else ""
+                db.execute("UPDATE posts SET shot_at=? WHERE id=?", (shot_at, post_id))
+            if "tags" in body:
+                raw = body.get("tags") if isinstance(body.get("tags"), list) else []
+                wanted = list(dict.fromkeys(str(t).strip().lower() for t in raw if str(t).strip()))[:MAX_TAGS]
+                wanted = [t for t in wanted if t != owner]
+                tags = []
+                if wanted:
+                    marks = ",".join("?" for _ in wanted)
+                    known = {r["username"] for r in db.execute(f"SELECT username FROM users WHERE username IN ({marks})", wanted).fetchall()}
+                    tags = [t for t in wanted if t in known]
+                db.execute("DELETE FROM post_tags WHERE post_id=?", (post_id,))
+                db.executemany("INSERT INTO post_tags(post_id, username) VALUES (?, ?)", [(post_id, t) for t in tags])
+            db.commit()
+            row = db.execute(f"SELECT {_COLS} FROM posts WHERE id=?", (post_id,)).fetchone()
+            # _attach drops a post with no photos left: saved, but nothing to show.
+            attached = _attach(db, [row], username) if row else []
+            if not attached:
+                return JSONResponse(status_code=404, content={"error": "that post has no photos any more"})
+            post = attached[0]
+        return post
+
+    return await run_in_threadpool(_work)

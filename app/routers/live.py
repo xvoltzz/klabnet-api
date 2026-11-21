@@ -27,6 +27,7 @@ GET …/chat?after=<last id>), so a new stream starts with an empty one.
 Off (`enabled: false`, the site hides it) unless LiveKit is set up for voice
 and LIVE_INGRESS=1. The tables are made here, on first use, not in db.py.
 Under /api/posts/ because Caddy only forwards a fixed list of prefixes."""
+import asyncio
 import json
 import re
 import secrets
@@ -490,6 +491,12 @@ async def rotate(request: Request):
     renew = ("whip", "rtmp") if which == "both" else (which,) if which in ("whip", "rtmp") else None
     if not renew:
         return _error(400, "which: whip, rtmp or both")
+    # LiveKit calls (Delete/Create/ListIngress, seconds each when it's slow)
+    # and SQLite: off the event loop every stream and call runs on.
+    return await asyncio.to_thread(_rotate, me, renew)
+
+
+def _rotate(me: str, renew: tuple):
     try:
         with _db() as db:
             row = _keys(db, me, renew)
@@ -506,7 +513,7 @@ async def edit_setup(request: Request):
         return _error(401, "not authenticated")
     if not _enabled():
         return _error(503, "streaming isn't set up")
-    return _edit_setup(me, await _body(request))
+    return await asyncio.to_thread(_edit_setup, me, await _body(request))
 
 
 def _edit_setup(me: str, b: dict) -> dict:
@@ -541,11 +548,16 @@ async def edit_someones_setup(user: str, request: Request):
         return _error(404, "no such person")
     if user != me and not is_admin(get_groups(request)):
         return _error(403, "not yours")
+    body = await _body(request)
+    return await asyncio.to_thread(_edit_someones, me, user, body)
+
+
+def _edit_someones(me: str, user: str, body: dict):
     if user != me:
         with _db() as db:
             if not db.execute("SELECT 1 FROM live_keys WHERE username=?", (user,)).fetchone():
                 return _error(404, "they've never set up streaming")
-    return _edit_setup(user, await _body(request))
+    return _edit_setup(user, body)
 
 
 def _user(raw: str) -> str | None:
@@ -634,6 +646,10 @@ async def post_chat(user: str, request: Request):
     body = str((await _body(request)).get("body") or "").strip()[:_CHAT_MAX]
     if not body:
         return _error(400, "say something")
+    return await asyncio.to_thread(_post_chat, me, user, body)
+
+
+def _post_chat(me: str, user: str, body: str):
     with _db() as db:
         s = db.execute("SELECT id FROM live_streams WHERE username=? AND ended IS NULL ORDER BY id DESC LIMIT 1", (user,)).fetchone()
         if not s:

@@ -183,7 +183,7 @@ def _build(start: date, tz: int) -> dict:
                    GROUP BY emoji ORDER BY c DESC LIMIT 3""", (top["post_id"], a, b))]
             line = {"key": "reacted", "postId": p["id"], "kind": p["kind"] or "post", "username": p["username"],
                     "text": _snip(p["text"]), "reactions": top["n"], "emoji": emoji, "people": [p["username"]]}
-            if p["kind"] == "photo":
+            if p["kind"] in ("photo", "screenshot"):
                 ph = db.execute("SELECT id FROM photos WHERE post_id = ? ORDER BY position LIMIT 1", (p["id"],)).fetchone()
                 line["photo"] = ph["id"] if ph else None
             elif p["kind"] == "video":
@@ -269,9 +269,12 @@ def _start(raw: str, tz: int) -> date | None:
     if not _DATE.fullmatch(raw):
         return None
     try:
-        return _monday(date.fromisoformat(raw))
+        d = _monday(date.fromisoformat(raw))
     except ValueError:
         return None
+    # ?start=0001-01-01: the week's bounds and "prev" fell off datetime's
+    # range (OverflowError, a 500). Nothing on klabnet is that old.
+    return d if d.year >= 2000 else None
 
 
 def _social(db, week: str, me: str) -> tuple[dict, dict]:
@@ -419,10 +422,12 @@ def recap_items(db, me: str, at: str) -> list[dict]:
     def iso(s):
         return s.replace(" ", "T") + "Z" if s and "T" not in s else s
     items: dict[tuple, dict] = {}
-    like = f"%,{me},%"
+    # instr, not LIKE: a "_" in a username is LIKE's any-character, so
+    # "a_b" was told about lines that were about "axb".
+    mark = f",{me},"
     for r in db.execute(
         """SELECT week, line, username, emoji, created, label FROM week_reactions
-           WHERE username != ? AND created > ? AND about LIKE ? ORDER BY created DESC LIMIT 100""", (me, at, like)):
+           WHERE username != ? AND created > ? AND instr(about, ?) > 0 ORDER BY created DESC LIMIT 100""", (me, at, mark)):
         it = items.setdefault(("react", r["week"], r["line"]), {
             "kind": "week-react", "at": iso(r["created"]), "who": [], "emoji": [], "week": r["week"], "line": r["line"],
             "on": r["label"]})
@@ -433,9 +438,9 @@ def recap_items(db, me: str, at: str) -> list[dict]:
     for r in db.execute(
         """SELECT w.week, w.line, w.username, w.text, w.created, w.label FROM week_replies w
            WHERE w.username != ? AND w.created > ?
-             AND (w.about LIKE ? OR EXISTS (SELECT 1 FROM week_replies m WHERE m.week = w.week AND m.line = w.line
+             AND (instr(w.about, ?) > 0 OR EXISTS (SELECT 1 FROM week_replies m WHERE m.week = w.week AND m.line = w.line
                                              AND m.username = ? AND m.id < w.id))
-           ORDER BY w.id DESC LIMIT 60""", (me, at, like, me)):
+           ORDER BY w.id DESC LIMIT 60""", (me, at, mark, me)):
         it = items.setdefault(("reply", r["week"], r["line"]), {
             "kind": "week-reply", "at": iso(r["created"]), "who": [], "week": r["week"], "line": r["line"],
             "on": r["label"], "text": _snip(r["text"])})

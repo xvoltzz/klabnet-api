@@ -20,6 +20,7 @@ and thumb copies never carry metadata.
 """
 
 import io
+import math
 import os
 import re
 import secrets
@@ -89,10 +90,13 @@ def delete_photo_files(photo_ids) -> None:
 # ── EXIF → display strings ──
 
 def _num(value):
+    # A rational with a zero denominator reads as NaN (or inf), and
+    # round()/int() of that raised: one odd camera's EXIF was a 500.
     try:
-        return float(value)
-    except (TypeError, ValueError, ZeroDivisionError):
+        v = float(value)
+    except (TypeError, ValueError, ZeroDivisionError, OverflowError):
         return None
+    return v if math.isfinite(v) else None
 
 
 def _clean(value) -> str:
@@ -300,18 +304,27 @@ def backfill_derivatives(log=print) -> int:
         return 0
     done = 0
     for shard in sorted(os.listdir(root)):
-        for photo_id in sorted(os.listdir(os.path.join(root, shard))):
+        # A stray file in photos/ (.DS_Store, the share's own) made listdir
+        # raise and ended the whole backfill thread.
+        if not os.path.isdir(os.path.join(root, shard)):
+            continue
+        try:
+            names = sorted(os.listdir(os.path.join(root, shard)))
+        except OSError as e:
+            log(f"backfill {shard}: {e}")
+            continue
+        for photo_id in names:
             folder = os.path.join(root, shard, photo_id)
             if not valid_photo_id(photo_id) or not os.path.isfile(os.path.join(folder, "original.jpg")):
                 continue
             if os.path.isfile(os.path.join(folder, DERIV_MARKER)):
                 continue
+            tmp = folder + ".partial"
             try:
-                img = Image.open(os.path.join(folder, "original.jpg"))
-                img.load()
-                icc = img.info.get("icc_profile")
-                oriented = ImageOps.exif_transpose(img).convert("RGB")
-                tmp = folder + ".partial"
+                with Image.open(os.path.join(folder, "original.jpg")) as img:
+                    img.load()
+                    icc = img.info.get("icc_profile")
+                    oriented = ImageOps.exif_transpose(img).convert("RGB")
                 os.makedirs(tmp, exist_ok=True)
                 write_derivatives(oriented, tmp, icc)
                 # Swap each file in place (the marker last), then drop old markers.
@@ -323,6 +336,7 @@ def backfill_derivatives(log=print) -> int:
                         os.remove(os.path.join(folder, f))
                 done += 1
             except Exception as e:  # one bad file mustn't stop the rest
+                shutil.rmtree(tmp, ignore_errors=True)
                 log(f"backfill {photo_id}: {e}")
     return done
 
@@ -342,7 +356,10 @@ def process_upload(data: bytes) -> dict:
     except Exception:
         raise PhotoError("that file isn't an image we can read")
 
-    exif = read_exif(img)
+    try:
+        exif = read_exif(img)
+    except Exception:  # malformed EXIF: the photo is still fine without it
+        exif = dict.fromkeys(EXIF_FIELDS, "")
     icc = img.info.get("icc_profile")
 
     original = None
@@ -358,14 +375,20 @@ def process_upload(data: bytes) -> dict:
         except Exception:
             original = None
 
-    oriented = ImageOps.exif_transpose(img)
-    if oriented.mode not in ("RGB", "L"):
-        if "A" in oriented.getbands():
-            flat = Image.new("RGB", oriented.size, (255, 255, 255))
-            flat.paste(oriented, mask=oriented.getchannel("A"))
-            oriented = flat
-        else:
-            oriented = oriented.convert("RGB")
+    try:
+        oriented = ImageOps.exif_transpose(img)
+    except Exception:  # a broken Orientation tag: keep it as stored
+        oriented = img
+    try:
+        if oriented.mode not in ("RGB", "L"):
+            if "A" in oriented.getbands():
+                flat = Image.new("RGB", oriented.size, (255, 255, 255))
+                flat.paste(oriented, mask=oriented.getchannel("A"))
+                oriented = flat
+            else:
+                oriented = oriented.convert("RGB")
+    except Exception:  # a mode Pillow can't turn into RGB (16-bit, float…)
+        raise PhotoError("that kind of image isn't supported")
     # Nothing rides along into the files written from this (XMP from a HEIC
     # or WebP can carry the location, and Pillow writes it back out); the
     # colour profile is passed explicitly.

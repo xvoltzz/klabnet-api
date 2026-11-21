@@ -53,6 +53,7 @@ KEEPALIVE = 15
 POLL = 5
 MAX_DEVICES = 12
 MAX_FAVORITES = 24
+PLACE_PER_MINUTE = 10         # calls one person can place a minute
 LOG_LIMIT = 60
 
 _DEVICE_RE = re.compile(r"[A-Za-z0-9_-]{8,40}")
@@ -135,6 +136,11 @@ def _resolve(db, to: str) -> str | None:
         return next((u for u, e in exts.items() if e == n), None)
     row = db.execute("SELECT username FROM users WHERE lower(username) = ?", (to.lstrip("@"),)).fetchone()
     return row["username"] if row and not row["username"].endswith("-bot") else None
+
+
+def _resolve_to(to) -> str | None:
+    with get_db() as db:
+        return _resolve(db, to)
 
 
 @router.get(f"{BASE}/extensions")
@@ -273,7 +279,11 @@ def _finish(c: dict, outcome: str, by: str = "") -> None:
     for h in c.pop("_timers", []):
         h.cancel()
     _tell(c)
-    _log(c)
+    # SQLite (up to its 5s busy wait): off the event loop, like the room below.
+    try:
+        asyncio.get_running_loop().run_in_executor(None, _log, dict(c))
+    except RuntimeError:
+        _log(c)
     if was_live and _enabled():
         # A blocking HTTP call (up to 5s with LiveKit down): off the event
         # loop, which every page's stream and every call's timers run on.
@@ -352,16 +362,20 @@ async def stream(request: Request, device: str = ""):
         return _error(401, "not authenticated")
     if not _DEVICE_RE.fullmatch(device):
         return _error(400, "bad device id")
-    mine = _streams.setdefault(me, {})
-    if device not in mine and len(mine) >= MAX_DEVICES:
+    if device not in (_streams.get(me) or {}) and len(_streams.get(me) or {}) >= MAX_DEVICES:
         return _error(429, "too many devices")
     d = _Device(device)
-    old = mine.get(device)
-    if old:
-        _end_stream(old)
-    mine[device] = d
 
     async def events():
+        # Registered here, not before the response: a client gone before
+        # the body is first read never starts this generator, its `finally`
+        # never ran, and the dead device stayed in _streams for good (calls
+        # to that person rang it for 30s instead of saying "unavailable").
+        mine = _streams.setdefault(me, {})
+        old = mine.get(device)
+        if old:
+            _end_stream(old)
+        mine[device] = d
         try:
             c = _call_of(me)
             yield f"event: hello\ndata: {json.dumps({'call': _public(c) if c else None, 't': _ms()})}\n\n"
@@ -410,8 +424,7 @@ async def place(request: Request):
         return _error(409, "not connected")
     if not _enabled():
         return _error(503, "calls need voice set up")
-    with get_db() as db:
-        callee = _resolve(db, body.get("to"))
+    callee = await asyncio.to_thread(_resolve_to, body.get("to"))  # SQLite (and _assign's writes): off the loop
     if not callee:
         return _error(404, "nobody has that number" if str(body.get("to") or "").strip().isdigit() else "no one by that name")
     if callee == me:
@@ -419,6 +432,11 @@ async def place(request: Request):
     if _call_of(me):
         return _error(409, "you're already in a call")
     now = _ms()
+    # A call that can't ring (dnd, busy, nobody there) ends at once, so
+    # nothing else stops a loop of them: each is a row in `calls`, a
+    # "missed call" in the callee's recap, and a minute in _calls.
+    if sum(1 for x in list(_calls.values()) if x["from"] == me and now - x["started"] < 60_000) >= PLACE_PER_MINUTE:
+        return _error(429, "too many calls: wait a minute")
     c = {"id": secrets.token_urlsafe(9), "from": me, "to": callee, "state": "ringing", "outcome": "",
          "started": now, "answered": 0, "ended": 0, "callerDevice": device, "device": "", "endedBy": ""}
     _calls[c["id"]] = c
@@ -515,7 +533,8 @@ async def token(call_id: str, request: Request):
         "sub": me, "name": me,
         "video": {
             "room": ROOM_PREFIX + c["id"], "roomJoin": True, "canSubscribe": True, "canPublish": True,
-            "canPublishSources": ["microphone", "camera", "screen_share", "screen_share_audio"],
+            # No camera: calls are voice only (js/46-calls.js never publishes one).
+            "canPublishSources": ["microphone", "screen_share", "screen_share_audio"],
             "canPublishData": True, "canUpdateOwnMetadata": True,
         },
     }, TOKEN_TTL)
