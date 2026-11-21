@@ -83,7 +83,7 @@ PLAYLISTS_PER_USER      = int(os.environ.get("PLAYLISTS_PER_USER", "200"))
 PLAYLIST_COVER_MAX_MB   = int(os.environ.get("PLAYLIST_COVER_MAX_MB", "20"))
 
 # ── Videos (routers/videos.py): uploads, made into an HLS ladder by ffmpeg ──
-VIDEO_MAX_MB          = int(os.environ.get("VIDEO_MAX_MB", "4096"))
+VIDEO_MAX_MB          = int(os.environ.get("VIDEO_MAX_MB", "51200"))
 VIDEO_TITLE_MAX_CHARS = int(os.environ.get("VIDEO_TITLE_MAX_CHARS", "100"))
 VIDEO_DESC_MAX_CHARS  = int(os.environ.get("VIDEO_DESC_MAX_CHARS", "5000"))
 # x264's preset: slower is smaller files for the same look, and more CPU

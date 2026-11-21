@@ -27,6 +27,7 @@ import subprocess
 import threading
 import time
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 from fastapi import APIRouter, File, Form, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
@@ -246,7 +247,13 @@ def _set(post_id: int, **cols) -> None:
 
 def _die_with_us() -> None:
     """In the child, before ffmpeg starts: die when this server does, so a
-    restart's job never races one left over from before it (Linux only)."""
+    restart's job never races one left over from before it (Linux only).
+    And a step back in the CPU queue, so a long encode doesn't starve the
+    API itself (an upload arriving while another video is being made)."""
+    try:
+        os.nice(10)
+    except OSError:
+        pass
     try:
         import ctypes
         import signal
@@ -625,6 +632,10 @@ def _work() -> None:
                     _enqueue(pid)
             except Exception as e:  # noqa: BLE001
                 print(f"videos: couldn't look for queued videos: {e}")
+            try:
+                sweep_uploads()
+            except Exception as e:  # noqa: BLE001
+                print(f"videos: couldn't sweep old uploads: {e}")
             continue
         try:
             _transcode(post_id)
@@ -790,7 +801,7 @@ def _save_upload(file: UploadFile) -> tuple[str, str, int] | JSONResponse:
 
 def create(request: Request | None, username: str, file, title: str, description: str, unlisted: bool = False,
            published: str | None = None, source_id: str = "", thumb: str | None = None,
-           queue_it: bool = True, kind: str = "", game: str = "") -> int | JSONResponse:
+           queue_it: bool = True, kind: str = "", game: str = "", saved: tuple[str, str, int] | None = None) -> int | JSONResponse:
     """An upload made into a video and queued for ffmpeg: its post id. An
     unlisted one (uploaded straight into a TV channel, routers/tv.py) is
     left out of Videos' lists. file is an UploadFile, or anything with
@@ -799,21 +810,29 @@ def create(request: Request | None, username: str, file, title: str, description
     was imported from. thumb: a picture file to make the poster from. With
     queue_it False (the importer, another process) the row is left
     processing for this server's worker to find. kind 'clip': a clip
-    (routers/clips.py), up to CLIP_MAX_SECONDS long, with its game."""
+    (routers/clips.py), up to CLIP_MAX_SECONDS long, with its game.
+    saved: (file_id, ext, size) of an upload already in its folder as
+    source.<ext> (a chunked upload, finish_upload); file is then only its
+    name. Anything that fails removes that folder."""
+    def refuse(status: int, message: str) -> JSONResponse:
+        if saved:
+            _remove_folder(saved[0])
+        return _error(status, message)
     try:
         published = parse_published(published)
     except ValueError as e:
-        return _error(400, str(e))
+        return refuse(400, str(e))
     if not media_ready():
-        return _error(503, "storage is offline")
+        return refuse(503, "storage is offline")
     if not shutil.which("ffmpeg"):
-        return _error(503, "this server can't make videos yet (no ffmpeg)")
+        return refuse(503, "this server can't make videos yet (no ffmpeg)")
     if len(description.strip()) > VIDEO_DESC_MAX_CHARS:
-        return _error(400, f"a description can be up to {VIDEO_DESC_MAX_CHARS:,} characters")
+        return refuse(400, f"a description can be up to {VIDEO_DESC_MAX_CHARS:,} characters")
     title = " ".join(title.split())[:VIDEO_TITLE_MAX_CHARS] or os.path.splitext(file.filename or "")[0][:VIDEO_TITLE_MAX_CHARS].strip() or "Untitled"
-    saved = _save_upload(file)
-    if isinstance(saved, JSONResponse):
-        return saved
+    if saved is None:
+        saved = _save_upload(file)
+        if isinstance(saved, JSONResponse):
+            return saved
     file_id, ext, size = saved
     info = probe(os.path.join(_folder(file_id), f"source.{ext}"))
     if info is None:
@@ -830,16 +849,22 @@ def create(request: Request | None, username: str, file, title: str, description
                 shutil.copyfile(thumb, os.path.join(_folder(file_id), f"thumb.{t_ext}"))
             except OSError as e:
                 print(f"videos: couldn't keep the thumbnail {thumb}: {e}")
-    with get_db() as db:
-        from .clips import game_name
-        game = game_name(db, game) if kind else ""
-        cur = db.execute("INSERT INTO posts(username, text, kind) VALUES (?, ?, 'video')", (username, description.strip()))
-        post_id = cur.lastrowid
-        db.execute("""INSERT INTO videos(post_id, title, file_id, ext, duration, width, height, size, unlisted, published, source_id, kind, game)
-                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, datetime('now')), ?, ?, ?)""",
-                   (post_id, title, file_id, ext, info["duration"], info["width"], info["height"], size, 1 if unlisted else 0,
-                    published, source_id, kind, game))
-        db.commit()
+    try:
+        with get_db() as db:
+            from .clips import game_name
+            game = game_name(db, game) if kind else ""
+            cur = db.execute("INSERT INTO posts(username, text, kind) VALUES (?, ?, 'video')", (username, description.strip()))
+            post_id = cur.lastrowid
+            db.execute("""INSERT INTO videos(post_id, title, file_id, ext, duration, width, height, size, unlisted, published, source_id, kind, game)
+                          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, datetime('now')), ?, ?, ?)""",
+                       (post_id, title, file_id, ext, info["duration"], info["width"], info["height"], size, 1 if unlisted else 0,
+                        published, source_id, kind, game))
+            db.commit()
+    except Exception:
+        # A row that couldn't be written (the database busy past its
+        # timeout): no video, so no folder either.
+        _remove_folder(file_id)
+        raise
     if queue_it:
         _enqueue(post_id)
     return post_id
@@ -857,6 +882,277 @@ def upload(request: Request, file: UploadFile = File(...), title: str = Form("")
         return post_id
     with get_db() as db:
         return _one(db, post_id, request, username)
+
+
+# ── Chunked uploads ──
+# A big file goes up in parts (PUT, up to _PART_MAX each, in order) into a
+# session on the media share, then finish_upload makes it a video like the
+# single POST above. Nothing passes through the server's temporary folder
+# (the single POST's multipart body is spooled whole into /tmp before the
+# route even runs: a 13GB file filled the container's disk and was then
+# refused at VIDEO_MAX_MB anyway), each request is small enough for any
+# proxy's body limit, and a part that fails is sent again from where the
+# server says it got to, so a dropped link or a restart only costs a part.
+# Sessions not touched for _UPLOAD_TTL are swept (sweep_uploads).
+_UPLOADS = os.path.join(MEDIA_DIR, "videos", ".uploads")  # never a 2-letter file-id folder
+_UPLOAD_ID_RE = re.compile(r"[A-Za-z0-9_-]{16,40}")
+_PART_MAX = 96 * 1024 * 1024
+_UPLOAD_TTL = 2 * 86400
+_UPLOADS_PER_USER = 8
+_upload_locks: dict[str, threading.Lock] = {}
+_upload_locks_lock = threading.Lock()
+_swept = 0.0
+
+
+def _session_dir(sid: str) -> str:
+    return os.path.join(_UPLOADS, sid)
+
+
+def _session(sid: str, username: str):
+    """(meta, data path) of the caller's own session, or an error response."""
+    if not _UPLOAD_ID_RE.fullmatch(sid or ""):
+        return None, None, _error(404, "that upload isn't there any more")
+    try:
+        with open(os.path.join(_session_dir(sid), "meta.json"), encoding="utf-8") as f:
+            meta = json.load(f)
+    except (OSError, ValueError):
+        return None, None, _error(404, "that upload isn't there any more")
+    if meta.get("user") != username:
+        return None, None, _error(404, "that upload isn't there any more")
+    return meta, os.path.join(_session_dir(sid), "data"), None
+
+
+def _received(data: str) -> int:
+    try:
+        return os.path.getsize(data)
+    except OSError:
+        return 0
+
+
+def _lock_for(sid: str) -> threading.Lock:
+    with _upload_locks_lock:
+        return _upload_locks.setdefault(sid, threading.Lock())
+
+
+def sweep_uploads(force: bool = False) -> None:
+    """Drops chunked uploads nobody has added to for _UPLOAD_TTL (at most
+    hourly; the worker calls it while idle, and at startup)."""
+    global _swept
+    now = time.time()
+    if not force and now - _swept < 3600:
+        return
+    _swept = now
+    try:
+        names = os.listdir(_UPLOADS)
+    except OSError:
+        return
+    for sid in names:
+        d = _session_dir(sid)
+        try:
+            last = max(os.path.getmtime(os.path.join(d, n)) for n in os.listdir(d)) if os.listdir(d) else os.path.getmtime(d)
+        except (OSError, ValueError):
+            continue
+        if now - last > _UPLOAD_TTL:
+            shutil.rmtree(d, ignore_errors=True)
+            with _upload_locks_lock:
+                _upload_locks.pop(sid, None)
+
+
+def _fields(body: dict) -> dict:
+    return {k: str(body.get(k) or "") for k in ("title", "description", "published", "kind", "game")}
+
+
+@router.post(f"{BASE}/uploads")
+def start_upload(request: Request, body: dict):
+    """{name, size, title?, description?, published?, kind?, game?}: a new
+    chunked upload, checked before a byte is sent. {id, received: 0, part}."""
+    username = _signed_in(request)
+    if not username:
+        return _error(401, "not authenticated")
+    name = str(body.get("name") or "")
+    ext = (os.path.splitext(name)[1][1:] or "").lower()
+    if ext not in _EXTS:
+        return _error(400, "a video is an mp4, mov, mkv, webm, avi or m4v file")
+    try:
+        size = int(body.get("size"))
+    except (TypeError, ValueError):
+        return _error(400, "size (bytes) required")
+    if size <= 0:
+        return _error(400, "that file is empty")
+    if size > _MAX_BYTES:
+        limit = f"{VIDEO_MAX_MB / 1024:.0f}GB" if VIDEO_MAX_MB >= 1024 else f"{VIDEO_MAX_MB}MB"
+        return _error(413, f"a video can be up to {limit} here, and this is {size / 1024 ** 3:.1f}GB")
+    fields = _fields(body)
+    try:
+        parse_published(fields["published"])
+    except ValueError as e:
+        return _error(400, str(e))
+    if len(fields["description"].strip()) > VIDEO_DESC_MAX_CHARS:
+        return _error(400, f"a description can be up to {VIDEO_DESC_MAX_CHARS:,} characters")
+    if not media_ready():
+        return _error(503, "storage is offline")
+    if not shutil.which("ffmpeg"):
+        return _error(503, "this server can't make videos yet (no ffmpeg)")
+    sweep_uploads()
+    os.makedirs(_UPLOADS, exist_ok=True)
+    # Room for it, and for the ladder it becomes (about a third again).
+    free = shutil.disk_usage(_UPLOADS).free
+    if free < size * 1.4 + 512 * 1024 * 1024:
+        return _error(507, f"the server's disk is too full for this ({free / 1024 ** 3:.1f}GB free)")
+    mine = 0
+    for other in os.listdir(_UPLOADS):
+        try:
+            with open(os.path.join(_session_dir(other), "meta.json"), encoding="utf-8") as f:
+                mine += json.load(f).get("user") == username
+        except (OSError, ValueError):
+            pass
+    if mine >= _UPLOADS_PER_USER:
+        return _error(429, "you've too many uploads going at once; finish or stop one first")
+    sid = secrets.token_urlsafe(18)
+    d = _session_dir(sid)
+    os.makedirs(d)
+    with open(os.path.join(d, "meta.json"), "w", encoding="utf-8") as f:
+        json.dump({"user": username, "name": name[:255], "ext": ext, "size": size, "created": time.time(), **fields}, f)
+    open(os.path.join(d, "data"), "wb").close()
+    return {"id": sid, "received": 0, "size": size, "part": _PART_MAX}
+
+
+@router.get(f"{BASE}/uploads/{{sid}}")
+def upload_status(sid: str, request: Request):
+    """How much of it the server has: where to carry on from."""
+    username = _signed_in(request)
+    if not username:
+        return _error(401, "not authenticated")
+    meta, data, err = _session(sid, username)
+    if err:
+        return err
+    return {"id": sid, "received": _received(data), "size": meta["size"], "part": _PART_MAX}
+
+
+@router.put(f"{BASE}/uploads/{{sid}}")
+async def upload_part(sid: str, request: Request, offset: int = -1):
+    """A part, as the raw body, written at ?offset= (which must be what the
+    server has, or less: a part sent again after its answer was lost)."""
+    from starlette.concurrency import run_in_threadpool
+    from starlette.requests import ClientDisconnect
+    username = _signed_in(request)
+    if not username:
+        return _error(401, "not authenticated")
+    meta, data, err = _session(sid, username)
+    if err:
+        return err
+    try:
+        length = int(request.headers.get("content-length") or -1)
+    except ValueError:
+        length = -1
+    if length > _PART_MAX:
+        return _error(413, f"a part can be up to {_PART_MAX // 1048576}MB")
+    lock = _lock_for(sid)
+    if not lock.acquire(blocking=False):
+        return _error(409, "that upload is already being sent")
+    try:
+        have = _received(data)
+        if offset < 0 or offset > have:
+            return JSONResponse(status_code=409, content={"error": "out of step", "received": have})
+        f = await run_in_threadpool(open, data, "r+b")
+        try:
+            if offset < have:
+                await run_in_threadpool(f.truncate, offset)
+            f.seek(offset)
+            got, buf = 0, []
+            pending = 0
+            try:
+                async for chunk in request.stream():
+                    got += len(chunk)
+                    if got > _PART_MAX or offset + got > meta["size"]:
+                        await run_in_threadpool(f.truncate, offset)
+                        return _error(413, "that's more than the file's size" if got <= _PART_MAX else
+                                      f"a part can be up to {_PART_MAX // 1048576}MB")
+                    buf.append(chunk)
+                    pending += len(chunk)
+                    if pending >= 1048576:
+                        await run_in_threadpool(f.write, b"".join(buf))
+                        buf, pending = [], 0
+                if buf:
+                    await run_in_threadpool(f.write, b"".join(buf))
+            except ClientDisconnect:
+                # What arrived is kept; the page asks where it got to.
+                pass
+            await run_in_threadpool(f.flush)
+        finally:
+            await run_in_threadpool(f.close)
+        return {"received": _received(data), "size": meta["size"]}
+    except OSError as e:
+        return _error(507 if getattr(e, "errno", 0) == 28 else 500,
+                      "the server's disk is full" if getattr(e, "errno", 0) == 28 else f"couldn't save that part: {e}")
+    finally:
+        lock.release()
+
+
+def take_upload(sid: str, username: str):
+    """A finished chunked upload moved into a new video folder as
+    source.<ext>: ((file_id, ext, size), its meta), or (None, an error).
+    For finish_upload and routers/tv.py's upload into a channel."""
+    meta, data, err = _session(sid, username)
+    if err:
+        return None, err
+    lock = _lock_for(sid)
+    if not lock.acquire(blocking=False):
+        return None, _error(409, "that upload is still being sent")
+    try:
+        have = _received(data)
+        if have != meta["size"]:
+            return None, JSONResponse(status_code=409, content={"error": "it isn't all there yet", "received": have})
+        file_id = secrets.token_urlsafe(12)
+        folder = _folder(file_id)
+        os.makedirs(folder, exist_ok=True)
+        try:
+            os.replace(data, os.path.join(folder, f"source.{meta['ext']}"))  # the same share: a rename
+        except OSError:
+            shutil.rmtree(folder, ignore_errors=True)
+            raise
+        shutil.rmtree(_session_dir(sid), ignore_errors=True)
+        return (file_id, meta["ext"], have), meta
+    finally:
+        lock.release()
+        with _upload_locks_lock:
+            _upload_locks.pop(sid, None)
+
+
+@router.post(f"{BASE}/uploads/{{sid}}/done")
+def finish_upload(sid: str, request: Request, body: dict | None = None):
+    """All of it's there: made into a video (the single POST's answer).
+    body may carry the fields again (title… as at the start), which win."""
+    username = _signed_in(request)
+    if not username:
+        return _error(401, "not authenticated")
+    saved, meta = take_upload(sid, username)
+    if saved is None:
+        return meta
+    body = body or {}
+    fields = {k: (str(body[k] or "") if body.get(k) is not None else str(meta.get(k) or ""))
+              for k in ("title", "description", "published", "kind", "game")}
+    post_id = create(request, username, SimpleNamespace(filename=meta.get("name") or f"video.{saved[1]}"),
+                     fields["title"], fields["description"], published=fields["published"],
+                     kind=fields["kind"], game=fields["game"], saved=saved)
+    if isinstance(post_id, JSONResponse):
+        return post_id
+    with get_db() as db:
+        return _one(db, post_id, request, username)
+
+
+@router.delete(f"{BASE}/uploads/{{sid}}")
+def cancel_upload(sid: str, request: Request):
+    username = _signed_in(request)
+    if not username:
+        return _error(401, "not authenticated")
+    meta, data, err = _session(sid, username)
+    if err:
+        return {"ok": True}
+    shutil.rmtree(_session_dir(sid), ignore_errors=True)
+    with _upload_locks_lock:
+        _upload_locks.pop(sid, None)
+    return {"ok": True}
 
 
 @router.get(BASE)

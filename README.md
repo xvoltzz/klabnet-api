@@ -62,6 +62,9 @@ anything else. Admin-only writes (`POST`/`PUT`/`DELETE` on `/api/apps` and
 | `/api/music-requests/session/cmd` | POST | a device with its stream open | `{device, cmd, to?}`: handed to the active device (or the one named in `to`): `play`, `resume`, `pause`, `seek`, `next`, `prev`, `queue`, `set`, `take` |
 | `/api/music-requests/session/release` | POST | a device with its stream open | `{device}`: the active device's page is closing |
 | `/api/posts/videos` | GET, POST | any | videos (`app/routers/videos.py`), each a `posts` row with kind `video`, so reactions and replies are the posts' own routes. GET `?limit=&before_id=&offset=&user=&sort=new\|old\|popular&q=`: `{videos, total}`, ordered by `published` (`new` newest first, `old` oldest first; `before_id` pages on from that video), others' only once ready, yours always. POST (multipart): `file` (mp4, mov, mkv, webm, avi, m4v; up to `VIDEO_MAX_MB`), `title`, `description`, `published` (optional: a date or an ISO date-time, not in the future; blank is now); answers at once with `status: processing`, and ffmpeg makes the HLS ladder in the background |
+| `/api/posts/videos/uploads` | POST | any | a chunked upload (what the site uses): `{name, size, title?, description?, published?, kind?, game?}`, checked before a byte is sent (type, `VIDEO_MAX_MB`, free space on the share: 413 / 507). `{id, received, part}`. Sessions live on the media share (`videos/.uploads/<id>/`), so nothing is spooled into the container's /tmp; untouched for 2 days, they're swept |
+| `/api/posts/videos/uploads/{id}` | GET, PUT, DELETE | the uploader | GET: how much has arrived (`received`), to carry on from. PUT `?offset=`: a part as the raw body (up to 96MB; the site sends 32MB), at what the server has or before it (a part sent again); 409 `{received}` when out of step. DELETE: stop it |
+| `/api/posts/videos/uploads/{id}/done` | POST | the uploader | all of it's there: made into a video, the single POST's answer. `POST /api/posts/tv/{id}/upload` takes `upload=<id>` in place of `file` the same way |
 | `/api/posts/videos/continue` | GET | any | your videos to carry on with (watched past 5s and short of 95%), newest first |
 | `/api/posts/videos/playlists` | GET, POST | any | video playlists (`app/routers/video_playlists.py`): yours and everyone's featured ones; POST `{name, description?, featured?, videos?: [id…]}` |
 | `/api/posts/videos/playlists/{id}` | GET, PATCH, DELETE | any (private: owner) / owner or admin | one with its videos in order; PATCH `name`, `description`, `featured`, `videos` (the whole order) |
@@ -488,7 +491,7 @@ planned with the desktop recorder, publishing over WHIP the same way.
 | `PLAYLISTS_PER_USER` | `200` | most playlists one person can have |
 | `PLAYLIST_NAME_MAX_CHARS` / `PLAYLIST_DESC_MAX_CHARS` | `80` / `600` | playlist name and description lengths |
 | `PLAYLIST_COVER_MAX_MB` | `20` | largest cover upload |
-| `VIDEO_MAX_MB` | `4096` | largest video upload. Caddy's request body limit (if it has one) has to allow it too |
+| `VIDEO_MAX_MB` | `51200` | largest video upload. The site uploads in 32MB parts, so Caddy's request body limit only has to allow a part (the single POST, for older clients, still needs the whole file) |
 | `VIDEO_TITLE_MAX_CHARS` / `VIDEO_DESC_MAX_CHARS` | `100` / `5000` | video title and description lengths |
 | `VIDEO_PRESET` | `medium` | x264's preset for the ladder (`slow` is better if the CPU keeps up) |
 | `VIDEO_CRF` | `18` | x264's constant quality for the ladder (lower is better and bigger); each rung also has a bitrate ceiling |

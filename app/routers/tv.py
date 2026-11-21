@@ -34,6 +34,7 @@ so a page switches at the boundary on its own."""
 import re
 import secrets
 import time
+from types import SimpleNamespace
 
 from fastapi import APIRouter, File, Form, Query, Request, UploadFile
 from fastapi.responses import JSONResponse
@@ -779,16 +780,28 @@ def remove_item(channel_id: str, pos: int, request: Request):
 
 
 @router.post(f"{BASE}/{{channel_id}}/upload")
-def upload_into(channel_id: str, request: Request, file: UploadFile = File(...), title: str = Form("")):
+def upload_into(channel_id: str, request: Request, file: UploadFile | None = File(None), title: str = Form(""),
+                upload: str = Form("")):
     """A file straight into the channel: made like any video, but unlisted,
-    and put on the end of the lineup (a new channel's only item)."""
+    and put on the end of the lineup (a new channel's only item). The file
+    is the multipart `file`, or `upload`: a finished chunked upload's id
+    (videos.take_upload), which is how the site sends a big one."""
     username = _signed_in(request)
     if not username:
         return _error(401, "not authenticated")
     row, err = _editable(channel_id, request, username)
     if err:
         return err
-    post_id = videos.create(request, username, file, title or row["name"], "", unlisted=True)
+    if upload:
+        saved, meta = videos.take_upload(upload, username)
+        if saved is None:
+            return meta
+        post_id = videos.create(request, username, SimpleNamespace(filename=meta.get("name") or ""), title or row["name"], "",
+                                unlisted=True, saved=saved)
+    elif file is None:
+        return _error(400, "a file or an upload is needed")
+    else:
+        post_id = videos.create(request, username, file, title or row["name"], "", unlisted=True)
     if isinstance(post_id, JSONResponse):
         return post_id
     with get_db() as db:
