@@ -6,9 +6,11 @@ through that proxy — it trusts these headers unconditionally. It must only
 ever be reachable via Caddy, never exposed directly.
 """
 
+import re
+
 from fastapi import HTTPException, Request
 
-from .config import ADMIN_GROUP
+from .config import ADMIN_GROUPS
 from .db import get_db
 
 
@@ -17,12 +19,15 @@ def get_username(request: Request) -> str:
 
 
 def get_groups(request: Request) -> list[str]:
+    # Authentik separates the groups with "|" ("authentik Admins|klabnet-admin");
+    # a comma list (older setups, the dev rig) works too. Split on commas only,
+    # someone in two groups read as one group named "a|b" and was never an admin.
     raw = request.headers.get("x-authentik-groups", "")
-    return [g.strip() for g in raw.split(",") if g.strip()]
+    return [g.strip() for g in re.split(r"[|,]", raw) if g.strip()]
 
 
 def is_admin(groups: list[str]) -> bool:
-    return ADMIN_GROUP in groups
+    return any(g in ADMIN_GROUPS for g in groups)
 
 
 def require_admin(request: Request) -> None:

@@ -19,9 +19,9 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
-from ..auth import get_username
+from ..auth import get_groups, get_username, is_admin
 from ..db import get_db
-from . import calls, live, week
+from . import calls, chat_admin, live, week
 
 router = APIRouter()
 
@@ -164,5 +164,8 @@ def recap(request: Request, since: float = 0):
             "playlists": playlists, "stations": stations,
             # Streams other people started (routers/live.py).
             "live": live.started_since(since, me),
+            # For admins: channels and spaces people made on Matrix
+            # (routers/chat_admin.py), so nothing new goes unseen.
+            "rooms": chat_admin.created_since(since) if is_admin(get_groups(request)) else [],
         },
     }

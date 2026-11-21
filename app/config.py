@@ -40,6 +40,10 @@ MEDIA_DIR    = os.environ.get("MEDIA_DIR", "/media")
 PHOTO_MAX_UPLOAD_MB = int(os.environ.get("PHOTO_MAX_UPLOAD_MB", "60"))
 PHOTOS_PER_POST     = int(os.environ.get("PHOTOS_PER_POST", "10"))
 ADMIN_GROUP  = os.environ.get("ADMIN_GROUP", "klabnet-admin")
+# Any of these makes someone a klabnet admin: ADMIN_GROUP, and Authentik's
+# own superuser group (2026-11-21, the owner: "my account xvoltzz should
+# have full admin rights. since i have the authentik admin group").
+ADMIN_GROUPS = {g.strip() for g in os.environ.get("ADMIN_GROUPS", "authentik Admins").split(",") if g.strip()} | {ADMIN_GROUP}
 PRESENCE_TTL = int(os.environ.get("PRESENCE_TTL", "30"))  # seconds
 AWAY_AFTER   = int(os.environ.get("AWAY_AFTER", "300"))   # seconds without input before someone shows as away
 NOTE_MAX_CHARS  = int(os.environ.get("NOTE_MAX_CHARS", "60"))  # same cap Instagram Notes uses
@@ -125,6 +129,11 @@ VOICE_MAX_CHANNELS = int(os.environ.get("VOICE_MAX_CHANNELS", "20"))
 # (WHIP isn't re-encoded at all).
 LIVE_INGRESS   = os.environ.get("LIVE_INGRESS", "").strip().lower() in ("1", "true", "yes", "on")
 LIVE_RTMP_KBPS = int(os.environ.get("LIVE_RTMP_KBPS", "9000"))
+
+# Chat admin (routers/chat_admin.py): a Synapse server admin's access token,
+# so klabnet's admins can manage Matrix rooms from the site. Unset: off.
+MATRIX_URL         = os.environ.get("MATRIX_URL", "https://matrix.klab.gg").strip().rstrip("/")
+MATRIX_ADMIN_TOKEN = os.environ.get("MATRIX_ADMIN_TOKEN", "").strip()
 
 CORS_ORIGINS = [
     origin.strip()

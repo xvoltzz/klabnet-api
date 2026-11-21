@@ -470,6 +470,19 @@ container isn't up or can't reach Redis.
 Desktop streaming straight from klabnet-desktop (no OBS) isn't built: it's
 planned with the desktop recorder, publishing over WHIP the same way.
 
+## Chat admin
+
+klabnet's admins (the Authentik admin group) manage klab's Matrix rooms from the site: every room with who made it and when, who can join and see history, whether it's listed, its people and their roles (invite, kick, ban), and deleting one. `app/routers/chat_admin.py`, under `/api/posts/chat-admin`.
+
+It needs a Synapse **server admin's** access token in `.env`:
+
+```
+MATRIX_URL=https://matrix.klab.gg
+MATRIX_ADMIN_TOKEN=syt_...
+```
+
+(Element, signed in as the server admin: Settings → Help & About → Access token. Logging that session out ends the token.) Changes are made as that user: when it isn't an admin of a room, Synapse's `make_room_admin` makes it one, joining if need be, and it leaves again afterwards if it joined only for that. Message contents are never read. When and by whom each room was made is read once from its `m.room.create` and kept in the `matrix_rooms` table.
+
 ## Environment variables
 
 | Var | Default | Notes |
