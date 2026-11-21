@@ -51,6 +51,7 @@ OCCUPANCY_TTL = 2.0
 
 _http = httpx.Client(timeout=httpx.Timeout(3.0, connect=2.0))
 _occupancy_lock = threading.Lock()
+_refresh_lock = threading.Lock()
 _occupancy_cache = {"at": 0.0, "rooms": {}, "online": False}
 
 
@@ -112,18 +113,42 @@ def _member(p: dict) -> dict:
 
 
 def _occupancy() -> tuple[dict, bool]:
-    """({room name: [member, ...]}, whether LiveKit answered)."""
+    """({room name: [member, ...]}, whether LiveKit answered).
+
+    One request at a time asks LiveKit (`_refresh_lock`); everyone else is
+    answered from the last look meanwhile, however stale. Holding the cache
+    lock across the 1+N calls queued every /api/voice (and Together's
+    rooms) behind a LiveKit that had stopped answering: seconds each, and a
+    threadpool's worth of requests stuck."""
     with _occupancy_lock:
         cache = _occupancy_cache
-        if time.monotonic() - cache["at"] < OCCUPANCY_TTL:
+        if time.monotonic() - cache["at"] < cache.get("ttl", OCCUPANCY_TTL):
             return cache["rooms"], cache["online"]
+        stale, ever = (cache["rooms"], cache["online"]), cache.get("ever", False)
+    # Nothing to fall back on yet: wait a little for the look in progress.
+    got = _refresh_lock.acquire(blocking=False) if ever else _refresh_lock.acquire(timeout=8)
+    if not got:
+        return stale if ever else ({}, False)
+    try:
+        with _occupancy_lock:
+            cache = _occupancy_cache
+            if time.monotonic() - cache["at"] < cache.get("ttl", OCCUPANCY_TTL):
+                return cache["rooms"], cache["online"]
+            before = dict(cache["rooms"])
+            gen = cache.get("gen", 0)
         rooms, online = {}, True
+        deadline = time.monotonic() + 6.0
         try:
             # A room exists from its first join until a few minutes after
             # its last leave, so this is only ever the channels in use.
             for room in _livekit("ListRooms", {}, {"roomList": True}).get("rooms") or []:
                 name = room.get("name", "")
                 if not name.startswith(ROOM_PREFIX):
+                    continue
+                if time.monotonic() > deadline:
+                    # A slow LiveKit: the rooms not reached keep what was known.
+                    if before.get(name):
+                        rooms[name] = before[name]
                     continue
                 people = _livekit("ListParticipants", {"room": name}, {"roomAdmin": True, "room": name})
                 members = [
@@ -134,13 +159,22 @@ def _occupancy() -> tuple[dict, bool]:
                     rooms[name] = sorted(members, key=lambda m: (m["joined"], m["username"]))
         except (httpx.HTTPError, ValueError):
             rooms, online = {}, False
-        cache.update(at=time.monotonic(), rooms=rooms, online=online)
+        with _occupancy_lock:
+            # Not answering: asked again in 5s, not on every poll's 2s.
+            # Forgotten while this look ran (someone walked in): what it saw
+            # may be from before, so the next request looks again.
+            fresh = _occupancy_cache.get("gen", 0) == gen
+            _occupancy_cache.update(at=time.monotonic() if fresh else 0.0, rooms=rooms, online=online, ever=True,
+                                    ttl=OCCUPANCY_TTL if online else 5.0)
         return rooms, online
+    finally:
+        _refresh_lock.release()
 
 
 def _forget_occupancy() -> None:
     with _occupancy_lock:
         _occupancy_cache["at"] = 0.0
+        _occupancy_cache["gen"] = _occupancy_cache.get("gen", 0) + 1
 
 
 def _channels(db) -> list:

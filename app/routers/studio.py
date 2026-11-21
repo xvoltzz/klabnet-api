@@ -483,12 +483,36 @@ def make(post_id: int, log=print) -> bool:
         else:
             _set(post_id, render="failed", render_error=msg[:300])
         return False
+    try:
+        swapped = _swap(post_id, row, new, new_id, old, stem, want, cols, base, log)
+    except Exception as e:  # noqa: BLE001 — the database busy at the swap: not left "rendering" for good
+        shutil.rmtree(new, ignore_errors=True)
+        log(f"video {post_id}: the edit rendered but couldn't be swapped in: {e}")
+        try:
+            _set(post_id, render="failed", render_error=f"couldn't swap the render in: {e}"[:300])
+        except Exception:  # noqa: BLE001
+            pass
+        return False
+    if not swapped:
+        return False
+    V._remove_folder(row["file_id"])
+    log(f"video {post_id}: {'edit' if want else 'original'} rendered in {time.monotonic() - started:.0f}s")
+    return True
+
+
+def _swap(post_id: int, row, new: str, new_id: str, old: str, stem: str, want: str, cols: dict, base, log) -> bool:
+    """The rendered folder in place of the old one (make's last step)."""
     with get_db() as db:
         cur = db.execute("SELECT file_id, edit, poster FROM videos WHERE post_id=?", (post_id,)).fetchone()
         if cur is None or cur["file_id"] != row["file_id"]:
             db.rollback()
             shutil.rmtree(new, ignore_errors=True)
             log(f"video {post_id}: changed while its edit was rendering; left as it was")
+            if cur is not None:
+                # (Rebuilt meanwhile, a new folder: the edit is still wanted,
+                # so it's made again from that one, not left "rendering".)
+                db.execute("UPDATE videos SET render='queued', render_progress=0 WHERE post_id=?", (post_id,))
+                db.commit()
             return False
         again = (cur["edit"] or "") != want
         # A thumbnail picked while it rendered went into the old folder.
@@ -506,8 +530,6 @@ def make(post_id: int, log=print) -> bool:
         if cols.get("duration"):
             db.execute("DELETE FROM video_progress WHERE post_id=? AND position >= ?", (post_id, cols["duration"] * V.DONE_AT))
         db.commit()
-    V._remove_folder(row["file_id"])
-    log(f"video {post_id}: {'edit' if want else 'original'} rendered in {time.monotonic() - started:.0f}s")
     return True
 
 
@@ -862,13 +884,33 @@ def _overlays(db, row, username: str, owner: bool, served: bool = False) -> dict
             "refs": _expand(db, _links_of(anns, cards, end), row["username"], row["post_id"], username)}
 
 
+_probed: dict[str, tuple[float, dict]] = {}
+
+
+def _source_info(path: str) -> dict:
+    """ffprobe of an upload, remembered while the file's the same (the
+    studio asks every 2s while a render runs, and an upload can be huge)."""
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return {}
+    hit = _probed.get(path)
+    if hit and hit[0] == mtime:
+        return hit[1]
+    try:
+        info = V.probe(path) or {}
+    except Exception:  # noqa: BLE001
+        info = {}
+    if len(_probed) > 64:
+        _probed.clear()
+    _probed[path] = (mtime, info)
+    return info
+
+
 def _studio_json(db, row, request: Request, username: str) -> dict:
     edited = bool(row["edit_live"])
     urls = V._urls(row)
-    try:
-        info = V.probe(os.path.join(V._folder(row["file_id"]), f"source.{row['ext']}")) or {}
-    except Exception:  # noqa: BLE001
-        info = {}
+    info = _source_info(os.path.join(V._folder(row["file_id"]), f"source.{row['ext']}"))
     audio = bool(info.get("audio", True))
     base_meta = _loads(row["base"], {}) if edited else None
     files = f"{BASE}/{row['post_id']}/studio/files/{row['file_id']}"

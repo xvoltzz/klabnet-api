@@ -151,7 +151,9 @@ async def search_musicbrainz(request: Request, q: str, type: str = "album"):
 
 
 @router.get("/api/music-requests")
-def list_requests():
+def list_requests(request: Request):
+    if get_username(request) == "anonymous":
+        return JSONResponse({"error": "not signed in"}, status_code=401)
     with get_db() as db:
         rows = db.execute(
             """SELECT id, username, req_type, title, artist, mbid, cover_art_url, status, created

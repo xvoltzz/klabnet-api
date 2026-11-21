@@ -262,6 +262,9 @@ def _die_with_us() -> None:
         pass
 
 
+FFMPEG_STALL_SECONDS = int(os.environ.get("FFMPEG_STALL_SECONDS", "900"))
+
+
 def _run(cmd: list[str], duration: float | None, lo: float, hi: float, report=None) -> None:
     """ffmpeg, telling report() how far it's got (lo..hi of the whole job)
     at most every 2s. Raises RuntimeError with its last words."""
@@ -275,8 +278,23 @@ def _run(cmd: list[str], duration: float | None, lo: float, hi: float, report=No
             del tail[:-20]
     t = threading.Thread(target=drain, daemon=True)
     t.start()
+    # A watchdog: ffmpeg writes progress every half second or so, however
+    # slow the encode. Silence this long is a hang (a GPU driver stall),
+    # which would otherwise hold the one worker for good.
+    heard = [time.monotonic()]
+    stalled = threading.Event()
+
+    def watch():
+        while proc.poll() is None:
+            if time.monotonic() - heard[0] > FFMPEG_STALL_SECONDS:
+                stalled.set()
+                proc.kill()
+                return
+            time.sleep(5)
+    threading.Thread(target=watch, daemon=True).start()
     last = 0.0
     for line in proc.stdout:
+        heard[0] = time.monotonic()
         key, _, value = line.strip().partition("=")
         if report and key == "out_time_us" and duration and value.isdigit():
             now = time.monotonic()
@@ -285,6 +303,8 @@ def _run(cmd: list[str], duration: float | None, lo: float, hi: float, report=No
                 report(round(lo + (hi - lo) * min(1.0, int(value) / 1e6 / duration), 3))
     proc.wait()
     t.join(timeout=5)
+    if stalled.is_set():
+        raise RuntimeError(f"ffmpeg stopped responding for {FFMPEG_STALL_SECONDS // 60} minutes")
     if proc.returncode != 0:
         raise RuntimeError(" / ".join(l for l in tail[-3:] if l) or f"ffmpeg exited {proc.returncode}")
 
@@ -421,9 +441,17 @@ def _stills(src: str, out: str, duration: float | None, w: int, h: int, report=N
     storyboard."""
     at = (duration or 0) * 0.1
     for name, width in (("poster-l.jpg", 1280), ("poster-s.jpg", 480)):
-        subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-ss", f"{at:.2f}", "-i", src,
-                        "-frames:v", "1", "-vf", f"scale={min(width, _even(w))}:-2", "-q:v", "3",
-                        os.path.join(out, name)], check=True, timeout=300)
+        # An odd file that can't seek to 10% gets its first frame instead,
+        # rather than failing the whole video over a poster.
+        for seek in dict.fromkeys((at, 0.0)):
+            try:
+                subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-ss", f"{seek:.2f}", "-i", src,
+                                "-frames:v", "1", "-vf", f"scale={min(width, _even(w))}:-2", "-q:v", "3",
+                                os.path.join(out, name)], check=True, timeout=300, preexec_fn=_die_with_us)
+                break
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+                if seek == 0.0:
+                    raise
     thumb = next((n for n in os.listdir(out) if n.startswith("thumb.")), None)
     if thumb:
         try:
@@ -557,6 +585,11 @@ def rebuild(post_id: int, log=print) -> bool:
     if row is None:
         log(f"video {post_id}: not found")
         return False
+    if row["status"] == "processing":
+        # (Still being made: the API's worker owns it; rebuilding alongside
+        # it would race it for the same folder and row.)
+        log(f"video {post_id}: it's still being made; left to the worker")
+        return False
     if "edit_live" in row.keys() and row["edit_live"]:
         # An edited video is made from its edit (routers/studio.py), never
         # from the upload alone.
@@ -639,6 +672,11 @@ def _work() -> None:
             continue
         try:
             _transcode(post_id)
+        except Exception as e:  # noqa: BLE001 — the database busy at the wrong moment: the worker goes on
+            # (_transcode fails the video itself; this is what got past that,
+            # which used to end this thread, and with it the queue and the
+            # watch for the importer's rows, until the next upload.)
+            print(f"video {post_id}: the worker couldn't finish it ({e}); it's tried again later")
         finally:
             with _worker_lock:
                 _queued.discard(post_id)

@@ -39,6 +39,9 @@ router = APIRouter()
 BASE = "/api/posts/videos/clips"
 GAME_MAX_CHARS = 60
 MIN_SECONDS = 1.0
+# Clips made from a range wait for the one worker, each a near-lossless
+# encode and a ladder: this many of yours at once, waiting or being made.
+QUEUED_PER_USER = 5
 _WINDOWS = {"week": 7 * 86400, "month": 30 * 86400, "all": 0}
 
 
@@ -210,6 +213,12 @@ async def make_clip(post_id: int, request: Request):
     if len(description) > VIDEO_DESC_MAX_CHARS:
         return _error(400, f"a description can be up to {VIDEO_DESC_MAX_CHARS:,} characters")
     title = " ".join(str(body.get("title") or "").split())[:VIDEO_TITLE_MAX_CHARS] or (src["title"] or "Untitled")[:VIDEO_TITLE_MAX_CHARS]
+    with get_db() as db:
+        waiting = db.execute("""SELECT COUNT(*) FROM videos v JOIN posts p ON p.id = v.post_id
+                                WHERE p.username=? AND v.kind='clip' AND v.clip_of > 0
+                                  AND v.status='processing'""", (username,)).fetchone()[0]
+    if waiting >= QUEUED_PER_USER:
+        return _error(429, f"you've {waiting} clips being made already; ask for another once one of them is done")
     file_id = secrets.token_urlsafe(12)
     os.makedirs(V._folder(file_id), exist_ok=True)
     with get_db() as db:
@@ -227,7 +236,7 @@ async def make_clip(post_id: int, request: Request):
         return V._one(db, clip_id, request, username)
 
 
-def cut(row, report=None) -> None:
+def cut(row, report=None, _again=True) -> None:
     """The worker's first step for a clip made from a range: the range of
     the video it's of, cut from that video's upload into this clip's folder
     as source.mkv, through the studio's render (studio.intermediate_cmd):
@@ -260,6 +269,14 @@ def cut(row, report=None) -> None:
         V._encode(lambda enc: ST.intermediate_cmd(path, tmp, edit, info, enc, crf=12, fmt="matroska")[0],
                   length, 0.0, 1.0, report, f"clip {row['post_id']}")
         os.replace(tmp, out)
+    except Exception:
+        # The video was re-rendered or rebuilt while this ran, and its
+        # folder (the upload with it) moved: once more from the new one.
+        if _again and not os.path.isfile(path):
+            if os.path.exists(tmp):
+                os.remove(tmp)
+            return cut(row, report, _again=False)
+        raise
     finally:
         if os.path.exists(tmp):
             os.remove(tmp)

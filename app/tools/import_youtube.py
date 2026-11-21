@@ -269,9 +269,14 @@ def main(argv=None) -> int:
             done[v["id"]] = -1
             stats["imported"] += 1
             continue
-        with open(v["path"], "rb") as f:
-            res = videos.create(None, user, SimpleNamespace(filename=os.path.basename(v["path"]), file=f), v["title"], desc,
-                                unlisted=unlisted, published=v["published"], source_id=v["id"], thumb=v["thumb"], queue_it=False)
+        try:
+            with open(v["path"], "rb") as f:
+                res = videos.create(None, user, SimpleNamespace(filename=os.path.basename(v["path"]), file=f), v["title"], desc,
+                                    unlisted=unlisted, published=v["published"], source_id=v["id"], thumb=v["thumb"], queue_it=False)
+        except Exception as e:  # noqa: BLE001 — one unreadable file (or a busy database) isn't the whole import
+            stats["failed"] += 1
+            print(f"couldn't import {v['title']}: {e}")
+            continue
         if isinstance(res, int):
             done[v["id"]] = res
             stats["imported"] += 1

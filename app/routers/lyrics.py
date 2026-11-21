@@ -51,24 +51,32 @@ def _key(title: str, artist: str, album: str, duration: int) -> str:
 
 
 async def _get(client: httpx.AsyncClient, path: str, params: dict) -> httpx.Response:
-    """One request to LRCLIB, spaced from the last, its rate limit waited out."""
+    """One request to LRCLIB, spaced from the last, its rate limit waited out.
+
+    The lock only spaces the requests themselves: a 429's back-off is
+    waited outside it (and pushes everyone's next request back through
+    `_last`), so lookups from tabs long closed don't queue up behind one
+    request's retries."""
     global _last
-    async with _lock:
-        for attempt in range(_RETRIES + 1):
+    for attempt in range(_RETRIES + 1):
+        async with _lock:
             wait = _MIN_INTERVAL - (time.monotonic() - _last)
             if wait > 0:
                 await asyncio.sleep(wait)
             res = await client.get(f"{BASE}/{path}", params=params, headers=HEADERS)
             _last = time.monotonic()
-            if res.status_code not in (429, 503):
-                return res
-            if attempt == _RETRIES:
-                break
-            try:
-                after = float(res.headers.get("retry-after", "1"))
-            except ValueError:
-                after = 1.0
-            await asyncio.sleep(min(_MAX_WAIT, max(0.5, after)) * (1 + attempt * 0.5))
+        if res.status_code not in (429, 503):
+            return res
+        if attempt == _RETRIES:
+            break
+        try:
+            after = float(res.headers.get("retry-after", "1"))
+        except ValueError:
+            after = 1.0
+        pause = min(_MAX_WAIT, max(0.5, after)) * (1 + attempt * 0.5)
+        # Everyone holds off until then, not just this request.
+        _last = max(_last, time.monotonic() + pause - _MIN_INTERVAL)
+        await asyncio.sleep(pause)
     raise _Busy()
 
 
@@ -125,10 +133,12 @@ async def lyrics(request: Request, title: str = "", artist: str = "", album: str
         return {"lyrics": json.loads(row["body"]) if row["body"] else None, "cached": True}
     try:
         found = await _lookup(title, artist, album, dur)
-    except (_Busy, httpx.HTTPError, ValueError):
+    except (_Busy, httpx.HTTPError, ValueError, TypeError, AttributeError):
+        # (TypeError/AttributeError: an answer that isn't the shape LRCLIB
+        # documents, e.g. an error object where the search's list goes.)
         return JSONResponse(status_code=503, content={"error": "busy"})
     keep = None
-    if found:
+    if isinstance(found, dict):
         keep = {k: found.get(k) for k in ("id", "trackName", "artistName", "albumName", "duration", "instrumental", "plainLyrics", "syncedLyrics")}
     await asyncio.to_thread(_store, key, json.dumps(keep) if keep else "")
     return {"lyrics": keep}
