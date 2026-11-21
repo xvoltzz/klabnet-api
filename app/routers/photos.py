@@ -136,7 +136,12 @@ def get_photo_file(photo_id: str, size: str, request: Request):
 # Timeline order: when the photos were taken, falling back to when they were
 # posted. Both are "YYYY-MM-DD HH:MM:SS", so they compare as strings.
 _SORT = "CASE WHEN shot_at != '' THEN shot_at ELSE created END"
-_COLS = f"id, username, text, image_mxc, song_json, created, shot_at, {_SORT} AS sort_at"
+_COLS = f"id, username, text, image_mxc, song_json, created, shot_at, kind, game, {_SORT} AS sort_at"
+# Photos (kind='photo') and screenshots (kind='screenshot', with a game:
+# Photos → Screenshots, 2026-11-21, the owner: "a screenshots section inside
+# of the photos area too! for game screenshots"). Each lists only its own,
+# so a pile of game screenshots doesn't bury the Timeline.
+KINDS = ("photo", "screenshot")
 _SHOT_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{2}):(\d{2})(?::(\d{2}))?)?$")
 MAX_TAGS = 20
 LIKE = "❤️"
@@ -206,6 +211,9 @@ def _attach(db, rows, username) -> list:
         post["likers"] = likers.get(r["id"], [])
         post["shot_at"] = r["shot_at"]
         post["sort_at"] = r["sort_at"]
+        keys = r.keys()
+        post["kind"] = r["kind"] if "kind" in keys else "photo"
+        post["game"] = r["game"] if "game" in keys else ""
         if post["photos"]:
             out.append(post)
     return out
@@ -216,10 +224,24 @@ def _attach(db, rows, username) -> list:
 _HAS_PHOTOS = "EXISTS (SELECT 1 FROM photos ph WHERE ph.post_id = posts.id)"
 
 
+@router.get("/api/posts/photos/games")
+def screenshot_games(request: Request):
+    """The games there are screenshots of, the most screenshots first, with
+    how many (photos, not posts) and the newest."""
+    with get_db() as db:
+        rows = db.execute(
+            """SELECT ps.game AS name, COUNT(*) AS count, MAX(ps.created) AS newest
+               FROM photos p JOIN posts ps ON ps.id = p.post_id
+               WHERE ps.kind='screenshot' AND ps.game != ''
+               GROUP BY lower(ps.game) ORDER BY count DESC, newest DESC LIMIT 200"""
+        ).fetchall()
+    return {"games": [dict(r) for r in rows]}
+
+
 @router.get("/api/posts/photos")
 def list_photo_posts(
     request: Request, limit: int = 40, before_sort: str | None = None, before_id: int | None = None,
-    order: str = "shot",
+    order: str = "shot", kind: str = "photo", game: str = "",
 ):
     """Photo posts, newest first. order=shot (default) is the timeline, by
     when the photos were taken; order=posted is "What's New", by upload.
@@ -228,32 +250,40 @@ def list_photo_posts(
     limit = max(1, min(limit, 100))
     username = get_username(request)
     posted = order == "posted"
+    kind = kind if kind in KINDS else "photo"
+    game = " ".join(str(game or "").split())
+    # Which posts: this kind, with photos, and (screenshots) of one game.
+    where, args = f"kind=? AND {_HAS_PHOTOS}", [kind]
+    if game:
+        where += " AND lower(game) = lower(?)"
+        args.append(game)
     with get_db() as db:
         if posted:
-            cols = "id, username, text, image_mxc, song_json, created, shot_at, created AS sort_at"
+            cols = "id, username, text, image_mxc, song_json, created, shot_at, kind, game, created AS sort_at"
             if before_id is not None:
                 rows = db.execute(
-                    f"SELECT {cols} FROM posts WHERE kind='photo' AND {_HAS_PHOTOS} AND id < ? ORDER BY id DESC LIMIT ?", (before_id, limit)
+                    f"SELECT {cols} FROM posts WHERE {where} AND id < ? ORDER BY id DESC LIMIT ?", (*args, before_id, limit)
                 ).fetchall()
             else:
-                rows = db.execute(f"SELECT {cols} FROM posts WHERE kind='photo' AND {_HAS_PHOTOS} ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+                rows = db.execute(f"SELECT {cols} FROM posts WHERE {where} ORDER BY id DESC LIMIT ?", (*args, limit)).fetchall()
         elif before_sort is not None and before_id is not None:
             rows = db.execute(
-                f"""SELECT {_COLS} FROM posts WHERE kind='photo' AND {_HAS_PHOTOS}
+                f"""SELECT {_COLS} FROM posts WHERE {where}
                     AND ({_SORT} < ? OR ({_SORT} = ? AND id < ?))
                     ORDER BY sort_at DESC, id DESC LIMIT ?""",
-                (before_sort, before_sort, before_id, limit),
+                (*args, before_sort, before_sort, before_id, limit),
             ).fetchall()
         else:
             rows = db.execute(
-                f"SELECT {_COLS} FROM posts WHERE kind='photo' AND {_HAS_PHOTOS} ORDER BY sort_at DESC, id DESC LIMIT ?", (limit,)
+                f"SELECT {_COLS} FROM posts WHERE {where} ORDER BY sort_at DESC, id DESC LIMIT ?", (*args, limit)
             ).fetchall()
         posts = _attach(db, rows, username)
         # The first page also says how many photos there are in all (not
         # posts: a post can hold several), for the count over the viewer.
         if before_sort is None and before_id is None:
+            gw, ga = ("AND lower(ps.game) = lower(?)", [game]) if game else ("", [])
             total = db.execute(
-                "SELECT COUNT(*) FROM photos p JOIN posts ps ON ps.id = p.post_id WHERE ps.kind='photo'"
+                f"SELECT COUNT(*) FROM photos p JOIN posts ps ON ps.id = p.post_id WHERE ps.kind=? {gw}", (kind, *ga)
             ).fetchone()[0]
             return {"posts": posts, "total": total}
     return {"posts": posts}
@@ -288,6 +318,7 @@ async def create_photo_post(request: Request):
     shot_at = _clean_shot_at(body.get("shot_at"))
     if shot_at is None:
         return JSONResponse(status_code=400, content={"error": "that shooting date isn't a real date"})
+    kind = "screenshot" if body.get("kind") == "screenshot" else "photo"
     raw_tags = body.get("tags") if isinstance(body.get("tags"), list) else []
     wanted = list(dict.fromkeys(str(t).strip().lower() for t in raw_tags if str(t).strip()))[:MAX_TAGS]
     wanted = [t for t in wanted if t != username]
@@ -313,9 +344,11 @@ async def create_photo_post(request: Request):
             tags = [t for t in wanted if t in known]
         if not shot_at and not body.get("shot_at_cleared"):
             shot_at = _earliest_taken(db, photo_ids)
+        from .clips import game_name
+        game = game_name(db, body.get("game")) if kind == "screenshot" else ""
         cur = db.execute(
-            "INSERT INTO posts(username, text, song_json, kind, shot_at) VALUES (?, ?, ?, 'photo', ?)",
-            (username, caption, song_json, shot_at),
+            "INSERT INTO posts(username, text, song_json, kind, shot_at, game) VALUES (?, ?, ?, ?, ?, ?)",
+            (username, caption, song_json, kind, shot_at, game),
         )
         post_id = cur.lastrowid
         for position, (photo_id, item) in enumerate(zip(photo_ids, items)):
@@ -354,12 +387,15 @@ async def edit_photo_post(post_id: int, request: Request):
     except Exception:
         return JSONResponse(status_code=400, content={"error": "invalid JSON"})
     with get_db() as db:
-        row = db.execute("SELECT username FROM posts WHERE id=? AND kind='photo'", (post_id,)).fetchone()
+        row = db.execute("SELECT username, kind FROM posts WHERE id=? AND kind IN ('photo', 'screenshot')", (post_id,)).fetchone()
         if row is None:
             return JSONResponse(status_code=404, content={"error": "not found"})
         if row["username"] != username and not is_admin(get_groups(request)):
             return JSONResponse(status_code=403, content={"error": "not your post"})
         owner = row["username"]
+        if "game" in body and row["kind"] == "screenshot":
+            from .clips import game_name
+            db.execute("UPDATE posts SET game=? WHERE id=?", (game_name(db, body.get("game")), post_id))
         if "caption" in body:
             db.execute("UPDATE posts SET text=? WHERE id=?", (str(body.get("caption") or "").strip()[:POST_MAX_CHARS], post_id))
         if "shot_at" in body:

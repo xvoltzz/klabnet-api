@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
-from ..auth import get_username
+from ..auth import get_groups, get_username, is_admin
 from ..config import NOTE_MAX_CHARS
 from ..db import get_db
 
@@ -55,9 +55,21 @@ async def set_note(request: Request):
 
 
 @router.delete("/api/notes")
-def clear_note(request: Request):
-    """Kept for older pages; a note stays until replaced (see set_note)."""
+def clear_note(request: Request, user: str = ""):
+    """Your own: kept for older pages; a note stays until replaced (see
+    set_note). With ?user=, an admin taking someone's note down (the owner,
+    2026-11-21: admins can delete or modify anything); that one goes. A
+    query, not a path, so it rides the /api/notes route Caddy forwards."""
     username = get_username(request)
     if username == "anonymous":
         return _unauthenticated()
-    return {"ok": True}
+    target = user.strip().lower()
+    if not target or target == username:
+        return {"ok": True}
+    if not is_admin(get_groups(request)):
+        return JSONResponse(status_code=403, content={"error": "admin access required"})
+    with get_db() as db:
+        db.execute("DELETE FROM notes WHERE username=?", (target,))
+        db.commit()
+    return {"ok": True, "text": ""}
+

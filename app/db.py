@@ -609,6 +609,10 @@ def init_db() -> None:
         # '' if never. Shown as "edited" beside the time.
         if "edited" not in post_cols:
             conn.execute("ALTER TABLE posts ADD COLUMN edited TEXT NOT NULL DEFAULT ''")
+        # game: a screenshot's game (kind='screenshot', routers/photos.py),
+        # '' for everything else. Spelt like the clips' (clips.game_name).
+        if "game" not in post_cols:
+            conn.execute("ALTER TABLE posts ADD COLUMN game TEXT NOT NULL DEFAULT ''")
         # videos.unlisted: a video uploaded straight into a TV channel
         # (routers/tv.py), kept out of Videos' lists.
         video_cols = [row[1] for row in conn.execute("PRAGMA table_info(videos)").fetchall()]

@@ -3,7 +3,7 @@ import re
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
-from ..auth import get_username
+from ..auth import get_groups, get_username, is_admin
 from ..config import BIO_MAX_CHARS
 from ..db import get_db
 
@@ -38,6 +38,27 @@ async def update_my_profile(request: Request):
     username = get_username(request)
     if username == "anonymous":
         return _unauthenticated()
+    return await _update_profile(username, request)
+
+
+@router.put("/api/profiles/{target}")
+async def update_someones_profile(target: str, request: Request):
+    """An admin fixing someone else's bio, banner or name colour (the owner,
+    2026-11-21: admins can delete or modify anything). Same body as /me.
+    A path of its own, not /me?user=: an older API would ignore the query
+    and change the admin's own profile instead."""
+    username = get_username(request)
+    if username == "anonymous":
+        return _unauthenticated()
+    target = target.strip().lower()
+    if target != username and not is_admin(get_groups(request)):
+        return JSONResponse(status_code=403, content={"error": "admin access required"})
+    if not target or target == "anonymous":
+        return JSONResponse(status_code=404, content={"error": "no such person"})
+    return await _update_profile(target, request)
+
+
+async def _update_profile(username: str, request: Request):
     try:
         body = await request.json()
         if not isinstance(body, dict):

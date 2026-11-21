@@ -522,7 +522,8 @@ def _program_editable(db, program_id: str, request: Request, username: str):
     if r is None:
         return None, _error(404, "not found")
     channel = _load(db, r["channel_id"])
-    if not (username == r["created_by"] or (channel is not None and _can_edit(channel, request, username))):
+    if not (username == r["created_by"] or is_admin(get_groups(request))
+            or (channel is not None and _can_edit(channel, request, username))):
         return None, _error(403, "not yours to change")
     return r, None
 

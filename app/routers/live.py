@@ -506,7 +506,10 @@ async def edit_setup(request: Request):
         return _error(401, "not authenticated")
     if not _enabled():
         return _error(503, "streaming isn't set up")
-    b = await _body(request)
+    return _edit_setup(me, await _body(request))
+
+
+def _edit_setup(me: str, b: dict) -> dict:
     fields = {}
     for key, cap in (("title", TITLE_MAX), ("game", GAME_MAX), ("description", DESC_MAX)):
         if key in b:
@@ -522,6 +525,27 @@ async def edit_setup(request: Request):
         db.commit()
         r = db.execute("SELECT title, game, description FROM live_keys WHERE username=?", (me,)).fetchone()
     return dict(r)
+
+
+@router.patch(f"{BASE}/{{user}}")
+async def edit_someones_setup(user: str, request: Request):
+    """An admin fixing someone else's title, game or description (the owner,
+    2026-11-21: admins can modify anything). Yourself is /me's job."""
+    me = _signed_in(request)
+    if not me:
+        return _error(401, "not authenticated")
+    if not _enabled():
+        return _error(503, "streaming isn't set up")
+    user = _user(user)
+    if not user:
+        return _error(404, "no such person")
+    if user != me and not is_admin(get_groups(request)):
+        return _error(403, "not yours")
+    if user != me:
+        with _db() as db:
+            if not db.execute("SELECT 1 FROM live_keys WHERE username=?", (user,)).fetchone():
+                return _error(404, "they've never set up streaming")
+    return _edit_setup(user, await _body(request))
 
 
 def _user(raw: str) -> str | None:

@@ -212,8 +212,9 @@ async def create_post(request: Request):
 
 @router.patch("/api/posts/{post_id}")
 async def edit_post(post_id: int, request: Request):
-    """Change a feed post's text. Only its writer can: an admin may delete
-    someone's post but not put words in it. The song, picture and video stay."""
+    """Change a feed post's text: its writer, or an admin (the owner,
+    2026-11-21: admins can delete or modify anything). The song, picture
+    and video stay."""
     username = get_username(request)
     if username == "anonymous":
         return _unauthenticated()
@@ -232,7 +233,7 @@ async def edit_post(post_id: int, request: Request):
         ).fetchone()
         if row is None or row["kind"] != "":
             return JSONResponse(status_code=404, content={"error": "not found"})
-        if row["username"] != username:
+        if row["username"] != username and not is_admin(get_groups(request)):
             return JSONResponse(status_code=403, content={"error": "not your post"})
         if not text and not row["image_mxc"] and not row["song_json"] and not row["video_json"]:
             return JSONResponse(status_code=400, content={"error": "a post with nothing else in it needs some text"})

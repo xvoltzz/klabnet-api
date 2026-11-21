@@ -62,6 +62,12 @@ def game_name(db, raw) -> str:
         return ""
     r = db.execute("""SELECT game FROM videos WHERE kind='clip' AND game != '' AND lower(game) = lower(?)
                       ORDER BY post_id LIMIT 1""", (name,)).fetchone()
+    if r:
+        return r["game"]
+    # Or as a screenshot spelt it (Photos → Screenshots, routers/photos.py):
+    # one name for a game across clips and screenshots.
+    r = db.execute("""SELECT game FROM posts WHERE kind='screenshot' AND game != '' AND lower(game) = lower(?)
+                      ORDER BY id LIMIT 1""", (name,)).fetchone()
     return r["game"] if r else name
 
 

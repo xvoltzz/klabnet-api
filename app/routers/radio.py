@@ -474,3 +474,23 @@ async def post_chat(station_id: str, request: Request):
         db.commit()
         row = db.execute("SELECT * FROM radio_chat WHERE id=?", (cur.lastrowid,)).fetchone()
     return _chat_json(row)
+
+
+@router.delete(f"{BASE}/{{station_id}}/chat/{{msg_id}}")
+def delete_chat(station_id: str, msg_id: int, request: Request):
+    """Take a chat message back: whoever wrote it, the station's editors
+    (live chat's streamer rule) or an admin."""
+    username = _signed_in(request)
+    if not username:
+        return _error(401, "not authenticated")
+    with get_db() as db:
+        r = db.execute("SELECT username FROM radio_chat WHERE id=? AND station=?", (msg_id, station_id)).fetchone()
+        if r is None:
+            return {"ok": True}
+        if r["username"] != username:
+            station = db.execute("SELECT * FROM radio_stations WHERE id=?", (station_id,)).fetchone()
+            if not (is_admin(get_groups(request)) or (station is not None and _can_edit(station, request, username))):
+                return _error(403, "not yours")
+        db.execute("DELETE FROM radio_chat WHERE id=?", (msg_id,))
+        db.commit()
+    return {"ok": True}
