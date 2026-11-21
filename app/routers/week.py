@@ -14,6 +14,7 @@ Computed when asked and kept a few minutes (the current week) or hours
 (a past one). Reactions and replies aren't cached. Under /api/posts/
 because Caddy only forwards a fixed list of /api prefixes; registered
 before posts.router so /api/posts/week isn't taken for a post id."""
+import asyncio
 import calendar
 import re
 import time
@@ -349,7 +350,9 @@ async def react(week: str, line: str, request: Request):
         return _error(401, "not authenticated")
     body = await _body(request)
     tz = _tz(body.get("tz"))
-    ln = _line(week, line, tz)
+    # _line can build a whole week (a dozen queries over listens and posts):
+    # off the event loop.
+    ln = await asyncio.to_thread(_line, week, line, tz)
     if ln is None:
         return _error(404, "no such line that week")
     emoji = str(body.get("emoji", "")).strip()[:EMOJI_MAX_CHARS]
@@ -378,7 +381,7 @@ async def reply(week: str, line: str, request: Request):
     if me == "anonymous":
         return _error(401, "not authenticated")
     body = await _body(request)
-    ln = _line(week, line, _tz(body.get("tz")))
+    ln = await asyncio.to_thread(_line, week, line, _tz(body.get("tz")))
     if ln is None:
         return _error(404, "no such line that week")
     text = str(body.get("text", "")).strip()[:POST_MAX_CHARS]

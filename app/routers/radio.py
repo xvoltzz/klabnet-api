@@ -456,7 +456,9 @@ async def post_chat(station_id: str, request: Request):
         data = await request.json()
     except ValueError:
         return _error(400, "bad request")
-    body = str((data or {}).get("body") or "").strip()[:_CHAT_MAX]
+    if not isinstance(data, dict):
+        return _error(400, "bad request")
+    body = str(data.get("body") or "").strip()[:_CHAT_MAX]
     if not body:
         return _error(400, "say something")
     with get_db() as db:
@@ -464,7 +466,11 @@ async def post_chat(station_id: str, request: Request):
             return _error(404, "no such station")
         cur = db.execute("INSERT INTO radio_chat (station, username, body, ts) VALUES (?,?,?,?)",
                          (station_id, username, body, time.time()))
-        db.execute("DELETE FROM radio_chat WHERE station=? AND id <= ?", (station_id, cur.lastrowid - _CHAT_KEEP))
+        # The newest _CHAT_KEEP of this station's own: ids are shared by every
+        # station, so "lastrowid - 300" kept fewer the busier the others were.
+        db.execute("""DELETE FROM radio_chat WHERE station=? AND id < (
+                        SELECT MIN(id) FROM (SELECT id FROM radio_chat WHERE station=? ORDER BY id DESC LIMIT ?))""",
+                   (station_id, station_id, _CHAT_KEEP))
         db.commit()
         row = db.execute("SELECT * FROM radio_chat WHERE id=?", (cur.lastrowid,)).fetchone()
     return _chat_json(row)

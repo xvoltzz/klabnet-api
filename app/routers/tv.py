@@ -866,11 +866,16 @@ def delete_channel(channel_id: str, request: Request):
     with get_db() as db:
         own = [r[0] for r in db.execute(
             """SELECT DISTINCT t.video_id FROM tv_items t JOIN videos v ON v.post_id = t.video_id
+               JOIN posts p ON p.id = t.video_id
                WHERE t.channel_id=? AND v.unlisted=1
+                 -- Only what this channel's own people uploaded: any id can be
+                 -- put in a lineup, so someone else's unlisted video (an
+                 -- imported one) mustn't be deleted with a channel it was added to.
+                 AND p.username IN (?, ?, ?)
                  AND NOT EXISTS (SELECT 1 FROM tv_items o WHERE o.video_id = t.video_id AND o.channel_id != t.channel_id)
                  AND NOT EXISTS (SELECT 1 FROM tv_program_items pi JOIN tv_programs pr ON pr.id = pi.program_id
                                  WHERE pi.video_id = t.video_id AND pr.channel_id != t.channel_id)""",
-            (channel_id,))]
+            (channel_id, row["created_by"], row["author"] or row["created_by"], username))]
         db.execute("DELETE FROM tv_program_items WHERE program_id IN (SELECT id FROM tv_programs WHERE channel_id=?)", (channel_id,))
         db.execute("DELETE FROM tv_programs WHERE channel_id=?", (channel_id,))
         db.execute("DELETE FROM tv_items WHERE channel_id=?", (channel_id,))

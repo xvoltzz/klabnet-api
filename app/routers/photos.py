@@ -383,5 +383,9 @@ async def edit_photo_post(post_id: int, request: Request):
             db.executemany("INSERT INTO post_tags(post_id, username) VALUES (?, ?)", [(post_id, t) for t in tags])
         db.commit()
         row = db.execute(f"SELECT {_COLS} FROM posts WHERE id=?", (post_id,)).fetchone()
-        post = _attach(db, [row], username)[0]
+        # _attach drops a post with no photos left: saved, but nothing to show.
+        attached = _attach(db, [row], username) if row else []
+        if not attached:
+            return JSONResponse(status_code=404, content={"error": "that post has no photos any more"})
+        post = attached[0]
     return post

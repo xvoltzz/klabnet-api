@@ -246,7 +246,9 @@ def _tell(c: dict) -> None:
 
 
 def _call_of(username: str) -> dict | None:
-    return next((c for c in _calls.values() if c["state"] != "ended" and username in (c["from"], c["to"])), None)
+    # list(): presence asks from a worker thread (in_call) while the event
+    # loop adds and drops calls; iterating the live dict there can raise.
+    return next((c for c in list(_calls.values()) if c["state"] != "ended" and username in (c["from"], c["to"])), None)
 
 
 def _log(c: dict) -> None:
@@ -273,10 +275,17 @@ def _finish(c: dict, outcome: str, by: str = "") -> None:
     _tell(c)
     _log(c)
     if was_live and _enabled():
+        # A blocking HTTP call (up to 5s with LiveKit down): off the event
+        # loop, which every page's stream and every call's timers run on.
+        def close_room():
+            try:
+                _livekit("DeleteRoom", {"room": ROOM_PREFIX + c["id"]}, {"roomCreate": True})
+            except (httpx.HTTPError, ValueError):
+                pass
         try:
-            _livekit("DeleteRoom", {"room": ROOM_PREFIX + c["id"]}, {"roomCreate": True})
-        except (httpx.HTTPError, ValueError):
-            pass
+            asyncio.get_running_loop().run_in_executor(None, close_room)
+        except RuntimeError:
+            close_room()
     # Kept a minute, so a page that asks about it late hears how it ended.
     try:
         asyncio.get_running_loop().call_later(60, lambda: _calls.pop(c["id"], None))
@@ -366,7 +375,10 @@ async def stream(request: Request, device: str = ""):
                     quiet += POLL
                     if quiet >= KEEPALIVE:
                         quiet = 0
-                        yield ": still here\n\n"
+                        # An event, not a comment: the page can't see
+                        # comments, and it needs to hear something to tell
+                        # a live line from one that died while it slept.
+                        yield "event: ping\ndata: {}\n\n"
                     continue
                 if item is None:
                     break

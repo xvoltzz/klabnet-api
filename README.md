@@ -412,7 +412,7 @@ machine's LAN address, so people at home connect straight to it.
 ## Live streaming
 
 People stream from OBS and everyone else watches in klabnet (klabnet-web's
-`js/44-live.js`, Videos → Live; this side is `app/routers/live.py`). It
+`js/45-live.js`, Videos → Live; this side is `app/routers/live.py`). It
 rides on Voice's LiveKit: [LiveKit Ingress](https://docs.livekit.io/home/ingress/overview/)
 takes the stream in and publishes it to a LiveKit room of its own
 (`live-<username>`), which viewers join subscribe-only.

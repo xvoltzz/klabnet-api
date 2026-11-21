@@ -615,7 +615,10 @@ async def post_chat(user: str, request: Request):
         if not s:
             return _error(409, f"{user} isn't live")
         cur = db.execute("INSERT INTO live_chat (stream, username, body, ts) VALUES (?,?,?,?)", (s["id"], me, body, time.time()))
-        db.execute("DELETE FROM live_chat WHERE stream=? AND id <= ?", (s["id"], cur.lastrowid - _CHAT_KEEP))
+        # The newest _CHAT_KEEP of this stream (ids are shared by every
+        # stream's chat, so lastrowid - KEEP kept fewer with two live).
+        db.execute("DELETE FROM live_chat WHERE stream=? AND id < (SELECT id FROM live_chat WHERE stream=? "
+                   "ORDER BY id DESC LIMIT 1 OFFSET ?)", (s["id"], s["id"], _CHAT_KEEP - 1))
         db.commit()
         row = db.execute("SELECT * FROM live_chat WHERE id=?", (cur.lastrowid,)).fetchone()
     return _chat_json(row)

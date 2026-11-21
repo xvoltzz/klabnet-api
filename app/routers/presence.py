@@ -44,9 +44,11 @@ def _best(username: str, keep: str = "") -> dict | None:
     devices = _beats.get(username, {})
     # Stale ones go, and so do ones whose page is known to have closed: a
     # device that was playing when it went mustn't outrank the others.
-    for d in [d for d, b in devices.items()
+    # Snapshots (list()): GET /api/presence runs this in a worker thread
+    # while the event loop's POST adds beats to the same dicts.
+    for d in [d for d, b in list(devices.items())
               if now - b["at"] > PRESENCE_TTL or (d != keep and session.device_gone(username, d))]:
-        del devices[d]
+        devices.pop(d, None)
     if not devices:
         _beats.pop(username, None)
         return None
@@ -58,9 +60,12 @@ def _best(username: str, keep: str = "") -> dict | None:
         mine = bool(active) and d == active
         return (mine and b["playing"], own and b["playing"], mine, own and bool(b["song"]), own, b["used"], b["at"])
 
-    best = max(devices.items(), key=rank)[1]
+    items = list(devices.items())
+    if not items:
+        return None
+    best = max(items, key=rank)[1]
     # A listening party is joined on one device; whichever it is, it shows.
-    party = best["party_host"] or next((b["party_host"] for b in devices.values() if b["party_host"]), "")
+    party = best["party_host"] or next((b["party_host"] for _, b in items if b["party_host"]), "")
     return dict(best, party_host=party)
 
 
@@ -187,7 +192,8 @@ def _latest(username: str) -> dict:
     devices = _beats.get(username) or {}
     if not devices:
         return {}
-    return max(devices.values(), key=lambda b: (b.get("used") or 0, b["at"]))
+    beats = list(devices.values())
+    return max(beats, key=lambda b: (b.get("used") or 0, b["at"])) if beats else {}
 
 
 def listening() -> list[str]:
