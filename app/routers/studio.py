@@ -72,7 +72,7 @@ def _error(status: int, message: str) -> JSONResponse:
 def _f(v, lo: float, hi: float, default: float | None = None) -> float | None:
     try:
         x = float(v)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return default
     if not math.isfinite(x):
         return default
@@ -119,7 +119,9 @@ def _loads(s, default=None):
 
 def _ranges(raw, duration: float, limit: int) -> list[list[float]]:
     out = []
-    for r in (raw or [])[:limit * 2]:
+    if not isinstance(raw, list):
+        return out
+    for r in raw[:limit * 2]:
         if not isinstance(r, (list, tuple)) or len(r) != 2:
             continue
         a, b = _f(r[0], 0, duration), _f(r[1], 0, duration)
@@ -472,16 +474,30 @@ def make(post_id: int, log=print) -> bool:
         shutil.rmtree(new, ignore_errors=True)
         msg = str(e) or e.__class__.__name__
         log(f"video {post_id}: the edit didn't render: {msg}")
-        _set(post_id, render="failed", render_error=msg[:300])
+        with get_db() as db:
+            cur = db.execute("SELECT edit FROM videos WHERE post_id=?", (post_id,)).fetchone()
+        if cur is not None and (cur["edit"] or "") != want:
+            # Changed (or reverted) while this one rendered: that one's
+            # still wanted, so it's made next (_work queues it again).
+            _set(post_id, render="queued", render_error="")
+        else:
+            _set(post_id, render="failed", render_error=msg[:300])
         return False
     with get_db() as db:
-        cur = db.execute("SELECT file_id, edit FROM videos WHERE post_id=?", (post_id,)).fetchone()
+        cur = db.execute("SELECT file_id, edit, poster FROM videos WHERE post_id=?", (post_id,)).fetchone()
         if cur is None or cur["file_id"] != row["file_id"]:
             db.rollback()
             shutil.rmtree(new, ignore_errors=True)
             log(f"video {post_id}: changed while its edit was rendering; left as it was")
             return False
         again = (cur["edit"] or "") != want
+        # A thumbnail picked while it rendered went into the old folder.
+        now_stem = cur["poster"] or "poster"
+        if now_stem != "poster" and now_stem != stem:
+            for size in ("l", "s"):
+                p = os.path.join(old, f"{now_stem}-{size}.jpg")
+                if os.path.isfile(p) and not os.path.isfile(os.path.join(new, f"{now_stem}-{size}.jpg")):
+                    shutil.copy2(p, os.path.join(new, f"{now_stem}-{size}.jpg"))
         keys = ", ".join(f"{k}=?" for k in cols)
         db.execute(f"""UPDATE videos SET file_id=?, {keys}, edit_live=?, base=?, render=?, render_progress=0,
                        render_error='', updated=datetime('now') WHERE post_id=?""",
@@ -674,7 +690,8 @@ def clean_cards(raw, duration: float) -> list[dict]:
         if c["kind"] == "poll":
             p = c.get("poll") if isinstance(c.get("poll"), dict) else {}
             q = _text(p.get("question"), 140)
-            opts = [_text(o, 60) for o in (p.get("options") or [])[:4] if _text(o, 60)]
+            raw_opts = p.get("options") if isinstance(p.get("options"), list) else []
+            opts = [_text(o, 60) for o in raw_opts[:4] if _text(o, 60)]
             if not q or len(opts) < 2:
                 raise ValueError("a poll needs a question and two to four answers")
             card["poll"] = {"question": q, "options": opts}
@@ -698,7 +715,7 @@ def clean_endscreen(raw, duration: float) -> dict | None:
     if duration and duration < start + 1:
         raise ValueError(f"the video's too short for a {start:.0f}s end screen")
     els, taken = [], set()
-    for e in (raw.get("elements") or [])[:4]:
+    for e in (raw.get("elements") if isinstance(raw.get("elements"), list) else [])[:4]:
         if not isinstance(e, dict) or e.get("kind") not in END_KINDS:
             continue
         w = _f(e.get("w"), 8, 60, 30)
