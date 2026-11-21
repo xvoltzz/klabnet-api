@@ -21,7 +21,7 @@ from fastapi.responses import JSONResponse
 
 from ..auth import get_username
 from ..db import get_db
-from . import live, week
+from . import calls, live, week
 
 router = APIRouter()
 
@@ -148,6 +148,8 @@ def recap(request: Request, since: float = 0):
                ORDER BY created DESC LIMIT 5""", (me, at))]
         # Reactions and replies on This week's lines about you (routers/week.py).
         items.extend(week.recap_items(db, me, at))
+        # Missed calls (routers/calls.py).
+        items.extend(calls.recap_items(db, me, at))
     items.sort(key=lambda i: i["at"], reverse=True)
     return {
         "since": since,

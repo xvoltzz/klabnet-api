@@ -290,6 +290,8 @@ def get_presence(request: Request):
             "room":      rooms.room_of(r["username"]),
             # Streaming ({title, game, started}, routers/live.py), from LiveKit Ingress.
             "live":      live_stream.live_of(r["username"]),
+            # On a call (routers/calls.py): only that they are, not with whom.
+            "call":      _on_call(r["username"]),
             # Where in klabnet (the page of the device they used last) and
             # the status they set.
             "where":     latest[r["username"]].get("where") or None,
@@ -311,6 +313,11 @@ def get_presence(request: Request):
         if not r["username"].endswith("-bot")
     ]
     return {"listeners": listeners, "roster": roster}
+
+
+def _on_call(username: str) -> bool:
+    from .calls import in_call  # calls reads presence's statuses: imported here, not at the top
+    return bool(in_call(username))
 
 
 def _away(r, cutoff, away_cutoff) -> bool:

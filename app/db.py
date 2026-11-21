@@ -509,6 +509,32 @@ CREATE TABLE IF NOT EXISTS video_endscreen (
     start_offset REAL NOT NULL,
     elements     TEXT NOT NULL DEFAULT '[]'
 );
+-- Calls (routers/calls.py): everyone's three-digit extension (first come,
+-- first served; 100-799, 8xx/9xx kept for later), the log of calls made
+-- (ringing and live calls are in memory; a row is written when one ends),
+-- and each person's speed dial.
+CREATE TABLE IF NOT EXISTS extensions (
+    username TEXT PRIMARY KEY,
+    ext      INTEGER NOT NULL UNIQUE
+);
+CREATE TABLE IF NOT EXISTS calls (
+    id       TEXT PRIMARY KEY,
+    caller   TEXT NOT NULL,
+    callee   TEXT NOT NULL,
+    started  TEXT NOT NULL,
+    answered TEXT NOT NULL DEFAULT '',
+    ended    TEXT NOT NULL,
+    outcome  TEXT NOT NULL,
+    seconds  INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS calls_callee ON calls(callee, ended);
+CREATE INDEX IF NOT EXISTS calls_caller ON calls(caller, ended);
+CREATE TABLE IF NOT EXISTS call_favorites (
+    username TEXT NOT NULL,
+    fav      TEXT NOT NULL,
+    position INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (username, fav)
+);
 """
 
 
